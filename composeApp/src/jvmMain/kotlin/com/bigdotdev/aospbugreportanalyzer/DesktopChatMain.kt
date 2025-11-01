@@ -40,13 +40,13 @@ fun main() = application {
                     Provider.OpenAI -> {
                         if ((apiKey.isBlank() || apiKey == System.getenv("GROQ_API_KEY")))
                             apiKey = System.getenv("OPENAI_API_KEY") ?: ""
-                        if (model.isBlank() || model.startsWith("llama") || model.startsWith("meta-") || model.startsWith("openai/")))
+                        if (model.isBlank() || model.startsWith("llama") || model.startsWith("meta-") || model.startsWith("openai/"))
                         model = System.getenv("OPENAI_MODEL") ?: "gpt-4o-mini"
                     }
                     Provider.Groq -> {
                         if ((apiKey.isBlank() || apiKey == System.getenv("OPENAI_API_KEY")))
                             apiKey = System.getenv("GROQ_API_KEY") ?: ""
-                        if (model.isBlank() || model.startsWith("gpt-")))
+                        if (model.isBlank() || model.startsWith("gpt-"))
                         model = "llama-3.1-8b-instant"
                     }
                 }
