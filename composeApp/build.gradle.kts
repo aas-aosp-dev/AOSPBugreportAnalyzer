@@ -99,12 +99,12 @@ dependencies {
 
 compose.desktop {
     application {
-        mainClass = "com.bigdotdev.aospbugreportanalyzer.MainKt"
+        mainClass = "com.bigdotdev.aospbugreportanalyzer.DesktopChatMainKt"
 
         nativeDistributions {
-            targetFormats(TargetFormat.Dmg, TargetFormat.Msi, TargetFormat.Deb)
-            packageName = "com.bigdotdev.aospbugreportanalyzer"
-            packageVersion = "1.0.0"
+            targetFormats(TargetFormat.Exe)
+            packageName = "AOSPBugreportAnalyzer"
+            packageVersion = "0.0.1"
         }
     }
 }
