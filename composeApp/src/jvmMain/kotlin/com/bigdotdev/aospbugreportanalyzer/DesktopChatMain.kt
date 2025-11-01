@@ -3,9 +3,14 @@ package com.bigdotdev.aospbugreportanalyzer
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Visibility
+import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Window
 import androidx.compose.ui.window.application
@@ -32,6 +37,7 @@ fun main() = application {
             var provider by remember { mutableStateOf(Provider.OpenAI) }
             var apiKey by remember { mutableStateOf(System.getenv("OPENAI_API_KEY") ?: "") }
             var model by remember { mutableStateOf(System.getenv("OPENAI_MODEL") ?: "gpt-4o-mini") }
+            var apiKeyVisible by remember { mutableStateOf(false) }
 
             var input by remember { mutableStateOf("") }
             var isLoading by remember { mutableStateOf(false) }
@@ -94,17 +100,19 @@ fun main() = application {
                     }
 
                     OutlinedTextField(
-                        value = apiKey, onValueChange = { apiKey = it },
-                        label = {
-                            Text(
-                                "API Key (" + when (provider) {
-                                    Provider.Groq -> "GROQ"
-                                    Provider.OpenRouter -> "OPENROUTER"
-                                    else -> "OpenAI"
-                                } + ")"
-                            )
-                        },
-                        modifier = Modifier.weight(1f)
+                        value = apiKey,
+                        onValueChange = { apiKey = it },
+                        label = { Text("API Key") },
+                        modifier = Modifier.weight(1f),
+                        visualTransformation = if (apiKeyVisible) VisualTransformation.None else PasswordVisualTransformation(),
+                        trailingIcon = {
+                            IconButton(onClick = { apiKeyVisible = !apiKeyVisible }) {
+                                Icon(
+                                    imageVector = if (apiKeyVisible) Icons.Default.Visibility else Icons.Default.VisibilityOff,
+                                    contentDescription = if (apiKeyVisible) "Скрыть ключ" else "Показать ключ"
+                                )
+                            }
+                        }
                     )
                     OutlinedTextField(
                         value = model, onValueChange = { model = it },
