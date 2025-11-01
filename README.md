@@ -1,5 +1,14 @@
 This is a Kotlin Multiplatform project targeting Android, iOS, Web, Desktop (JVM), Server.
 
+### Providers
+- **OpenAI**  
+  Base URL: `https://api.openai.com/v1`  
+  Env: `OPENAI_API_KEY` (опц. `OPENAI_MODEL`, по умолчанию `gpt-4o-mini`)
+
+- **Groq**  
+  Base URL: `https://api.groq.com/openai/v1` (OpenAI-compatible Responses API)  
+  Env: `GROQ_API_KEY` (модель по умолчанию `llama-3.1-8b-instant`)
+
 * [/composeApp](./composeApp/src) is for code that will be shared across your Compose Multiplatform applications.
   It contains several subfolders:
     - [commonMain](./composeApp/src/commonMain/kotlin) is for code that’s common for all targets.

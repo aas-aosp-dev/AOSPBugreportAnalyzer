@@ -17,37 +17,78 @@ import java.net.http.HttpClient
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 
+private enum class Provider { OpenAI, Groq }
+
 @OptIn(ExperimentalMaterial3Api::class)
 fun main() = application {
     Window(onCloseRequest = ::exitApplication, title = "AOSP Bugreport Analyzer — Chat") {
         MaterialTheme {
             val scope = rememberCoroutineScope()
+
+            var provider by remember { mutableStateOf(Provider.OpenAI) }
             var apiKey by remember { mutableStateOf(System.getenv("OPENAI_API_KEY") ?: "") }
             var model by remember { mutableStateOf(System.getenv("OPENAI_MODEL") ?: "gpt-4o-mini") }
+
             var input by remember { mutableStateOf("") }
             var isLoading by remember { mutableStateOf(false) }
             var error by remember { mutableStateOf<String?>(null) }
-            val history = remember { mutableStateListOf<Pair<String,String>>() } // role to content
+            val history = remember { mutableStateListOf<Pair<String, String>>() } // role -> content
+
+            // Реакция на смену провайдера: меняем ключ и дефолтную модель
+            LaunchedEffect(provider) {
+                when (provider) {
+                    Provider.OpenAI -> {
+                        if ((apiKey.isBlank() || apiKey == System.getenv("GROQ_API_KEY")))
+                            apiKey = System.getenv("OPENAI_API_KEY") ?: ""
+                        if (model.isBlank() || model.startsWith("llama") || model.startsWith("meta-") || model.startsWith("openai/")))
+                        model = System.getenv("OPENAI_MODEL") ?: "gpt-4o-mini"
+                    }
+                    Provider.Groq -> {
+                        if ((apiKey.isBlank() || apiKey == System.getenv("OPENAI_API_KEY")))
+                            apiKey = System.getenv("GROQ_API_KEY") ?: ""
+                        if (model.isBlank() || model.startsWith("gpt-")))
+                        model = "llama-3.1-8b-instant"
+                    }
+                }
+            }
 
             Column(Modifier.fillMaxSize().padding(16.dp)) {
+                // Provider + Key + Model
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    var expanded by remember { mutableStateOf(false) }
+                    ExposedDropdownMenuBox(expanded = expanded, onExpandedChange = { expanded = !expanded }) {
+                        OutlinedTextField(
+                            value = provider.name,
+                            onValueChange = {},
+                            label = { Text("Provider") },
+                            readOnly = true,
+                            modifier = Modifier.menuAnchor().width(180.dp)
+                        )
+                        ExposedDropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+                            DropdownMenuItem(text = { Text("OpenAI") }, onClick = {
+                                provider = Provider.OpenAI; expanded = false
+                            })
+                            DropdownMenuItem(text = { Text("Groq") }, onClick = {
+                                provider = Provider.Groq; expanded = false
+                            })
+                        }
+                    }
+
                     OutlinedTextField(
                         apiKey, { apiKey = it },
-                        label = { Text("API Key") },
+                        label = { Text("API Key (${if (provider == Provider.Groq) "GROQ" else "OpenAI"})") },
                         modifier = Modifier.weight(1f)
                     )
                     OutlinedTextField(
                         model, { model = it },
                         label = { Text("Model") },
-                        modifier = Modifier.width(220.dp)
+                        modifier = Modifier.width(240.dp)
                     )
                 }
 
                 Spacer(Modifier.height(12.dp))
 
-                Column(
-                    Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState())
-                ) {
+                Column(Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState())) {
                     history.forEach { (role, text) ->
                         Text("${role.uppercase()}: $text")
                         Spacer(Modifier.height(6.dp))
@@ -73,7 +114,12 @@ fun main() = application {
                             scope.launch {
                                 isLoading = true
                                 val reply = withContext(Dispatchers.IO) {
-                                    callOpenAIResponses(apiKey, model, history)
+                                    callResponsesApi(
+                                        provider = provider,
+                                        apiKey = apiKey,
+                                        model = model,
+                                        history = history
+                                    )
                                 }
                                 history += "assistant" to reply
                                 isLoading = false
@@ -81,22 +127,22 @@ fun main() = application {
                         }
                     ) { Text("Отправить") }
 
-                    OutlinedButton(onClick = { history.clear() }, enabled = !isLoading) {
-                        Text("Очистить чат")
-                    }
+                    OutlinedButton(onClick = { history.clear() }, enabled = !isLoading) { Text("Очистить чат") }
                 }
             }
         }
     }
 }
 
-private fun callOpenAIResponses(
+private fun callResponsesApi(
+    provider: Provider,
     apiKey: String,
     model: String,
-    history: List<Pair<String,String>>
+    history: List<Pair<String, String>>
 ): String {
     return try {
-        // Сериализация истории в формат Responses API (input = list of messages)
+        // Универсальный payload для OpenAI/Groq Responses API:
+        // { "model": "...", "input": [ {role, content:[{type:"text", text:"..."}]} ... ] }
         val messagesJson = buildString {
             append('[')
             var first = true
@@ -107,10 +153,7 @@ private fun callOpenAIResponses(
                 append(role)
                 append("\",\"content\":[{\"type\":\"text\",\"text\":\"")
                 append(
-                    content
-                        .replace("\\", "\\\\")
-                        .replace("\"", "\\\"")
-                        .replace("\n", " ")
+                    content.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", " ")
                 )
                 append("\"}]}")
             }
@@ -119,8 +162,12 @@ private fun callOpenAIResponses(
 
         val body = "{\"model\":\"$model\",\"input\":$messagesJson}"
 
+        val baseUrl = when (provider) {
+            Provider.OpenAI -> "https://api.openai.com/v1"
+            Provider.Groq   -> "https://api.groq.com/openai/v1" // OpenAI-совместимый Responses API
+        }
         val request = HttpRequest.newBuilder()
-            .uri(URI.create("https://api.openai.com/v1/responses"))
+            .uri(URI.create("$baseUrl/responses"))
             .header("Authorization", "Bearer $apiKey")
             .header("Content-Type", "application/json")
             .POST(HttpRequest.BodyPublishers.ofString(body))
@@ -128,10 +175,9 @@ private fun callOpenAIResponses(
 
         val response = HttpClient.newHttpClient().send(request, HttpResponse.BodyHandlers.ofString())
         if (response.statusCode() !in 200..299) {
-            return "HTTP ${response.statusCode()}: " + response.body().take(500)
+            return "HTTP ${response.statusCode()}: ${response.body().take(2000)}"
         }
 
-        // Простой «наивный» парсинг: сначала пробуем output_text, затем text
         val s = response.body()
         val marker = "\"output_text\":\""
         val idx = s.indexOf(marker)
