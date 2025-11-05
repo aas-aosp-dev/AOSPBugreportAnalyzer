@@ -48,8 +48,9 @@ fun main() = application {
 
             var strictJsonEnabled by remember { mutableStateOf(true) }
 
-            val defaultVpnServerUrl = remember { System.getenv("VPN_SERVER_URL") ?: DEFAULT_VPN_SERVER_URL }
-            var vpnServerUrl by remember { mutableStateOf(defaultVpnServerUrl) }
+            val vpnServerBaseUrl = remember {
+                sanitizeBaseUrl(System.getenv("VPN_SERVER_URL") ?: DEFAULT_VPN_SERVER_URL)
+            }
             var vpnVlessKey by remember { mutableStateOf("") }
             var vpnConnectionState by remember { mutableStateOf<VpnConnectionViewData?>(null) }
             var vpnBanner by remember { mutableStateOf<VpnBannerMessage?>(null) }
@@ -122,15 +123,6 @@ Behavioral rules:
                         Text("VPN подключение", style = MaterialTheme.typography.titleMedium)
 
                         OutlinedTextField(
-                            value = vpnServerUrl,
-                            onValueChange = { vpnServerUrl = it },
-                            label = { Text("VPN сервер") },
-                            singleLine = true,
-                            enabled = !vpnBusy,
-                            modifier = Modifier.fillMaxWidth()
-                        )
-
-                        OutlinedTextField(
                             value = vpnVlessKey,
                             onValueChange = { vpnVlessKey = it },
                             label = { Text("VLESS ключ") },
@@ -150,7 +142,7 @@ Behavioral rules:
                                         vpnBanner = null
                                         val result = withContext(Dispatchers.IO) {
                                             connectVpn(
-                                                serverUrl = vpnServerUrl,
+                                                serverUrl = vpnServerBaseUrl,
                                                 vlessKey = key
                                             )
                                         }
@@ -177,7 +169,7 @@ Behavioral rules:
                                         vpnBanner = null
                                         val result = withContext(Dispatchers.IO) {
                                             disconnectVpn(
-                                                serverUrl = vpnServerUrl,
+                                                serverUrl = vpnServerBaseUrl,
                                                 connectionId = active.connectionId
                                             )
                                         }
