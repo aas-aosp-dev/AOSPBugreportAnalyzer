@@ -31,4 +31,22 @@ data class VlessConnectResponse(
 }
 
 @Serializable
+data class VlessDisconnectRequest(
+    val connectionId: String,
+)
+
+@Serializable
+data class VlessDisconnectResponse(
+    val connectionId: String,
+    val status: VpnConnectionStatus,
+) {
+    companion object {
+        fun fromSession(session: VpnSession): VlessDisconnectResponse = VlessDisconnectResponse(
+            connectionId = session.connectionId,
+            status = session.status,
+        )
+    }
+}
+
+@Serializable
 data class ErrorResponse(val message: String?)

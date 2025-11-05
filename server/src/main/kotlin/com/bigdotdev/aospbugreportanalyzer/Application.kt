@@ -3,6 +3,8 @@ package com.bigdotdev.aospbugreportanalyzer
 import com.bigdotdev.aospbugreportanalyzer.vpn.ErrorResponse
 import com.bigdotdev.aospbugreportanalyzer.vpn.VlessConnectRequest
 import com.bigdotdev.aospbugreportanalyzer.vpn.VlessConnectResponse
+import com.bigdotdev.aospbugreportanalyzer.vpn.VlessDisconnectRequest
+import com.bigdotdev.aospbugreportanalyzer.vpn.VlessDisconnectResponse
 import com.bigdotdev.aospbugreportanalyzer.vpn.VpnConnectionManager
 import io.ktor.http.*
 import io.ktor.serialization.kotlinx.json.*
@@ -48,6 +50,23 @@ fun Application.module() {
             }
 
             call.respond(VlessConnectResponse.fromSession(session))
+        }
+
+        post("/vpn/disconnect") {
+            val request = try {
+                call.receive<VlessDisconnectRequest>()
+            } catch (_: SerializationException) {
+                call.respond(HttpStatusCode.BadRequest, ErrorResponse("Invalid request body"))
+                return@post
+            }
+
+            val session = vpnConnectionManager.disconnect(request.connectionId)
+                ?: run {
+                    call.respond(HttpStatusCode.NotFound, ErrorResponse("Connection not found"))
+                    return@post
+                }
+
+            call.respond(VlessDisconnectResponse.fromSession(session))
         }
     }
 }

@@ -1,8 +1,8 @@
 package com.bigdotdev.aospbugreportanalyzer.vpn
 
+import kotlinx.datetime.Clock
 import kotlinx.serialization.Serializable
 import kotlin.random.Random
-import kotlin.system.getTimeMillis
 
 /**
  * Keeps track of active VPN sessions that were created from VLESS keys.
@@ -19,7 +19,7 @@ class VpnConnectionManager {
         val session = VpnSession(
             connectionId = sessionId,
             vlessUri = parsed,
-            connectedAtMillis = getTimeMillis(),
+            connectedAtMillis = Clock.System.now().toEpochMilliseconds(),
             status = VpnConnectionStatus.CONNECTED,
         )
         sessions[sessionId] = session

@@ -28,6 +28,7 @@ private enum class Provider { OpenAI, Groq, OpenRouter }
 // Необязательные, но рекомендуемые заголовки для OpenRouter
 private const val OPENROUTER_REFERER = "https://github.com/aas-aosp-dev/AOSPBugreportAnalyzer"
 private const val OPENROUTER_TITLE = "AOSP Bugreport Analyzer"
+private const val DEFAULT_VPN_SERVER_URL = "http://localhost:8080"
 
 @OptIn(ExperimentalMaterial3Api::class)
 fun main() = application {
@@ -46,6 +47,13 @@ fun main() = application {
             val history = remember { mutableStateListOf<Pair<String, String>>() } // role -> content
 
             var strictJsonEnabled by remember { mutableStateOf(true) }
+
+            val defaultVpnServerUrl = remember { System.getenv("VPN_SERVER_URL") ?: DEFAULT_VPN_SERVER_URL }
+            var vpnServerUrl by remember { mutableStateOf(defaultVpnServerUrl) }
+            var vpnVlessKey by remember { mutableStateOf("") }
+            var vpnConnectionState by remember { mutableStateOf<VpnConnectionViewData?>(null) }
+            var vpnBanner by remember { mutableStateOf<VpnBannerMessage?>(null) }
+            var vpnBusy by remember { mutableStateOf(false) }
 
             val DEFAULT_SYSTEM_PROMPT = """
 You are a strict JSON formatter. Return ONLY valid JSON (UTF-8), no Markdown, no comments, no extra text.
@@ -106,6 +114,118 @@ Behavioral rules:
             }
 
             Column(Modifier.fillMaxSize().padding(16.dp)) {
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+                ) {
+                    Column(modifier = Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                        Text("VPN подключение", style = MaterialTheme.typography.titleMedium)
+
+                        OutlinedTextField(
+                            value = vpnServerUrl,
+                            onValueChange = { vpnServerUrl = it },
+                            label = { Text("VPN сервер") },
+                            singleLine = true,
+                            enabled = !vpnBusy,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+
+                        OutlinedTextField(
+                            value = vpnVlessKey,
+                            onValueChange = { vpnVlessKey = it },
+                            label = { Text("VLESS ключ") },
+                            placeholder = { Text("vless://<uuid>@host:port?params") },
+                            enabled = !vpnBusy,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Button(
+                                enabled = !vpnBusy && vpnVlessKey.isNotBlank(),
+                                onClick = {
+                                    val key = vpnVlessKey.trim()
+                                    if (key.isEmpty()) return@Button
+                                    scope.launch {
+                                        vpnBusy = true
+                                        vpnBanner = null
+                                        val result = withContext(Dispatchers.IO) {
+                                            connectVpn(
+                                                serverUrl = vpnServerUrl,
+                                                vlessKey = key
+                                            )
+                                        }
+                                        vpnBusy = false
+                                        result.session?.let { session ->
+                                            vpnConnectionState = session
+                                            vpnBanner = VpnBannerMessage("VPN подключено", isError = false)
+                                        }
+                                        result.error?.let { message ->
+                                            vpnBanner = VpnBannerMessage(message, isError = true)
+                                        }
+                                    }
+                                }
+                            ) {
+                                Text("Подключиться")
+                            }
+
+                            OutlinedButton(
+                                enabled = !vpnBusy && vpnConnectionState != null,
+                                onClick = {
+                                    val active = vpnConnectionState ?: return@OutlinedButton
+                                    scope.launch {
+                                        vpnBusy = true
+                                        vpnBanner = null
+                                        val result = withContext(Dispatchers.IO) {
+                                            disconnectVpn(
+                                                serverUrl = vpnServerUrl,
+                                                connectionId = active.connectionId
+                                            )
+                                        }
+                                        vpnBusy = false
+                                        result.status?.let { status ->
+                                            vpnConnectionState = active.copy(status = status)
+                                            vpnBanner = VpnBannerMessage("VPN отключено", isError = false)
+                                        }
+                                        result.error?.let { message ->
+                                            vpnBanner = VpnBannerMessage(message, isError = true)
+                                        }
+                                    }
+                                }
+                            ) {
+                                Text("Отключиться")
+                            }
+                        }
+
+                        vpnConnectionState?.let { session ->
+                            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                Text("Статус: ${session.status}")
+                                session.host?.let { host ->
+                                    val port = session.port
+                                    val hostText = if (port != null) "$host:$port" else host
+                                    Text("Сервер: $hostText")
+                                }
+                                session.userId?.let { userId ->
+                                    Text("ID пользователя: $userId")
+                                }
+                                session.displayName?.let { display ->
+                                    Text("Название: $display")
+                                }
+                                session.parametersDescription?.let { parameters ->
+                                    Text("Параметры: $parameters")
+                                }
+                                Text("ID сессии: ${session.connectionId}")
+                            }
+                        }
+
+                        vpnBanner?.let { banner ->
+                            val color = if (banner.isError) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary
+                            Text(banner.text, color = color)
+                        }
+                    }
+                }
+
+                Spacer(Modifier.height(16.dp))
+
                 // Provider + Key + Model
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     var expanded by remember { mutableStateOf(false) }
@@ -223,6 +343,31 @@ Behavioral rules:
 
 data class ChatMessage(val role: String, val content: String)
 
+private data class VpnConnectionViewData(
+    val connectionId: String,
+    val status: String,
+    val host: String?,
+    val port: Int?,
+    val userId: String?,
+    val displayName: String?,
+    val parametersDescription: String?,
+)
+
+private data class VpnConnectResult(
+    val session: VpnConnectionViewData?,
+    val error: String?,
+)
+
+private data class VpnDisconnectResult(
+    val status: String?,
+    val error: String?,
+)
+
+private data class VpnBannerMessage(
+    val text: String,
+    val isError: Boolean,
+)
+
 private fun buildMessagesForProvider(
     provider: Provider,
     history: List<Pair<String, String>>,
@@ -276,6 +421,104 @@ private fun messagesToJson(messages: List<ChatMessage>): String {
     }
     sb.append(']')
     return sb.toString()
+}
+
+private fun connectVpn(serverUrl: String, vlessKey: String): VpnConnectResult {
+    return try {
+        val base = sanitizeBaseUrl(serverUrl)
+        val client = HttpClient.newHttpClient()
+        val body = """{"vlessKey":"${escapeJsonValue(vlessKey)}"}"""
+        val request = HttpRequest.newBuilder()
+            .uri(URI.create("$base/vpn/connect"))
+            .header("Content-Type", "application/json")
+            .POST(HttpRequest.BodyPublishers.ofString(body))
+            .build()
+        val response = client.send(request, HttpResponse.BodyHandlers.ofString())
+        val status = response.statusCode()
+        val payload = response.body()
+        if (status !in 200..299) {
+            val message = extractJsonStringValue(payload, "\"message\":\"")
+                ?.ifBlank { null }
+                ?: payload.take(400)
+            return VpnConnectResult(null, "Ошибка сервера ($status): $message")
+        }
+        val parsed = parseVpnConnectionResponse(payload)
+            ?: return VpnConnectResult(null, "Не удалось распознать ответ VPN-сервера")
+        VpnConnectResult(parsed, null)
+    } catch (t: Throwable) {
+        VpnConnectResult(session = null, error = t.message ?: t::class.simpleName ?: "Неизвестная ошибка")
+    }
+}
+
+private fun disconnectVpn(serverUrl: String, connectionId: String): VpnDisconnectResult {
+    return try {
+        val base = sanitizeBaseUrl(serverUrl)
+        val client = HttpClient.newHttpClient()
+        val body = """{"connectionId":"${escapeJsonValue(connectionId)}"}"""
+        val request = HttpRequest.newBuilder()
+            .uri(URI.create("$base/vpn/disconnect"))
+            .header("Content-Type", "application/json")
+            .POST(HttpRequest.BodyPublishers.ofString(body))
+            .build()
+        val response = client.send(request, HttpResponse.BodyHandlers.ofString())
+        val status = response.statusCode()
+        val payload = response.body()
+        if (status !in 200..299) {
+            val message = extractJsonStringValue(payload, "\"message\":\"")
+                ?.ifBlank { null }
+                ?: payload.take(400)
+            return VpnDisconnectResult(null, "Ошибка сервера ($status): $message")
+        }
+        val parsedStatus = parseVpnDisconnectResponse(payload)
+            ?: return VpnDisconnectResult(null, "Не удалось распознать ответ VPN-сервера")
+        VpnDisconnectResult(parsedStatus, null)
+    } catch (t: Throwable) {
+        VpnDisconnectResult(status = null, error = t.message ?: t::class.simpleName ?: "Неизвестная ошибка")
+    }
+}
+
+private fun sanitizeBaseUrl(input: String): String {
+    val trimmed = input.trim().ifEmpty { DEFAULT_VPN_SERVER_URL }
+    return trimmed.trimEnd('/')
+}
+
+private fun parseVpnConnectionResponse(payload: String): VpnConnectionViewData? {
+    val connectionId = extractJsonStringValue(payload, "\"connectionId\":\"") ?: return null
+    val status = extractJsonStringValue(payload, "\"status\":\"") ?: "UNKNOWN"
+    val host = extractJsonStringValue(payload, "\"host\":\"")
+    val port = extractJsonNumberValue(payload, "\"port\":")
+    val userId = extractJsonStringValue(payload, "\"userId\":\"")
+    val displayName = extractJsonStringValue(payload, "\"displayName\":\"")
+    val parameters = extractJsonObjectValue(payload, "\"parameters\":")
+    return VpnConnectionViewData(
+        connectionId = connectionId,
+        status = status,
+        host = host,
+        port = port,
+        userId = userId,
+        displayName = displayName,
+        parametersDescription = parameters,
+    )
+}
+
+private fun parseVpnDisconnectResponse(payload: String): String? {
+    return extractJsonStringValue(payload, "\"status\":\"")
+}
+
+private fun escapeJsonValue(value: String): String {
+    if (value.isEmpty()) return value
+    val builder = StringBuilder(value.length + 16)
+    value.forEach { ch ->
+        when (ch) {
+            '\\' -> builder.append("\\\\")
+            '"' -> builder.append("\\\"")
+            '\n' -> builder.append("\\n")
+            '\r' -> builder.append("\\r")
+            '\t' -> builder.append("\\t")
+            else -> builder.append(ch)
+        }
+    }
+    return builder.toString()
 }
 
 private fun callApi(
@@ -386,6 +629,53 @@ private fun callApi(
     } catch (t: Throwable) {
         "Ошибка: " + (t.message ?: t::class.simpleName)
     }
+}
+
+private fun extractJsonNumberValue(source: String, marker: String): Int? {
+    val startIndex = source.indexOf(marker)
+    if (startIndex < 0) return null
+    var index = startIndex + marker.length
+    while (index < source.length && source[index].isWhitespace()) {
+        index++
+    }
+    if (index >= source.length) return null
+    val builder = StringBuilder()
+    while (index < source.length) {
+        val ch = source[index]
+        if (ch.isDigit()) {
+            builder.append(ch)
+            index++
+        } else {
+            break
+        }
+    }
+    return builder.toString().toIntOrNull()
+}
+
+private fun extractJsonObjectValue(source: String, marker: String): String? {
+    val startIndex = source.indexOf(marker)
+    if (startIndex < 0) return null
+    var index = startIndex + marker.length
+    while (index < source.length && source[index] != '{') {
+        index++
+    }
+    if (index >= source.length || source[index] != '{') return null
+    var depth = 0
+    var i = index
+    while (i < source.length) {
+        val ch = source[i]
+        when (ch) {
+            '{' -> depth++
+            '}' -> {
+                depth--
+                if (depth == 0) {
+                    return source.substring(index, i + 1)
+                }
+            }
+        }
+        i++
+    }
+    return null
 }
 
 private fun extractJsonStringValue(source: String, marker: String): String? {
