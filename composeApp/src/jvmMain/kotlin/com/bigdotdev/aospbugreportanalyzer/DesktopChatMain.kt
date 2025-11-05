@@ -9,6 +9,7 @@ import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
@@ -43,6 +44,29 @@ fun main() = application {
             var isLoading by remember { mutableStateOf(false) }
             var error by remember { mutableStateOf<String?>(null) }
             val history = remember { mutableStateListOf<Pair<String, String>>() } // role -> content
+
+            var strictJsonEnabled by remember { mutableStateOf(true) }
+
+            val DEFAULT_SYSTEM_PROMPT = """
+Ты — строгий форматтер. Всегда возвращай ТОЛЬКО валидный JSON UTF-8, без Markdown, без комментариев и без пояснений.
+Формат ответа:
+{
+  "version": "1.0",
+  "ok": <true|false>,
+  "generated_at": "<ISO 8601>",
+  "items": [],
+  "error": "<string, optional>"
+}
+Требования:
+- Корневой тип — объект.
+- Никакого текста вне JSON.
+- Если задачу выполнить нельзя, верни {"version":"1.0","ok":false,"generated_at":"<ISO8601>","items":[],"error":"<пояснение>"}.
+- Если задача выполнена, "ok": true, "error": "" или отсутствует.
+- "items" — массив объектов (структура — на усмотрение, но корректный JSON).
+- Запрещены дополнительные префиксы/постфиксы, подсказки, блоки кода и т. п.
+""".trimIndent()
+
+            var systemPromptText by remember { mutableStateOf(DEFAULT_SYSTEM_PROMPT) }
 
             // Подстраиваем ключ и дефолтную модель при смене провайдера
             LaunchedEffect(provider) {
@@ -123,6 +147,28 @@ fun main() = application {
 
                 Spacer(Modifier.height(12.dp))
 
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Checkbox(
+                        checked = strictJsonEnabled,
+                        onCheckedChange = { strictJsonEnabled = it }
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text("System-prompt")
+                }
+                if (strictJsonEnabled) {
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedTextField(
+                        value = systemPromptText,
+                        onValueChange = { systemPromptText = it },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(min = 120.dp),
+                        label = { Text("System-prompt (используется, если включён)") }
+                    )
+                }
+
+                Spacer(Modifier.height(12.dp))
+
                 Column(Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState())) {
                     history.forEach { (role, text) ->
                         Text("${role.uppercase()}: $text")
@@ -146,6 +192,7 @@ fun main() = application {
                             input = ""
                             error = null
                             history += "user" to prompt
+                            val historySnapshot = history.toList()
                             scope.launch {
                                 isLoading = true
                                 val reply = withContext(Dispatchers.IO) {
@@ -153,7 +200,9 @@ fun main() = application {
                                         provider = provider,
                                         apiKey = apiKey,
                                         model = model,
-                                        history = history
+                                        history = historySnapshot,
+                                        strictJsonEnabled = strictJsonEnabled,
+                                        systemPromptText = systemPromptText
                                     )
                                 }
                                 history += "assistant" to reply
@@ -169,12 +218,46 @@ fun main() = application {
     }
 }
 
+data class ChatMessage(val role: String, val content: String)
+
+private fun buildMessagesForProvider(
+    provider: Provider,
+    history: List<Pair<String, String>>,
+    strictEnabled: Boolean,
+    systemText: String
+): List<ChatMessage> {
+    val base = history.map { ChatMessage(it.first, it.second) }
+
+    if (!strictEnabled) return base
+
+    val supportsSystemRole = when (provider) {
+        Provider.OpenAI,
+        Provider.Groq,
+        Provider.OpenRouter -> true
+    }
+
+    return if (supportsSystemRole) {
+        listOf(ChatMessage(role = "system", content = systemText)) + base
+    } else {
+        if (base.isEmpty()) {
+            listOf(ChatMessage(role = "user", content = systemText))
+        } else {
+            val userIndex = base.indexOfFirst { it.role == "user" }
+            if (userIndex == -1) {
+                listOf(ChatMessage(role = "user", content = systemText)) + base
+            } else {
+                val updated = base[userIndex].copy(content = systemText + "\n\n" + base[userIndex].content)
+                base.mapIndexed { index, message -> if (index == userIndex) updated else message }
+            }
+        }
+    }
+}
+
 // Для chat.completions (Groq/OpenRouter) нужен простой формат messages
-private fun historyToMessages(history: List<Pair<String, String>>): String {
-    // [{"role":"user","content":"..."}, {"role":"assistant","content":"..."}]
+private fun messagesToJson(messages: List<ChatMessage>): String {
     val sb = StringBuilder("[")
     var first = true
-    for ((role, content) in history) {
+    for ((role, content) in messages) {
         if (!first) sb.append(',')
         first = false
         sb.append("{\"role\":\"")
@@ -195,17 +278,25 @@ private fun callApi(
     provider: Provider,
     apiKey: String,
     model: String,
-    history: List<Pair<String, String>>
+    history: List<Pair<String, String>>,
+    strictJsonEnabled: Boolean,
+    systemPromptText: String
 ): String {
     return try {
         val client = HttpClient.newHttpClient()
+        val messages = buildMessagesForProvider(
+            provider = provider,
+            history = history,
+            strictEnabled = strictJsonEnabled,
+            systemText = systemPromptText
+        )
         val response = when (provider) {
             Provider.OpenAI -> {
                 // OpenAI Responses API (как было)
                 val messagesJson = buildString {
                     append('[')
                     var first = true
-                    for ((role, content) in history) {
+                    for ((role, content) in messages) {
                         if (!first) append(',')
                         first = false
                         append("{\"role\":\"")
@@ -231,8 +322,8 @@ private fun callApi(
             }
             Provider.Groq -> {
                 // Groq: chat/completions
-                val messages = historyToMessages(history)
-                val body = "{\"model\":\"$model\",\"messages\":$messages}"
+                val preparedMessages = messagesToJson(messages)
+                val body = "{\"model\":\"$model\",\"messages\":$preparedMessages}"
                 val req = HttpRequest.newBuilder()
                     .uri(URI.create("https://api.groq.com/openai/v1/chat/completions"))
                     .header("Authorization", "Bearer $apiKey")
@@ -243,8 +334,8 @@ private fun callApi(
             }
             Provider.OpenRouter -> {
                 // OpenRouter: chat/completions
-                val messages = historyToMessages(history)
-                val body = "{\"model\":\"$model\",\"messages\":$messages}"
+                val preparedMessages = messagesToJson(messages)
+                val body = "{\"model\":\"$model\",\"messages\":$preparedMessages}"
                 val req = HttpRequest.newBuilder()
                     .uri(URI.create("https://openrouter.ai/api/v1/chat/completions"))
                     .header("Authorization", "Bearer $apiKey")
