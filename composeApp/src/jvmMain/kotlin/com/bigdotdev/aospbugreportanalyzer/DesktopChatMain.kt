@@ -235,8 +235,8 @@ private fun buildMessagesForProvider(
 
     val supportsSystemRole = when (provider) {
         Provider.OpenAI,
-        Provider.Groq,
-        Provider.OpenRouter -> true
+        Provider.Groq -> true
+        Provider.OpenRouter -> false // OpenRouter rejects requests that start with a system-only task
     }
 
     return if (supportsSystemRole) {
