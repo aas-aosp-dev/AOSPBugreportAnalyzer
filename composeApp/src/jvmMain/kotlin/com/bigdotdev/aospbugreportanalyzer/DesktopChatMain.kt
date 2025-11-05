@@ -266,7 +266,7 @@ private fun messagesToJson(messages: List<ChatMessage>): String {
             .append(
                 content.replace("\\", "\\\\")
                     .replace("\"", "\\\"")
-                    .replace("\n", " ")
+                    .replace("\n", "\\n")
             )
             .append("\"}")
     }
@@ -361,32 +361,65 @@ private fun callApi(
         val s = response.body()
         // Groq/OpenRouter: choices[0].message.content
         if (provider == Provider.Groq || provider == Provider.OpenRouter) {
-            val marker = "\"content\":\""
-            val idx = s.indexOf(marker)
-            if (idx >= 0) {
-                val after = s.substring(idx + marker.length)
-                return after.substringBefore("\"").replace("\\n", "\n").ifBlank { "(пустой ответ)" }
+            extractJsonStringValue(s, "\"content\":\"")?.let { value ->
+                return value.ifBlank { "(пустой ответ)" }
             }
         }
         // OpenAI Responses: сначала output_text, затем text
         run {
-            val marker = "\"output_text\":\""
-            val idx = s.indexOf(marker)
-            if (idx >= 0) {
-                val after = s.substring(idx + marker.length)
-                return after.substringBefore("\"").replace("\\n", "\n").ifBlank { "(пустой ответ)" }
+            extractJsonStringValue(s, "\"output_text\":\"")?.let { value ->
+                return value.ifBlank { "(пустой ответ)" }
             }
         }
         run {
-            val marker2 = "\"text\":\""
-            val idx2 = s.indexOf(marker2)
-            if (idx2 >= 0) {
-                val after = s.substring(idx2 + marker2.length)
-                return after.substringBefore("\"").replace("\\n", "\n").ifBlank { "(пустой ответ)" }
+            extractJsonStringValue(s, "\"text\":\"")?.let { value ->
+                return value.ifBlank { "(пустой ответ)" }
             }
         }
         "(не удалось распарсить ответ)"
     } catch (t: Throwable) {
         "Ошибка: " + (t.message ?: t::class.simpleName)
     }
+}
+
+private fun extractJsonStringValue(source: String, marker: String): String? {
+    val startIndex = source.indexOf(marker)
+    if (startIndex < 0) return null
+    val from = startIndex + marker.length
+    if (from >= source.length) return null
+    val sb = StringBuilder()
+    var i = from
+    var escaping = false
+    while (i < source.length) {
+        val c = source[i]
+        if (escaping) {
+            when (c) {
+                '\\', '"', '/' -> sb.append(c)
+                'b' -> sb.append('\b')
+                'f' -> sb.append('\u000C')
+                'n' -> sb.append('\n')
+                'r' -> sb.append('\r')
+                't' -> sb.append('\t')
+                'u' -> {
+                    if (i + 4 < source.length) {
+                        val hex = source.substring(i + 1, i + 5)
+                        hex.toIntOrNull(16)?.let { code ->
+                            sb.append(code.toChar())
+                            i += 4
+                        }
+                    }
+                }
+                else -> sb.append(c)
+            }
+            escaping = false
+        } else {
+            when (c) {
+                '\\' -> escaping = true
+                '"' -> return sb.toString()
+                else -> sb.append(c)
+            }
+        }
+        i++
+    }
+    return sb.toString()
 }
