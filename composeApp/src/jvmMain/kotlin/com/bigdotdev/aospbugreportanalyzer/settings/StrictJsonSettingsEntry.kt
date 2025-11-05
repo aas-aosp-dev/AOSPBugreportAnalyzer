@@ -24,7 +24,8 @@ import kotlinx.coroutines.withContext
 @Composable
 fun StrictJsonSettingsEntry(
     modifier: Modifier = Modifier,
-    buttonLabel: String = "Strict JSON settings"
+    buttonLabel: String = "Strict JSON settings",
+    onSettingsChanged: (AppSettings) -> Unit = {}
 ) {
     var isDialogOpen by remember { mutableStateOf(false) }
     var isLoading by remember { mutableStateOf(false) }
@@ -34,8 +35,15 @@ fun StrictJsonSettingsEntry(
 
     LaunchedEffect(Unit) {
         val result = runCatching { withContext(Dispatchers.IO) { SettingsStore.load() } }
-        settings = result.getOrDefault(AppSettings())
+        val loaded = result.getOrDefault(AppSettings())
+        settings = loaded
         errorMessage = result.exceptionOrNull()?.message
+    }
+
+    LaunchedEffect(settings, errorMessage) {
+        if (settings != null && errorMessage == null) {
+            onSettingsChanged(settings!!)
+        }
     }
 
     TextButton(
@@ -43,7 +51,8 @@ fun StrictJsonSettingsEntry(
             if (settings == null) {
                 scope.launch {
                     val result = runCatching { withContext(Dispatchers.IO) { SettingsStore.load() } }
-                    settings = result.getOrDefault(AppSettings())
+                    val loaded = result.getOrDefault(AppSettings())
+                    settings = loaded
                     errorMessage = result.exceptionOrNull()?.message
                     isDialogOpen = true
                 }

@@ -8,12 +8,19 @@ import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Window
 import androidx.compose.ui.window.application
+import com.bigdotdev.aospbugreportanalyzer.llm.Message
+import com.bigdotdev.aospbugreportanalyzer.llm.MessageBuilder
+import com.bigdotdev.aospbugreportanalyzer.llm.ensureJsonOrFix
+import com.bigdotdev.aospbugreportanalyzer.settings.AppSettings
+import com.bigdotdev.aospbugreportanalyzer.settings.SettingsStore
+import com.bigdotdev.aospbugreportanalyzer.settings.StrictJsonSettingsEntry
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -42,7 +49,15 @@ fun main() = application {
             var input by remember { mutableStateOf("") }
             var isLoading by remember { mutableStateOf(false) }
             var error by remember { mutableStateOf<String?>(null) }
-            val history = remember { mutableStateListOf<Pair<String, String>>() } // role -> content
+            val history = remember { mutableStateListOf<Message>() }
+            var appSettings by remember { mutableStateOf(AppSettings()) }
+            var settingsError by remember { mutableStateOf<String?>(null) }
+
+            LaunchedEffect(Unit) {
+                val result = runCatching { withContext(Dispatchers.IO) { SettingsStore.load() } }
+                appSettings = result.getOrDefault(AppSettings())
+                settingsError = result.exceptionOrNull()?.message
+            }
 
             // Подстраиваем ключ и дефолтную модель при смене провайдера
             LaunchedEffect(provider) {
@@ -121,15 +136,42 @@ fun main() = application {
                     )
                 }
 
+                Spacer(Modifier.height(8.dp))
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = if (appSettings.strictJsonEnabled) "Strict JSON mode: enabled" else "Strict JSON mode: disabled",
+                        style = MaterialTheme.typography.bodyMedium
+                    )
+                    StrictJsonSettingsEntry(
+                        onSettingsChanged = { updated ->
+                            appSettings = updated
+                            settingsError = null
+                        }
+                    )
+                }
+
+                settingsError?.let {
+                    Text(
+                        "Settings error: $it",
+                        color = MaterialTheme.colorScheme.error,
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+
                 Spacer(Modifier.height(12.dp))
 
                 Column(Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState())) {
-                    history.forEach { (role, text) ->
-                        Text("${role.uppercase()}: $text")
+                    history.forEach { message ->
+                        Text("${message.role.uppercase()}: ${message.content}")
                         Spacer(Modifier.height(6.dp))
                     }
                     if (isLoading) Text("…генерация ответа")
-                    error?.let { Text("Ошибка: $it", color = MaterialTheme.colorScheme.error) }
+                    error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
                 }
 
                 OutlinedTextField(
@@ -145,47 +187,88 @@ fun main() = application {
                             val prompt = input.trim()
                             input = ""
                             error = null
-                            history += "user" to prompt
+                            val previousMessages = history.toList()
+                            history += Message(role = "user", content = prompt)
                             scope.launch {
                                 isLoading = true
-                                val reply = withContext(Dispatchers.IO) {
+                                val activeSettings = appSettings
+                                val sendRequest: (List<Message>) -> String = { messages ->
                                     callApi(
                                         provider = provider,
                                         apiKey = apiKey,
                                         model = model,
-                                        history = history
+                                        messages = messages
                                     )
                                 }
-                                history += "assistant" to reply
-                                isLoading = false
+                                val reply = try {
+                                    withContext(Dispatchers.IO) {
+                                        if (activeSettings.strictJsonEnabled) {
+                                            ensureJsonOrFix(
+                                                send = sendRequest,
+                                                userPrompt = prompt,
+                                                settings = activeSettings,
+                                                history = previousMessages
+                                            )
+                                        } else {
+                                            val messagesToSend = MessageBuilder.build(
+                                                userPrompt = prompt,
+                                                settings = activeSettings,
+                                                previousMessages = previousMessages
+                                            )
+                                            sendRequest(messagesToSend).trim()
+                                        }
+                                    }
+                                } finally {
+                                    isLoading = false
+                                }
+                                history += Message(role = "assistant", content = reply)
+                                if (reply.startsWith("Ошибка") || reply.startsWith("HTTP")) {
+                                    error = reply
+                                }
                             }
                         }
                     ) { Text("Отправить") }
 
-                    OutlinedButton(onClick = { history.clear() }, enabled = !isLoading) { Text("Очистить чат") }
+                    OutlinedButton(
+                        onClick = {
+                            history.clear()
+                            error = null
+                        },
+                        enabled = !isLoading
+                    ) { Text("Очистить чат") }
                 }
             }
         }
     }
 }
 
-// Для chat.completions (Groq/OpenRouter) нужен простой формат messages
-private fun historyToMessages(history: List<Pair<String, String>>): String {
-    // [{"role":"user","content":"..."}, {"role":"assistant","content":"..."}]
+private fun messagesToChatCompletionsPayload(messages: List<Message>): String {
     val sb = StringBuilder("[")
     var first = true
-    for ((role, content) in history) {
+    for (message in messages) {
         if (!first) sb.append(',')
         first = false
         sb.append("{\"role\":\"")
-            .append(role)
+            .append(escapeJson(message.role))
             .append("\",\"content\":\"")
-            .append(
-                content.replace("\\", "\\\\")
-                    .replace("\"", "\\\"")
-                    .replace("\n", " ")
-            )
+            .append(escapeJson(message.content))
             .append("\"}")
+    }
+    sb.append(']')
+    return sb.toString()
+}
+
+private fun messagesToResponsesInput(messages: List<Message>): String {
+    val sb = StringBuilder("[")
+    var first = true
+    for (message in messages) {
+        if (!first) sb.append(',')
+        first = false
+        sb.append("{\"role\":\"")
+            .append(escapeJson(message.role))
+            .append("\",\"content\":[{\"type\":\"text\",\"text\":\"")
+            .append(escapeJson(message.content))
+            .append("\"}]}")
     }
     sb.append(']')
     return sb.toString()
@@ -195,66 +278,45 @@ private fun callApi(
     provider: Provider,
     apiKey: String,
     model: String,
-    history: List<Pair<String, String>>
+    messages: List<Message>
 ): String {
     return try {
         val client = HttpClient.newHttpClient()
         val response = when (provider) {
             Provider.OpenAI -> {
-                // OpenAI Responses API (как было)
-                val messagesJson = buildString {
-                    append('[')
-                    var first = true
-                    for ((role, content) in history) {
-                        if (!first) append(',')
-                        first = false
-                        append("{\"role\":\"")
-                        append(role)
-                        append("\",\"content\":[{\"type\":\"text\",\"text\":\"")
-                        append(
-                            content.replace("\\", "\\\\")
-                                .replace("\"", "\\\"")
-                                .replace("\n", " ")
-                        )
-                        append("\"}]}")
-                    }
-                    append(']')
-                }
+                val messagesJson = messagesToResponsesInput(messages)
                 val body = "{\"model\":\"$model\",\"input\":$messagesJson}"
-                val req = HttpRequest.newBuilder()
+                val request = HttpRequest.newBuilder()
                     .uri(URI.create("https://api.openai.com/v1/responses"))
                     .header("Authorization", "Bearer $apiKey")
                     .header("Content-Type", "application/json")
                     .POST(HttpRequest.BodyPublishers.ofString(body))
                     .build()
-                client.send(req, HttpResponse.BodyHandlers.ofString())
+                client.send(request, HttpResponse.BodyHandlers.ofString())
             }
             Provider.Groq -> {
-                // Groq: chat/completions
-                val messages = historyToMessages(history)
-                val body = "{\"model\":\"$model\",\"messages\":$messages}"
-                val req = HttpRequest.newBuilder()
+                val messagesJson = messagesToChatCompletionsPayload(messages)
+                val body = "{\"model\":\"$model\",\"messages\":$messagesJson}"
+                val request = HttpRequest.newBuilder()
                     .uri(URI.create("https://api.groq.com/openai/v1/chat/completions"))
                     .header("Authorization", "Bearer $apiKey")
                     .header("Content-Type", "application/json")
                     .POST(HttpRequest.BodyPublishers.ofString(body))
                     .build()
-                client.send(req, HttpResponse.BodyHandlers.ofString())
+                client.send(request, HttpResponse.BodyHandlers.ofString())
             }
             Provider.OpenRouter -> {
-                // OpenRouter: chat/completions
-                val messages = historyToMessages(history)
-                val body = "{\"model\":\"$model\",\"messages\":$messages}"
-                val req = HttpRequest.newBuilder()
+                val messagesJson = messagesToChatCompletionsPayload(messages)
+                val body = "{\"model\":\"$model\",\"messages\":$messagesJson}"
+                val request = HttpRequest.newBuilder()
                     .uri(URI.create("https://openrouter.ai/api/v1/chat/completions"))
                     .header("Authorization", "Bearer $apiKey")
                     .header("Content-Type", "application/json")
-                    // Рекомендуемые хедеры
                     .header("HTTP-Referer", OPENROUTER_REFERER)
                     .header("X-Title", OPENROUTER_TITLE)
                     .POST(HttpRequest.BodyPublishers.ofString(body))
                     .build()
-                client.send(req, HttpResponse.BodyHandlers.ofString())
+                client.send(request, HttpResponse.BodyHandlers.ofString())
             }
         }
 
@@ -264,38 +326,147 @@ private fun callApi(
                 appendLine("HTTP ${response.statusCode()}")
                 appendLine(headers)
                 appendLine(response.body())
-            }.take(4000)
+            }.trim().take(4000)
         }
 
-        val s = response.body()
-        // Groq/OpenRouter: choices[0].message.content
+        val payload = response.body()
         if (provider == Provider.Groq || provider == Provider.OpenRouter) {
-            val marker = "\"content\":\""
-            val idx = s.indexOf(marker)
-            if (idx >= 0) {
-                val after = s.substring(idx + marker.length)
-                return after.substringBefore("\"").replace("\\n", "\n").ifBlank { "(пустой ответ)" }
+            val assistant = extractAssistantContent(payload)
+            if (assistant != null) {
+                val trimmed = assistant.trim()
+                return trimmed.ifBlank { "(пустой ответ)" }
             }
         }
-        // OpenAI Responses: сначала output_text, затем text
-        run {
-            val marker = "\"output_text\":\""
-            val idx = s.indexOf(marker)
-            if (idx >= 0) {
-                val after = s.substring(idx + marker.length)
-                return after.substringBefore("\"").replace("\\n", "\n").ifBlank { "(пустой ответ)" }
-            }
+        extractStringValue(payload, "output_text")?.let {
+            val trimmed = it.trim()
+            return trimmed.ifBlank { "(пустой ответ)" }
         }
-        run {
-            val marker2 = "\"text\":\""
-            val idx2 = s.indexOf(marker2)
-            if (idx2 >= 0) {
-                val after = s.substring(idx2 + marker2.length)
-                return after.substringBefore("\"").replace("\\n", "\n").ifBlank { "(пустой ответ)" }
-            }
+        extractStringValue(payload, "text")?.let {
+            val trimmed = it.trim()
+            return trimmed.ifBlank { "(пустой ответ)" }
         }
         "(не удалось распарсить ответ)"
     } catch (t: Throwable) {
         "Ошибка: " + (t.message ?: t::class.simpleName)
     }
+}
+
+private fun escapeJson(value: String): String {
+    val sb = StringBuilder(value.length)
+    for (ch in value) {
+        when (ch) {
+            '\\' -> sb.append("\\\\")
+            '\"' -> sb.append("\\\"")
+            '\n' -> sb.append("\\n")
+            '\r' -> sb.append("\\r")
+            '\t' -> sb.append("\\t")
+            '\b' -> sb.append("\\b")
+            '\u000C' -> sb.append("\\f")
+            else -> sb.append(ch)
+        }
+    }
+    return sb.toString()
+}
+
+private fun extractAssistantContent(payload: String): String? {
+    val roleToken = "\"role\":\"assistant\""
+    var searchStart = 0
+    while (true) {
+        val roleIndex = payload.indexOf(roleToken, startIndex = searchStart)
+        if (roleIndex < 0) return null
+        val contentIndex = payload.indexOf("\"content\"", startIndex = roleIndex)
+        if (contentIndex >= 0) {
+            extractStringValueFromIndex(payload, contentIndex)?.let { return it }
+        }
+        searchStart = roleIndex + roleToken.length
+    }
+}
+
+private fun extractStringValue(payload: String, key: String): String? {
+    var searchStart = 0
+    val token = "\"$key\""
+    while (true) {
+        val keyIndex = payload.indexOf(token, startIndex = searchStart)
+        if (keyIndex < 0) return null
+        val value = extractStringValueFromIndex(payload, keyIndex)
+        if (value != null) return value
+        searchStart = keyIndex + token.length
+    }
+}
+
+private fun extractStringValueFromIndex(payload: String, keyIndex: Int): String? {
+    var i = keyIndex + 1
+    while (i < payload.length && payload[i] != '\"') {
+        i++
+    }
+    if (i >= payload.length) return null
+    i++
+    while (i < payload.length && payload[i].isWhitespace()) {
+        i++
+    }
+    if (i >= payload.length || payload[i] != ':') return null
+    i++
+    while (i < payload.length && payload[i].isWhitespace()) {
+        i++
+    }
+    if (i >= payload.length) return null
+    return when (payload[i]) {
+        '\"' -> parseJsonString(payload, i)?.first
+        '[' -> {
+            i++
+            while (i < payload.length && payload[i].isWhitespace()) {
+                i++
+            }
+            if (i < payload.length && payload[i] == '\"') {
+                parseJsonString(payload, i)?.first
+            } else {
+                null
+            }
+        }
+        else -> null
+    }
+}
+
+private fun parseJsonString(payload: String, quoteIndex: Int): Pair<String, Int>? {
+    val sb = StringBuilder()
+    var i = quoteIndex + 1
+    var escaped = false
+    while (i < payload.length) {
+        val ch = payload[i]
+        if (escaped) {
+            when (ch) {
+                '\\' -> sb.append('\\')
+                '\"' -> sb.append('\"')
+                'n' -> sb.append('\n')
+                'r' -> sb.append('\r')
+                't' -> sb.append('\t')
+                'b' -> sb.append('\b')
+                'f' -> sb.append('\u000C')
+                'u' -> {
+                    if (i + 4 < payload.length) {
+                        val hex = payload.substring(i + 1, i + 5)
+                        val codePoint = hex.toIntOrNull(16)
+                        if (codePoint != null) {
+                            sb.append(codePoint.toChar())
+                            i += 4
+                        } else {
+                            sb.append('u')
+                        }
+                    } else {
+                        sb.append('u')
+                    }
+                }
+                else -> sb.append(ch)
+            }
+            escaped = false
+        } else {
+            when (ch) {
+                '\\' -> escaped = true
+                '\"' -> return sb.toString() to (i + 1)
+                else -> sb.append(ch)
+            }
+        }
+        i++
+    }
+    return null
 }
