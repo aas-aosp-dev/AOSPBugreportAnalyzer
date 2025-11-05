@@ -48,22 +48,23 @@ fun main() = application {
             var strictJsonEnabled by remember { mutableStateOf(true) }
 
             val DEFAULT_SYSTEM_PROMPT = """
-Ты — строгий форматтер. Всегда возвращай ТОЛЬКО валидный JSON UTF-8, без Markdown, без комментариев и без пояснений.
-Формат ответа:
+You are a strict JSON formatter. Return ONLY valid JSON (UTF-8), no Markdown, no comments, no extra text.
+
+Always return an object:
 {
   "version": "1.0",
-  "ok": <true|false>,
-  "generated_at": "<ISO 8601>",
+  "ok": true,
+  "generated_at": "<ISO8601>",
   "items": [],
-  "error": "<string, optional>"
+  "error": ""
 }
-Требования:
-- Корневой тип — объект.
-- Никакого текста вне JSON.
-- Если задачу выполнить нельзя, верни {"version":"1.0","ok":false,"generated_at":"<ISO8601>","items":[],"error":"<пояснение>"}.
-- Если задача выполнена, "ok": true, "error": "" или отсутствует.
-- "items" — массив объектов (структура — на усмотрение, но корректный JSON).
-- Запрещены дополнительные префиксы/постфиксы, подсказки, блоки кода и т. п.
+
+Behavioral rules:
+- Never return errors. If the request is unclear, conversational, or empty, still output ok=true and include a single item describing the user's intent.
+- Always include at least one item. Use this shape for the first item:
+  { "type": "summary", "intent": "<one-word label like 'greeting'|'smalltalk'|'other'>", "echo": "<verbatim user text>" }
+- If you can extract structured results, append them as additional items (e.g., { "type": "result", ... }).
+- Do not invent failures. Keep "error" empty.
 """.trimIndent()
 
             var systemPromptText by remember { mutableStateOf(DEFAULT_SYSTEM_PROMPT) }
