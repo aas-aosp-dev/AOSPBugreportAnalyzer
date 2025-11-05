@@ -189,10 +189,11 @@ fun main() = application {
                         enabled = !isLoading && input.isNotBlank() && apiKey.isNotBlank(),
                         onClick = {
                             val prompt = input.trim()
+                            if (prompt.isEmpty()) return@Button
+                            val historySnapshot = history.toList()
                             input = ""
                             error = null
                             history += "user" to prompt
-                            val historySnapshot = history.toList()
                             scope.launch {
                                 isLoading = true
                                 val reply = withContext(Dispatchers.IO) {
@@ -201,6 +202,7 @@ fun main() = application {
                                         apiKey = apiKey,
                                         model = model,
                                         history = historySnapshot,
+                                        userInput = prompt,
                                         strictJsonEnabled = strictJsonEnabled,
                                         systemPromptText = systemPromptText
                                     )
@@ -223,10 +225,11 @@ data class ChatMessage(val role: String, val content: String)
 private fun buildMessagesForProvider(
     provider: Provider,
     history: List<Pair<String, String>>,
+    userInput: String,
     strictEnabled: Boolean,
     systemText: String
 ): List<ChatMessage> {
-    val base = history.map { ChatMessage(it.first, it.second) }
+    val base = history.map { ChatMessage(it.first, it.second) } + ChatMessage(role = "user", content = userInput)
 
     if (!strictEnabled) return base
 
@@ -279,6 +282,7 @@ private fun callApi(
     apiKey: String,
     model: String,
     history: List<Pair<String, String>>,
+    userInput: String,
     strictJsonEnabled: Boolean,
     systemPromptText: String
 ): String {
@@ -287,6 +291,7 @@ private fun callApi(
         val messages = buildMessagesForProvider(
             provider = provider,
             history = history,
+            userInput = userInput,
             strictEnabled = strictJsonEnabled,
             systemText = systemPromptText
         )
