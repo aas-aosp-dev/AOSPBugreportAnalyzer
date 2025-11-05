@@ -1,7 +1,7 @@
 package com.bigdotdev.aospbugreportanalyzer.settings
 
 /**
- * Desktop-specific application settings that control JSON formatting behaviour.
+ * JVM-specific application settings that control JSON formatting behaviour.
  */
 data class AppSettings(
     val strictJsonEnabled: Boolean = false,
