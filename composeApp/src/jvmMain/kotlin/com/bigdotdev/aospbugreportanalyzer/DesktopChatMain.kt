@@ -18,10 +18,13 @@ import androidx.compose.ui.window.application
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.net.ConnectException
 import java.net.URI
+import java.net.UnknownHostException
 import java.net.http.HttpClient
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
+import java.net.http.HttpTimeoutException
 
 private enum class Provider { OpenAI, Groq, OpenRouter }
 
@@ -416,8 +419,8 @@ private fun messagesToJson(messages: List<ChatMessage>): String {
 }
 
 private fun connectVpn(serverUrl: String, vlessKey: String): VpnConnectResult {
+    val base = sanitizeBaseUrl(serverUrl)
     return try {
-        val base = sanitizeBaseUrl(serverUrl)
         val client = HttpClient.newHttpClient()
         val body = """{"vlessKey":"${escapeJsonValue(vlessKey)}"}"""
         val request = HttpRequest.newBuilder()
@@ -438,13 +441,13 @@ private fun connectVpn(serverUrl: String, vlessKey: String): VpnConnectResult {
             ?: return VpnConnectResult(null, "Не удалось распознать ответ VPN-сервера")
         VpnConnectResult(parsed, null)
     } catch (t: Throwable) {
-        VpnConnectResult(session = null, error = t.message ?: t::class.simpleName ?: "Неизвестная ошибка")
+        VpnConnectResult(session = null, error = mapNetworkError(t, base))
     }
 }
 
 private fun disconnectVpn(serverUrl: String, connectionId: String): VpnDisconnectResult {
+    val base = sanitizeBaseUrl(serverUrl)
     return try {
-        val base = sanitizeBaseUrl(serverUrl)
         val client = HttpClient.newHttpClient()
         val body = """{"connectionId":"${escapeJsonValue(connectionId)}"}"""
         val request = HttpRequest.newBuilder()
@@ -465,8 +468,28 @@ private fun disconnectVpn(serverUrl: String, connectionId: String): VpnDisconnec
             ?: return VpnDisconnectResult(null, "Не удалось распознать ответ VPN-сервера")
         VpnDisconnectResult(parsedStatus, null)
     } catch (t: Throwable) {
-        VpnDisconnectResult(status = null, error = t.message ?: t::class.simpleName ?: "Неизвестная ошибка")
+        VpnDisconnectResult(status = null, error = mapNetworkError(t, base))
     }
+}
+
+private fun mapNetworkError(error: Throwable, baseUrl: String): String {
+    val root = findRootCause(error)
+    return when (root) {
+        is ConnectException -> "Не удалось подключиться к VPN-серверу ($baseUrl). Проверьте, что он запущен и доступен."
+        is UnknownHostException -> "VPN-сервер ($baseUrl) не найден. Проверьте адрес."
+        is HttpTimeoutException -> "Истекло время ожидания ответа VPN-сервера ($baseUrl). Попробуйте ещё раз позже."
+        else -> root.message ?: root::class.simpleName ?: "Неизвестная ошибка"
+    }
+}
+
+private fun findRootCause(error: Throwable): Throwable {
+    var current = error
+    val visited = mutableSetOf<Throwable>()
+    while (current.cause != null && current.cause !in visited) {
+        visited += current
+        current = current.cause!!
+    }
+    return current
 }
 
 private fun sanitizeBaseUrl(input: String): String {
