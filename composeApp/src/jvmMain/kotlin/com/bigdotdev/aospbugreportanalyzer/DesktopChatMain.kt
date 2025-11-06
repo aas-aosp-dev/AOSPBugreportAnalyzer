@@ -4,12 +4,33 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
-import androidx.compose.ui.Modifier
+import androidx.compose.material3.Button
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.ExposedDropdownMenuBox
+import androidx.compose.material3.ExposedDropdownMenuDefaults
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Switch
+import androidx.compose.material3.Text
+import androidx.compose.material3.TopAppBar
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
@@ -28,26 +49,7 @@ private const val OPENROUTER_REFERER = "https://github.com/aas-aosp-dev/AOSPBugr
 private const val OPENROUTER_TITLE = "AOSP Bugreport Analyzer"
 private const val DEFAULT_OPENROUTER_MODEL = "gpt-4o-mini"
 
-@OptIn(ExperimentalMaterial3Api::class)
-fun main() = application {
-    Window(onCloseRequest = ::exitApplication, title = "AOSP Bugreport Analyzer — Chat") {
-        MaterialTheme {
-            val scope = rememberCoroutineScope()
-
-            var apiKey by remember { mutableStateOf(System.getenv("OPENROUTER_API_KEY") ?: "") }
-            val model = remember {
-                System.getenv("OPENROUTER_MODEL")?.takeIf { it.isNotBlank() } ?: DEFAULT_OPENROUTER_MODEL
-            }
-            var apiKeyVisible by remember { mutableStateOf(false) }
-
-            var input by remember { mutableStateOf("") }
-            var isLoading by remember { mutableStateOf(false) }
-            var error by remember { mutableStateOf<String?>(null) }
-            val history = remember { mutableStateListOf<Pair<String, String>>() } // role -> content
-
-            var strictJsonEnabled by remember { mutableStateOf(true) }
-
-            val DEFAULT_SYSTEM_PROMPT = """
+private val DEFAULT_SYSTEM_PROMPT = """
 You are a strict JSON formatter. Return ONLY valid JSON (UTF-8), no Markdown, no comments, no extra text.
 
 Always return an object:
@@ -67,112 +69,271 @@ Behavioral rules:
 - Do not invent failures. Keep "error" empty.
 """.trimIndent()
 
-            var systemPromptText by remember { mutableStateOf(DEFAULT_SYSTEM_PROMPT) }
+private enum class ProviderOption(val displayName: String) {
+    OpenRouter("OpenRouter")
+}
 
-            Column(Modifier.fillMaxSize().padding(16.dp)) {
-                // Provider (фиксированный) + Key + Model
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    OutlinedTextField(
-                        value = "OpenRouter",
-                        onValueChange = {},
-                        label = { Text("Provider") },
-                        readOnly = true,
-                        modifier = Modifier.width(200.dp)
-                    )
+@OptIn(ExperimentalMaterial3Api::class)
+fun main() = application {
+    Window(onCloseRequest = ::exitApplication, title = "AOSP Bugreport Analyzer — Chat") {
+        MaterialTheme {
+            DesktopChatApp()
+        }
+    }
+}
 
-                    OutlinedTextField(
-                        value = apiKey,
-                        onValueChange = { apiKey = it },
-                        label = { Text("API Key") },
-                        modifier = Modifier.weight(1f),
-                        visualTransformation = if (apiKeyVisible) VisualTransformation.None else PasswordVisualTransformation(),
-                        trailingIcon = {
-                            IconButton(onClick = { apiKeyVisible = !apiKeyVisible }) {
-                                Icon(
-                                    imageVector = if (apiKeyVisible) Icons.Default.Visibility else Icons.Default.VisibilityOff,
-                                    contentDescription = if (apiKeyVisible) "Скрыть ключ" else "Показать ключ"
-                                )
-                            }
-                        }
-                    )
-                    OutlinedTextField(
-                        value = model,
-                        onValueChange = {},
-                        label = { Text("Model") },
-                        modifier = Modifier.width(260.dp),
-                        readOnly = true
-                    )
-                }
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun DesktopChatApp() {
+    val scope = rememberCoroutineScope()
 
-                Spacer(Modifier.height(12.dp))
+    var provider by remember { mutableStateOf(ProviderOption.OpenRouter) }
+    var apiKey by remember { mutableStateOf(System.getenv("OPENROUTER_API_KEY") ?: "") }
+    var model by remember {
+        mutableStateOf(
+            System.getenv("OPENROUTER_MODEL")?.takeIf { it.isNotBlank() } ?: DEFAULT_OPENROUTER_MODEL
+        )
+    }
+    var strictJsonEnabled by remember { mutableStateOf(true) }
+    var systemPromptText by remember { mutableStateOf(DEFAULT_SYSTEM_PROMPT) }
 
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Checkbox(
-                        checked = strictJsonEnabled,
-                        onCheckedChange = { strictJsonEnabled = it }
-                    )
-                    Spacer(Modifier.width(8.dp))
-                    Text("System-prompt")
-                }
-                if (strictJsonEnabled) {
-                    Spacer(Modifier.height(8.dp))
-                    OutlinedTextField(
-                        value = systemPromptText,
-                        onValueChange = { systemPromptText = it },
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .heightIn(min = 120.dp),
-                        label = { Text("System-prompt (используется, если включён)") }
-                    )
-                }
+    var input by remember { mutableStateOf("") }
+    var isLoading by remember { mutableStateOf(false) }
+    var error by remember { mutableStateOf<String?>(null) }
+    val history = remember { mutableStateListOf<Pair<String, String>>() } // role -> content
 
-                Spacer(Modifier.height(12.dp))
+    var showSettings by remember { mutableStateOf(false) }
 
-                Column(Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState())) {
-                    history.forEach { (role, text) ->
-                        Text("${role.uppercase()}: $text")
-                        Spacer(Modifier.height(6.dp))
+    if (showSettings) {
+        SettingsScreen(
+            provider = provider,
+            onProviderChange = { provider = it },
+            apiKey = apiKey,
+            onApiKeyChange = { apiKey = it },
+            model = model,
+            onModelChange = { model = it },
+            strictJsonEnabled = strictJsonEnabled,
+            onStrictJsonChange = { strictJsonEnabled = it },
+            systemPromptText = systemPromptText,
+            onSystemPromptChange = { systemPromptText = it },
+            onClose = { showSettings = false }
+        )
+        return
+    }
+
+    fun sendMessage() {
+        val prompt = input.trim()
+        if (prompt.isEmpty()) return
+        val historySnapshot = history.toList()
+        input = ""
+        error = null
+        history += "user" to prompt
+        scope.launch {
+            isLoading = true
+            val reply = withContext(Dispatchers.IO) {
+                callApi(
+                    provider = provider,
+                    apiKey = apiKey,
+                    model = model,
+                    history = historySnapshot,
+                    userInput = prompt,
+                    strictJsonEnabled = strictJsonEnabled,
+                    systemPromptText = systemPromptText
+                )
+            }
+            history += "assistant" to reply
+            isLoading = false
+        }
+    }
+
+    ChatScreen(
+        history = history,
+        isLoading = isLoading,
+        error = error,
+        input = input,
+        onInputChange = { input = it },
+        onSend = { sendMessage() },
+        onClearHistory = { history.clear() },
+        onOpenSettings = { showSettings = true },
+        canSend = !isLoading && input.isNotBlank() && apiKey.isNotBlank() && model.isNotBlank()
+    )
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun ChatScreen(
+    history: List<Pair<String, String>>,
+    isLoading: Boolean,
+    error: String?,
+    input: String,
+    onInputChange: (String) -> Unit,
+    onSend: () -> Unit,
+    onClearHistory: () -> Unit,
+    onOpenSettings: () -> Unit,
+    canSend: Boolean
+) {
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text("Чат") },
+                actions = {
+                    IconButton(onClick = onOpenSettings) {
+                        Icon(imageVector = Icons.Default.Settings, contentDescription = "Настройки")
                     }
-                    if (isLoading) Text("…генерация ответа")
-                    error?.let { Text("Ошибка: $it", color = MaterialTheme.colorScheme.error) }
                 }
+            )
+        }
+    ) { padding ->
+        Column(
+            Modifier
+                .padding(padding)
+                .fillMaxSize()
+                .padding(16.dp)
+        ) {
+            Column(
+                Modifier
+                    .weight(1f)
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState())
+            ) {
+                history.forEach { (role, text) ->
+                    Text("${role.uppercase()}: $text")
+                    Spacer(Modifier.height(6.dp))
+                }
+                if (isLoading) Text("…генерация ответа")
+                error?.let { Text("Ошибка: $it", color = MaterialTheme.colorScheme.error) }
+            }
 
+            OutlinedTextField(
+                value = input,
+                onValueChange = onInputChange,
+                label = { Text("Сообщение") },
+                modifier = Modifier.fillMaxWidth()
+            )
+            Spacer(Modifier.height(8.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(
+                    enabled = canSend,
+                    onClick = onSend
+                ) { Text("Отправить") }
+
+                OutlinedButton(onClick = onClearHistory, enabled = !isLoading) { Text("Очистить чат") }
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun SettingsScreen(
+    provider: ProviderOption,
+    onProviderChange: (ProviderOption) -> Unit,
+    apiKey: String,
+    onApiKeyChange: (String) -> Unit,
+    model: String,
+    onModelChange: (String) -> Unit,
+    strictJsonEnabled: Boolean,
+    onStrictJsonChange: (Boolean) -> Unit,
+    systemPromptText: String,
+    onSystemPromptChange: (String) -> Unit,
+    onClose: () -> Unit
+) {
+    var providersExpanded by remember { mutableStateOf(false) }
+    var apiKeyVisible by remember { mutableStateOf(false) }
+
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text("Настройки") },
+                navigationIcon = {
+                    IconButton(onClick = onClose) {
+                        Icon(imageVector = Icons.Default.ArrowBack, contentDescription = "Назад")
+                    }
+                }
+            )
+        }
+    ) { padding ->
+        Column(
+            Modifier
+                .padding(padding)
+                .fillMaxSize()
+                .padding(16.dp)
+                .verticalScroll(rememberScrollState()),
+            verticalArrangement = Arrangement.spacedBy(16.dp)
+        ) {
+            Text(text = "Подключение", style = MaterialTheme.typography.titleMedium)
+
+            ExposedDropdownMenuBox(
+                expanded = providersExpanded,
+                onExpandedChange = { providersExpanded = it }
+            ) {
                 OutlinedTextField(
-                    value = input, onValueChange = { input = it },
-                    label = { Text("Сообщение") },
+                    value = provider.displayName,
+                    onValueChange = {},
+                    readOnly = true,
+                    label = { Text("Провайдер") },
+                    trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = providersExpanded) },
                     modifier = Modifier.fillMaxWidth()
                 )
-                Spacer(Modifier.height(8.dp))
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Button(
-                        enabled = !isLoading && input.isNotBlank() && apiKey.isNotBlank(),
-                        onClick = {
-                            val prompt = input.trim()
-                            if (prompt.isEmpty()) return@Button
-                            val historySnapshot = history.toList()
-                            input = ""
-                            error = null
-                            history += "user" to prompt
-                            scope.launch {
-                                isLoading = true
-                                val reply = withContext(Dispatchers.IO) {
-                                    callApi(
-                                        apiKey = apiKey,
-                                        model = model,
-                                        history = historySnapshot,
-                                        userInput = prompt,
-                                        strictJsonEnabled = strictJsonEnabled,
-                                        systemPromptText = systemPromptText
-                                    )
-                                }
-                                history += "assistant" to reply
-                                isLoading = false
+                ExposedDropdownMenu(
+                    expanded = providersExpanded,
+                    onDismissRequest = { providersExpanded = false }
+                ) {
+                    ProviderOption.values().forEach { option ->
+                        DropdownMenuItem(
+                            text = { Text(option.displayName) },
+                            onClick = {
+                                onProviderChange(option)
+                                providersExpanded = false
                             }
-                        }
-                    ) { Text("Отправить") }
-
-                    OutlinedButton(onClick = { history.clear() }, enabled = !isLoading) { Text("Очистить чат") }
+                        )
+                    }
                 }
+            }
+
+            OutlinedTextField(
+                value = apiKey,
+                onValueChange = onApiKeyChange,
+                label = { Text("API Key") },
+                modifier = Modifier.fillMaxWidth(),
+                visualTransformation = if (apiKeyVisible) VisualTransformation.None else PasswordVisualTransformation(),
+                trailingIcon = {
+                    IconButton(onClick = { apiKeyVisible = !apiKeyVisible }) {
+                        Icon(
+                            imageVector = if (apiKeyVisible) Icons.Default.Visibility else Icons.Default.VisibilityOff,
+                            contentDescription = if (apiKeyVisible) "Скрыть ключ" else "Показать ключ"
+                        )
+                    }
+                }
+            )
+
+            OutlinedTextField(
+                value = model,
+                onValueChange = onModelChange,
+                label = { Text("Model") },
+                modifier = Modifier.fillMaxWidth()
+            )
+
+            Text(text = "System prompt", style = MaterialTheme.typography.titleMedium)
+
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Switch(
+                    checked = strictJsonEnabled,
+                    onCheckedChange = onStrictJsonChange
+                )
+                Spacer(Modifier.width(8.dp))
+                Text("Использовать system prompt для строгого JSON")
+            }
+
+            if (strictJsonEnabled) {
+                OutlinedTextField(
+                    value = systemPromptText,
+                    onValueChange = onSystemPromptChange,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = 160.dp),
+                    label = { Text("System prompt") }
+                )
             }
         }
     }
@@ -227,6 +388,7 @@ private fun messagesToJson(messages: List<ChatMessage>): String {
 }
 
 private fun callApi(
+    provider: ProviderOption,
     apiKey: String,
     model: String,
     history: List<Pair<String, String>>,
@@ -234,6 +396,10 @@ private fun callApi(
     strictJsonEnabled: Boolean,
     systemPromptText: String
 ): String {
+    if (provider != ProviderOption.OpenRouter) {
+        return "Провайдер ${provider.displayName} не поддерживается"
+    }
+
     return try {
         val client = HttpClient.newHttpClient()
         val messages = buildMessages(
