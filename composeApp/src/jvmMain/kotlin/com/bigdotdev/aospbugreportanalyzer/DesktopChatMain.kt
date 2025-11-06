@@ -23,8 +23,6 @@ import java.net.http.HttpClient
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 
-private enum class Provider { OpenAI, Groq, OpenRouter }
-
 // Необязательные, но рекомендуемые заголовки для OpenRouter
 private const val OPENROUTER_REFERER = "https://github.com/aas-aosp-dev/AOSPBugreportAnalyzer"
 private const val OPENROUTER_TITLE = "AOSP Bugreport Analyzer"
@@ -35,9 +33,8 @@ fun main() = application {
         MaterialTheme {
             val scope = rememberCoroutineScope()
 
-            var provider by remember { mutableStateOf(Provider.OpenAI) }
-            var apiKey by remember { mutableStateOf(System.getenv("OPENAI_API_KEY") ?: "") }
-            var model by remember { mutableStateOf(System.getenv("OPENAI_MODEL") ?: "gpt-4o-mini") }
+            var apiKey by remember { mutableStateOf(System.getenv("OPENROUTER_API_KEY") ?: "") }
+            var model by remember { mutableStateOf(System.getenv("OPENROUTER_MODEL") ?: "openrouter/auto") }
             var apiKeyVisible by remember { mutableStateOf(false) }
 
             var input by remember { mutableStateOf("") }
@@ -69,60 +66,16 @@ Behavioral rules:
 
             var systemPromptText by remember { mutableStateOf(DEFAULT_SYSTEM_PROMPT) }
 
-            // Подстраиваем ключ и дефолтную модель при смене провайдера
-            LaunchedEffect(provider) {
-                when (provider) {
-                    Provider.OpenAI -> {
-                        if (apiKey.isBlank() || apiKey == System.getenv("GROQ_API_KEY") || apiKey == System.getenv("OPENROUTER_API_KEY")) {
-                            apiKey = System.getenv("OPENAI_API_KEY") ?: ""
-                        }
-                        if (
-                            model.isBlank() ||
-                            model.startsWith("llama") ||
-                            model.startsWith("meta-") ||
-                            model.startsWith("openrouter/") ||
-                            model.startsWith("openai/")
-                        ) {
-                            model = System.getenv("OPENAI_MODEL") ?: "gpt-4o-mini"
-                        }
-                    }
-                    Provider.Groq -> {
-                        if (apiKey.isBlank() || apiKey == System.getenv("OPENAI_API_KEY") || apiKey == System.getenv("OPENROUTER_API_KEY")) {
-                            apiKey = System.getenv("GROQ_API_KEY") ?: ""
-                        }
-                        if (model.isBlank() || model.startsWith("gpt-") || model.startsWith("openrouter/")) {
-                            model = "llama-3.1-8b-instant"
-                        }
-                    }
-                    Provider.OpenRouter -> {
-                        if (apiKey.isBlank() || apiKey == System.getenv("OPENAI_API_KEY") || apiKey == System.getenv("GROQ_API_KEY")) {
-                            apiKey = System.getenv("OPENROUTER_API_KEY") ?: ""
-                        }
-                        if (model.isBlank()) {
-                            model = "openrouter/auto"
-                        }
-                    }
-                }
-            }
-
             Column(Modifier.fillMaxSize().padding(16.dp)) {
-                // Provider + Key + Model
+                // Provider (фиксированный) + Key + Model
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    var expanded by remember { mutableStateOf(false) }
-                    ExposedDropdownMenuBox(expanded = expanded, onExpandedChange = { expanded = !expanded }) {
-                        OutlinedTextField(
-                            value = provider.name,
-                            onValueChange = {},
-                            label = { Text("Provider") },
-                            readOnly = true,
-                            modifier = Modifier.menuAnchor().width(200.dp)
-                        )
-                        ExposedDropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
-                            DropdownMenuItem(text = { Text("OpenAI") }, onClick = { provider = Provider.OpenAI; expanded = false })
-                            DropdownMenuItem(text = { Text("Groq") }, onClick = { provider = Provider.Groq; expanded = false })
-                            DropdownMenuItem(text = { Text("OpenRouter") }, onClick = { provider = Provider.OpenRouter; expanded = false })
-                        }
-                    }
+                    OutlinedTextField(
+                        value = "OpenRouter",
+                        onValueChange = {},
+                        label = { Text("Provider") },
+                        readOnly = true,
+                        modifier = Modifier.width(200.dp)
+                    )
 
                     OutlinedTextField(
                         value = apiKey,
@@ -199,7 +152,6 @@ Behavioral rules:
                                 isLoading = true
                                 val reply = withContext(Dispatchers.IO) {
                                     callApi(
-                                        provider = provider,
                                         apiKey = apiKey,
                                         model = model,
                                         history = historySnapshot,
@@ -223,8 +175,9 @@ Behavioral rules:
 
 data class ChatMessage(val role: String, val content: String)
 
-private fun buildMessagesForProvider(
-    provider: Provider,
+// OpenRouter не поддерживает отдельную роль system, поэтому внедряем system prompt
+// в первое пользовательское сообщение, если строгий режим включён.
+private fun buildMessages(
     history: List<Pair<String, String>>,
     userInput: String,
     strictEnabled: Boolean,
@@ -234,30 +187,20 @@ private fun buildMessagesForProvider(
 
     if (!strictEnabled) return base
 
-    val supportsSystemRole = when (provider) {
-        Provider.OpenAI,
-        Provider.Groq -> true
-        Provider.OpenRouter -> false // OpenRouter rejects requests that start with a system-only task
+    if (base.isEmpty()) {
+        return listOf(ChatMessage(role = "user", content = systemText))
     }
 
-    return if (supportsSystemRole) {
-        listOf(ChatMessage(role = "system", content = systemText)) + base
+    val userIndex = base.indexOfFirst { it.role == "user" }
+    return if (userIndex == -1) {
+        listOf(ChatMessage(role = "user", content = systemText)) + base
     } else {
-        if (base.isEmpty()) {
-            listOf(ChatMessage(role = "user", content = systemText))
-        } else {
-            val userIndex = base.indexOfFirst { it.role == "user" }
-            if (userIndex == -1) {
-                listOf(ChatMessage(role = "user", content = systemText)) + base
-            } else {
-                val updated = base[userIndex].copy(content = systemText + "\n\n" + base[userIndex].content)
-                base.mapIndexed { index, message -> if (index == userIndex) updated else message }
-            }
-        }
+        val updated = base[userIndex].copy(content = systemText + "\n\n" + base[userIndex].content)
+        base.mapIndexed { index, message -> if (index == userIndex) updated else message }
     }
 }
 
-// Для chat.completions (Groq/OpenRouter) нужен простой формат messages
+// Для chat.completions OpenRouter нужен простой формат messages
 private fun messagesToJson(messages: List<ChatMessage>): String {
     val sb = StringBuilder("[")
     var first = true
@@ -279,7 +222,6 @@ private fun messagesToJson(messages: List<ChatMessage>): String {
 }
 
 private fun callApi(
-    provider: Provider,
     apiKey: String,
     model: String,
     history: List<Pair<String, String>>,
@@ -289,71 +231,24 @@ private fun callApi(
 ): String {
     return try {
         val client = HttpClient.newHttpClient()
-        val messages = buildMessagesForProvider(
-            provider = provider,
+        val messages = buildMessages(
             history = history,
             userInput = userInput,
             strictEnabled = strictJsonEnabled,
             systemText = systemPromptText
         )
-        val response = when (provider) {
-            Provider.OpenAI -> {
-                // OpenAI Responses API (как было)
-                val messagesJson = buildString {
-                    append('[')
-                    var first = true
-                    for ((role, content) in messages) {
-                        if (!first) append(',')
-                        first = false
-                        append("{\"role\":\"")
-                        append(role)
-                        append("\",\"content\":[{\"type\":\"text\",\"text\":\"")
-                        append(
-                            content.replace("\\", "\\\\")
-                                .replace("\"", "\\\"")
-                                .replace("\n", " ")
-                        )
-                        append("\"}]}")
-                    }
-                    append(']')
-                }
-                val body = "{\"model\":\"$model\",\"input\":$messagesJson}"
-                val req = HttpRequest.newBuilder()
-                    .uri(URI.create("https://api.openai.com/v1/responses"))
-                    .header("Authorization", "Bearer $apiKey")
-                    .header("Content-Type", "application/json")
-                    .POST(HttpRequest.BodyPublishers.ofString(body))
-                    .build()
-                client.send(req, HttpResponse.BodyHandlers.ofString())
-            }
-            Provider.Groq -> {
-                // Groq: chat/completions
-                val preparedMessages = messagesToJson(messages)
-                val body = "{\"model\":\"$model\",\"messages\":$preparedMessages}"
-                val req = HttpRequest.newBuilder()
-                    .uri(URI.create("https://api.groq.com/openai/v1/chat/completions"))
-                    .header("Authorization", "Bearer $apiKey")
-                    .header("Content-Type", "application/json")
-                    .POST(HttpRequest.BodyPublishers.ofString(body))
-                    .build()
-                client.send(req, HttpResponse.BodyHandlers.ofString())
-            }
-            Provider.OpenRouter -> {
-                // OpenRouter: chat/completions
-                val preparedMessages = messagesToJson(messages)
-                val body = "{\"model\":\"$model\",\"messages\":$preparedMessages}"
-                val req = HttpRequest.newBuilder()
-                    .uri(URI.create("https://openrouter.ai/api/v1/chat/completions"))
-                    .header("Authorization", "Bearer $apiKey")
-                    .header("Content-Type", "application/json")
-                    // Рекомендуемые хедеры
-                    .header("HTTP-Referer", OPENROUTER_REFERER)
-                    .header("X-Title", OPENROUTER_TITLE)
-                    .POST(HttpRequest.BodyPublishers.ofString(body))
-                    .build()
-                client.send(req, HttpResponse.BodyHandlers.ofString())
-            }
-        }
+        val preparedMessages = messagesToJson(messages)
+        val body = "{\"model\":\"$model\",\"messages\":$preparedMessages}"
+        val req = HttpRequest.newBuilder()
+            .uri(URI.create("https://openrouter.ai/api/v1/chat/completions"))
+            .header("Authorization", "Bearer $apiKey")
+            .header("Content-Type", "application/json")
+            // Рекомендуемые хедеры
+            .header("HTTP-Referer", OPENROUTER_REFERER)
+            .header("X-Title", OPENROUTER_TITLE)
+            .POST(HttpRequest.BodyPublishers.ofString(body))
+            .build()
+        val response = client.send(req, HttpResponse.BodyHandlers.ofString())
 
         if (response.statusCode() !in 200..299) {
             val headers = response.headers().map().entries.joinToString { (k, v) -> "$k=$v" }
@@ -365,22 +260,8 @@ private fun callApi(
         }
 
         val s = response.body()
-        // Groq/OpenRouter: choices[0].message.content
-        if (provider == Provider.Groq || provider == Provider.OpenRouter) {
-            extractJsonStringValue(s, "\"content\":\"")?.let { value ->
-                return value.ifBlank { "(пустой ответ)" }
-            }
-        }
-        // OpenAI Responses: сначала output_text, затем text
-        run {
-            extractJsonStringValue(s, "\"output_text\":\"")?.let { value ->
-                return value.ifBlank { "(пустой ответ)" }
-            }
-        }
-        run {
-            extractJsonStringValue(s, "\"text\":\"")?.let { value ->
-                return value.ifBlank { "(пустой ответ)" }
-            }
+        extractJsonStringValue(s, "\"content\":\"")?.let { value ->
+            return value.ifBlank { "(пустой ответ)" }
         }
         "(не удалось распарсить ответ)"
     } catch (t: Throwable) {
