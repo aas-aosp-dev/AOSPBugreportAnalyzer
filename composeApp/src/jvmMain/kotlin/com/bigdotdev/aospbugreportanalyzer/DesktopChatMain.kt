@@ -49,6 +49,47 @@ private const val OPENROUTER_REFERER = "https://github.com/aas-aosp-dev/AOSPBugr
 private const val OPENROUTER_TITLE = "AOSP Bugreport Analyzer"
 private const val DEFAULT_OPENROUTER_MODEL = "gpt-4o-mini"
 
+private val RESEARCH_MODE_PROMPT = """
+Ты — аналитик и фасилитатор. Общайся кратко, задавай по одному уточняющему вопросу за раз.
+Цель: собрать требования и в нужный момент выдать итоговый документ (ТЗ).
+
+Когда информации недостаточно — задавай уточнения.
+Когда информации достаточно — сформируй ТЗ строго по итоговому формату (см. ниже), затем выведи маркер <END_TZ> и остановись.
+
+Итоговый формат (строго JSON UTF-8, без Markdown и лишнего текста):
+{
+  "complete": true,
+  "generated_at": "<ISO8601>",
+  "tz": {
+    "title": "<строка>",
+    "problem": "<1-3 предложения>",
+    "goals": ["<цель 1>", "<цель 2>"],
+    "non_goals": ["<что не делаем>"],
+    "scope": {
+      "in": ["<что входит>"],
+      "out": ["<что не входит>"]
+    },
+    "stakeholders": ["<кто участвует>"],
+    "inputs": ["<исходные данные>"],
+    "deliverables": ["<результаты/артефакты>"],
+    "acceptance": ["<критерии приёмки>"],
+    "risks": ["<риски>"],
+    "timeline": "<оценка сроков/этапов>"
+  }
+}
+
+Во время диалога (до готовности) отвечай только в виде JSON:
+{
+  "complete": false,
+  "ask": "<один конкретный вопрос пользователю>",
+  "known": { "title": "...", "goals": [...], "...": "..." }
+}
+
+Строго:
+- Всегда JSON, без Markdown и пояснений.
+- Когда ТЗ готово, только один JSON с "complete": true, затем маркер <END_TZ>.
+""".trimIndent()
+
 private val DEFAULT_SYSTEM_PROMPT = """
 You are a strict JSON formatter. Return ONLY valid JSON (UTF-8), no Markdown, no comments, no extra text.
 
@@ -96,6 +137,7 @@ private fun DesktopChatApp() {
     }
     var strictJsonEnabled by remember { mutableStateOf(true) }
     var systemPromptText by remember { mutableStateOf(DEFAULT_SYSTEM_PROMPT) }
+    var researchModeEnabled by remember { mutableStateOf(false) }
 
     var input by remember { mutableStateOf("") }
     var isLoading by remember { mutableStateOf(false) }
@@ -137,8 +179,12 @@ private fun DesktopChatApp() {
                     model = model,
                     history = historySnapshot,
                     userInput = prompt,
-                    strictJsonEnabled = strictJsonEnabled,
-                    systemPromptText = systemPromptText
+                    strictJsonEnabled = strictJsonEnabled || researchModeEnabled,
+                    systemPromptText = if (researchModeEnabled) {
+                        RESEARCH_MODE_PROMPT
+                    } else {
+                        systemPromptText
+                    }
                 )
             }
             history += "assistant" to reply
@@ -155,6 +201,8 @@ private fun DesktopChatApp() {
         onSend = { sendMessage() },
         onClearHistory = { history.clear() },
         onOpenSettings = { showSettings = true },
+        researchModeEnabled = researchModeEnabled,
+        onResearchModeToggle = { researchModeEnabled = !researchModeEnabled },
         canSend = !isLoading && input.isNotBlank() && apiKey.isNotBlank() && model.isNotBlank()
     )
 }
@@ -170,6 +218,8 @@ private fun ChatScreen(
     onSend: () -> Unit,
     onClearHistory: () -> Unit,
     onOpenSettings: () -> Unit,
+    researchModeEnabled: Boolean,
+    onResearchModeToggle: () -> Unit,
     canSend: Boolean
 ) {
     Scaffold(
@@ -177,6 +227,11 @@ private fun ChatScreen(
             TopAppBar(
                 title = { Text("Чат") },
                 actions = {
+                    Button(onClick = onResearchModeToggle) {
+                        Text(
+                            if (researchModeEnabled) "Выключить режим исследования" else "Включить режим исследования"
+                        )
+                    }
                     IconButton(onClick = onOpenSettings) {
                         Icon(imageVector = Icons.Default.Settings, contentDescription = "Настройки")
                     }
@@ -196,6 +251,14 @@ private fun ChatScreen(
                     .fillMaxWidth()
                     .verticalScroll(rememberScrollState())
             ) {
+                if (researchModeEnabled) {
+                    Text(
+                        text = "Режим исследования включён",
+                        color = MaterialTheme.colorScheme.primary,
+                        style = MaterialTheme.typography.labelLarge
+                    )
+                    Spacer(Modifier.height(8.dp))
+                }
                 history.forEach { (role, text) ->
                     Text("${role.uppercase()}: $text")
                     Spacer(Modifier.height(6.dp))
