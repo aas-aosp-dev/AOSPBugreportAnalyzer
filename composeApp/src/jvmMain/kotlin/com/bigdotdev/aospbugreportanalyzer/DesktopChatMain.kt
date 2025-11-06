@@ -26,6 +26,7 @@ import java.net.http.HttpResponse
 // Необязательные, но рекомендуемые заголовки для OpenRouter
 private const val OPENROUTER_REFERER = "https://github.com/aas-aosp-dev/AOSPBugreportAnalyzer"
 private const val OPENROUTER_TITLE = "AOSP Bugreport Analyzer"
+private const val DEFAULT_OPENROUTER_MODEL = "gpt-4o-mini"
 
 @OptIn(ExperimentalMaterial3Api::class)
 fun main() = application {
@@ -34,7 +35,9 @@ fun main() = application {
             val scope = rememberCoroutineScope()
 
             var apiKey by remember { mutableStateOf(System.getenv("OPENROUTER_API_KEY") ?: "") }
-            var model by remember { mutableStateOf(System.getenv("OPENROUTER_MODEL") ?: "openrouter/auto") }
+            val model = remember {
+                System.getenv("OPENROUTER_MODEL")?.takeIf { it.isNotBlank() } ?: DEFAULT_OPENROUTER_MODEL
+            }
             var apiKeyVisible by remember { mutableStateOf(false) }
 
             var input by remember { mutableStateOf("") }
@@ -93,9 +96,11 @@ Behavioral rules:
                         }
                     )
                     OutlinedTextField(
-                        value = model, onValueChange = { model = it },
+                        value = model,
+                        onValueChange = {},
                         label = { Text("Model") },
-                        modifier = Modifier.width(260.dp)
+                        modifier = Modifier.width(260.dp),
+                        readOnly = true
                     )
                 }
 
