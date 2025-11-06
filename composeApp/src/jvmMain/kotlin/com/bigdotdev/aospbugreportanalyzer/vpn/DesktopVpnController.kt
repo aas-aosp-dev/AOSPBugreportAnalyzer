@@ -165,7 +165,7 @@ class DesktopVpnController(
 
     private fun resolveExecutable(candidate: String): Path? {
         val path = Paths.get(candidate)
-        if (path.isAbsolute || candidate.contains('/') || candidate.contains('\')) {
+        if (path.isAbsolute || candidate.contains('/') || candidate.contains("\\")) {
             return if (Files.isRegularFile(path) && Files.isExecutable(path)) path.normalize() else null
         }
 
