@@ -19,10 +19,9 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
-import androidx.compose.material3.SmallTopAppBar
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
-import androidx.compose.material3.menuAnchor
+import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
@@ -50,7 +49,7 @@ private const val OPENROUTER_REFERER = "https://github.com/aas-aosp-dev/AOSPBugr
 private const val OPENROUTER_TITLE = "AOSP Bugreport Analyzer"
 private const val DEFAULT_OPENROUTER_MODEL = "gpt-4o-mini"
 
-private const val DEFAULT_SYSTEM_PROMPT = """
+private val DEFAULT_SYSTEM_PROMPT = """
 You are a strict JSON formatter. Return ONLY valid JSON (UTF-8), no Markdown, no comments, no extra text.
 
 Always return an object:
@@ -175,7 +174,7 @@ private fun ChatScreen(
 ) {
     Scaffold(
         topBar = {
-            SmallTopAppBar(
+            TopAppBar(
                 title = { Text("Чат") },
                 actions = {
                     IconButton(onClick = onOpenSettings) {
@@ -244,7 +243,7 @@ private fun SettingsScreen(
 
     Scaffold(
         topBar = {
-            SmallTopAppBar(
+            TopAppBar(
                 title = { Text("Настройки") },
                 navigationIcon = {
                     IconButton(onClick = onClose) {
@@ -274,9 +273,7 @@ private fun SettingsScreen(
                     readOnly = true,
                     label = { Text("Провайдер") },
                     trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = providersExpanded) },
-                    modifier = Modifier
-                        .menuAnchor()
-                        .fillMaxWidth()
+                    modifier = Modifier.fillMaxWidth()
                 )
                 ExposedDropdownMenu(
                     expanded = providersExpanded,
