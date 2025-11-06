@@ -4,12 +4,33 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
-import androidx.compose.ui.Modifier
+import androidx.compose.material3.Button
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.ExposedDropdownMenuBox
+import androidx.compose.material3.ExposedDropdownMenuDefaults
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Switch
+import androidx.compose.material3.Text
+import androidx.compose.material3.TopAppBar
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
@@ -23,31 +44,53 @@ import java.net.http.HttpClient
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 
-private enum class Provider { OpenAI, Groq, OpenRouter }
-
 // Необязательные, но рекомендуемые заголовки для OpenRouter
 private const val OPENROUTER_REFERER = "https://github.com/aas-aosp-dev/AOSPBugreportAnalyzer"
 private const val OPENROUTER_TITLE = "AOSP Bugreport Analyzer"
+private const val DEFAULT_OPENROUTER_MODEL = "gpt-4o-mini"
 
-@OptIn(ExperimentalMaterial3Api::class)
-fun main() = application {
-    Window(onCloseRequest = ::exitApplication, title = "AOSP Bugreport Analyzer — Chat") {
-        MaterialTheme {
-            val scope = rememberCoroutineScope()
+private val RESEARCH_MODE_PROMPT = """
+Ты — аналитик и фасилитатор. Общайся кратко, задавай по одному уточняющему вопросу за раз.
+Цель: собрать требования и в нужный момент выдать итоговый документ (ТЗ).
 
-            var provider by remember { mutableStateOf(Provider.OpenAI) }
-            var apiKey by remember { mutableStateOf(System.getenv("OPENAI_API_KEY") ?: "") }
-            var model by remember { mutableStateOf(System.getenv("OPENAI_MODEL") ?: "gpt-4o-mini") }
-            var apiKeyVisible by remember { mutableStateOf(false) }
+Когда информации недостаточно — задавай уточнения.
+Когда информации достаточно — сформируй ТЗ строго по итоговому формату (см. ниже), затем выведи маркер <END_TZ> и остановись.
 
-            var input by remember { mutableStateOf("") }
-            var isLoading by remember { mutableStateOf(false) }
-            var error by remember { mutableStateOf<String?>(null) }
-            val history = remember { mutableStateListOf<Pair<String, String>>() } // role -> content
+Итоговый формат (строго JSON UTF-8, без Markdown и лишнего текста):
+{
+  "complete": true,
+  "generated_at": "<ISO8601>",
+  "tz": {
+    "title": "<строка>",
+    "problem": "<1-3 предложения>",
+    "goals": ["<цель 1>", "<цель 2>"],
+    "non_goals": ["<что не делаем>"],
+    "scope": {
+      "in": ["<что входит>"],
+      "out": ["<что не входит>"]
+    },
+    "stakeholders": ["<кто участвует>"],
+    "inputs": ["<исходные данные>"],
+    "deliverables": ["<результаты/артефакты>"],
+    "acceptance": ["<критерии приёмки>"],
+    "risks": ["<риски>"],
+    "timeline": "<оценка сроков/этапов>"
+  }
+}
 
-            var strictJsonEnabled by remember { mutableStateOf(true) }
+Во время диалога (до готовности) отвечай только в виде JSON:
+{
+  "complete": false,
+  "ask": "<один конкретный вопрос пользователю>",
+  "known": { "title": "...", "goals": [...], "...": "..." }
+}
 
-            val DEFAULT_SYSTEM_PROMPT = """
+Строго:
+- Всегда JSON, без Markdown и пояснений.
+- Когда ТЗ готово, только один JSON с "complete": true, затем маркер <END_TZ>.
+""".trimIndent()
+
+private val DEFAULT_SYSTEM_PROMPT = """
 You are a strict JSON formatter. Return ONLY valid JSON (UTF-8), no Markdown, no comments, no extra text.
 
 Always return an object:
@@ -67,155 +110,293 @@ Behavioral rules:
 - Do not invent failures. Keep "error" empty.
 """.trimIndent()
 
-            var systemPromptText by remember { mutableStateOf(DEFAULT_SYSTEM_PROMPT) }
+private enum class ProviderOption(val displayName: String) {
+    OpenRouter("OpenRouter")
+}
 
-            // Подстраиваем ключ и дефолтную модель при смене провайдера
-            LaunchedEffect(provider) {
-                when (provider) {
-                    Provider.OpenAI -> {
-                        if (apiKey.isBlank() || apiKey == System.getenv("GROQ_API_KEY") || apiKey == System.getenv("OPENROUTER_API_KEY")) {
-                            apiKey = System.getenv("OPENAI_API_KEY") ?: ""
-                        }
-                        if (
-                            model.isBlank() ||
-                            model.startsWith("llama") ||
-                            model.startsWith("meta-") ||
-                            model.startsWith("openrouter/") ||
-                            model.startsWith("openai/")
-                        ) {
-                            model = System.getenv("OPENAI_MODEL") ?: "gpt-4o-mini"
-                        }
+@OptIn(ExperimentalMaterial3Api::class)
+fun main() = application {
+    Window(onCloseRequest = ::exitApplication, title = "AOSP Bugreport Analyzer — Chat") {
+        MaterialTheme {
+            DesktopChatApp()
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun DesktopChatApp() {
+    val scope = rememberCoroutineScope()
+
+    var provider by remember { mutableStateOf(ProviderOption.OpenRouter) }
+    var apiKey by remember { mutableStateOf(System.getenv("OPENROUTER_API_KEY") ?: "") }
+    var model by remember {
+        mutableStateOf(
+            System.getenv("OPENROUTER_MODEL")?.takeIf { it.isNotBlank() } ?: DEFAULT_OPENROUTER_MODEL
+        )
+    }
+    var strictJsonEnabled by remember { mutableStateOf(true) }
+    var systemPromptText by remember { mutableStateOf(DEFAULT_SYSTEM_PROMPT) }
+    var researchModeEnabled by remember { mutableStateOf(false) }
+
+    var input by remember { mutableStateOf("") }
+    var isLoading by remember { mutableStateOf(false) }
+    var error by remember { mutableStateOf<String?>(null) }
+    val history = remember { mutableStateListOf<Pair<String, String>>() } // role -> content
+
+    var showSettings by remember { mutableStateOf(false) }
+
+    if (showSettings) {
+        SettingsScreen(
+            provider = provider,
+            onProviderChange = { provider = it },
+            apiKey = apiKey,
+            onApiKeyChange = { apiKey = it },
+            model = model,
+            onModelChange = { model = it },
+            strictJsonEnabled = strictJsonEnabled,
+            onStrictJsonChange = { strictJsonEnabled = it },
+            systemPromptText = systemPromptText,
+            onSystemPromptChange = { systemPromptText = it },
+            onClose = { showSettings = false }
+        )
+        return
+    }
+
+    fun sendMessage() {
+        val prompt = input.trim()
+        if (prompt.isEmpty()) return
+        val historySnapshot = history.toList()
+        input = ""
+        error = null
+        history += "user" to prompt
+        scope.launch {
+            isLoading = true
+            val reply = withContext(Dispatchers.IO) {
+                callApi(
+                    provider = provider,
+                    apiKey = apiKey,
+                    model = model,
+                    history = historySnapshot,
+                    userInput = prompt,
+                    strictJsonEnabled = strictJsonEnabled || researchModeEnabled,
+                    systemPromptText = if (researchModeEnabled) {
+                        RESEARCH_MODE_PROMPT
+                    } else {
+                        systemPromptText
                     }
-                    Provider.Groq -> {
-                        if (apiKey.isBlank() || apiKey == System.getenv("OPENAI_API_KEY") || apiKey == System.getenv("OPENROUTER_API_KEY")) {
-                            apiKey = System.getenv("GROQ_API_KEY") ?: ""
-                        }
-                        if (model.isBlank() || model.startsWith("gpt-") || model.startsWith("openrouter/")) {
-                            model = "llama-3.1-8b-instant"
-                        }
+                )
+            }
+            history += "assistant" to reply
+            isLoading = false
+        }
+    }
+
+    ChatScreen(
+        history = history,
+        isLoading = isLoading,
+        error = error,
+        input = input,
+        onInputChange = { input = it },
+        onSend = { sendMessage() },
+        onClearHistory = { history.clear() },
+        onOpenSettings = { showSettings = true },
+        researchModeEnabled = researchModeEnabled,
+        onResearchModeToggle = { researchModeEnabled = !researchModeEnabled },
+        canSend = !isLoading && input.isNotBlank() && apiKey.isNotBlank() && model.isNotBlank()
+    )
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun ChatScreen(
+    history: List<Pair<String, String>>,
+    isLoading: Boolean,
+    error: String?,
+    input: String,
+    onInputChange: (String) -> Unit,
+    onSend: () -> Unit,
+    onClearHistory: () -> Unit,
+    onOpenSettings: () -> Unit,
+    researchModeEnabled: Boolean,
+    onResearchModeToggle: () -> Unit,
+    canSend: Boolean
+) {
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text("Чат") },
+                actions = {
+                    Button(onClick = onResearchModeToggle) {
+                        Text(
+                            if (researchModeEnabled) "Выключить режим исследования" else "Включить режим исследования"
+                        )
                     }
-                    Provider.OpenRouter -> {
-                        if (apiKey.isBlank() || apiKey == System.getenv("OPENAI_API_KEY") || apiKey == System.getenv("GROQ_API_KEY")) {
-                            apiKey = System.getenv("OPENROUTER_API_KEY") ?: ""
-                        }
-                        if (model.isBlank()) {
-                            model = "openrouter/auto"
-                        }
+                    IconButton(onClick = onOpenSettings) {
+                        Icon(imageVector = Icons.Default.Settings, contentDescription = "Настройки")
+                    }
+                }
+            )
+        }
+    ) { padding ->
+        Column(
+            Modifier
+                .padding(padding)
+                .fillMaxSize()
+                .padding(16.dp)
+        ) {
+            Column(
+                Modifier
+                    .weight(1f)
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState())
+            ) {
+                if (researchModeEnabled) {
+                    Text(
+                        text = "Режим исследования включён",
+                        color = MaterialTheme.colorScheme.primary,
+                        style = MaterialTheme.typography.labelLarge
+                    )
+                    Spacer(Modifier.height(8.dp))
+                }
+                history.forEach { (role, text) ->
+                    Text("${role.uppercase()}: $text")
+                    Spacer(Modifier.height(6.dp))
+                }
+                if (isLoading) Text("…генерация ответа")
+                error?.let { Text("Ошибка: $it", color = MaterialTheme.colorScheme.error) }
+            }
+
+            OutlinedTextField(
+                value = input,
+                onValueChange = onInputChange,
+                label = { Text("Сообщение") },
+                modifier = Modifier.fillMaxWidth()
+            )
+            Spacer(Modifier.height(8.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(
+                    enabled = canSend,
+                    onClick = onSend
+                ) { Text("Отправить") }
+
+                OutlinedButton(onClick = onClearHistory, enabled = !isLoading) { Text("Очистить чат") }
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun SettingsScreen(
+    provider: ProviderOption,
+    onProviderChange: (ProviderOption) -> Unit,
+    apiKey: String,
+    onApiKeyChange: (String) -> Unit,
+    model: String,
+    onModelChange: (String) -> Unit,
+    strictJsonEnabled: Boolean,
+    onStrictJsonChange: (Boolean) -> Unit,
+    systemPromptText: String,
+    onSystemPromptChange: (String) -> Unit,
+    onClose: () -> Unit
+) {
+    var providersExpanded by remember { mutableStateOf(false) }
+    var apiKeyVisible by remember { mutableStateOf(false) }
+
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text("Настройки") },
+                navigationIcon = {
+                    IconButton(onClick = onClose) {
+                        Icon(imageVector = Icons.Default.ArrowBack, contentDescription = "Назад")
+                    }
+                }
+            )
+        }
+    ) { padding ->
+        Column(
+            Modifier
+                .padding(padding)
+                .fillMaxSize()
+                .padding(16.dp)
+                .verticalScroll(rememberScrollState()),
+            verticalArrangement = Arrangement.spacedBy(16.dp)
+        ) {
+            Text(text = "Подключение", style = MaterialTheme.typography.titleMedium)
+
+            ExposedDropdownMenuBox(
+                expanded = providersExpanded,
+                onExpandedChange = { providersExpanded = it }
+            ) {
+                OutlinedTextField(
+                    value = provider.displayName,
+                    onValueChange = {},
+                    readOnly = true,
+                    label = { Text("Провайдер") },
+                    trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = providersExpanded) },
+                    modifier = Modifier.fillMaxWidth()
+                )
+                ExposedDropdownMenu(
+                    expanded = providersExpanded,
+                    onDismissRequest = { providersExpanded = false }
+                ) {
+                    ProviderOption.values().forEach { option ->
+                        DropdownMenuItem(
+                            text = { Text(option.displayName) },
+                            onClick = {
+                                onProviderChange(option)
+                                providersExpanded = false
+                            }
+                        )
                     }
                 }
             }
 
-            Column(Modifier.fillMaxSize().padding(16.dp)) {
-                // Provider + Key + Model
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    var expanded by remember { mutableStateOf(false) }
-                    ExposedDropdownMenuBox(expanded = expanded, onExpandedChange = { expanded = !expanded }) {
-                        OutlinedTextField(
-                            value = provider.name,
-                            onValueChange = {},
-                            label = { Text("Provider") },
-                            readOnly = true,
-                            modifier = Modifier.menuAnchor().width(200.dp)
+            OutlinedTextField(
+                value = apiKey,
+                onValueChange = onApiKeyChange,
+                label = { Text("API Key") },
+                modifier = Modifier.fillMaxWidth(),
+                visualTransformation = if (apiKeyVisible) VisualTransformation.None else PasswordVisualTransformation(),
+                trailingIcon = {
+                    IconButton(onClick = { apiKeyVisible = !apiKeyVisible }) {
+                        Icon(
+                            imageVector = if (apiKeyVisible) Icons.Default.Visibility else Icons.Default.VisibilityOff,
+                            contentDescription = if (apiKeyVisible) "Скрыть ключ" else "Показать ключ"
                         )
-                        ExposedDropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
-                            DropdownMenuItem(text = { Text("OpenAI") }, onClick = { provider = Provider.OpenAI; expanded = false })
-                            DropdownMenuItem(text = { Text("Groq") }, onClick = { provider = Provider.Groq; expanded = false })
-                            DropdownMenuItem(text = { Text("OpenRouter") }, onClick = { provider = Provider.OpenRouter; expanded = false })
-                        }
                     }
-
-                    OutlinedTextField(
-                        value = apiKey,
-                        onValueChange = { apiKey = it },
-                        label = { Text("API Key") },
-                        modifier = Modifier.weight(1f),
-                        visualTransformation = if (apiKeyVisible) VisualTransformation.None else PasswordVisualTransformation(),
-                        trailingIcon = {
-                            IconButton(onClick = { apiKeyVisible = !apiKeyVisible }) {
-                                Icon(
-                                    imageVector = if (apiKeyVisible) Icons.Default.Visibility else Icons.Default.VisibilityOff,
-                                    contentDescription = if (apiKeyVisible) "Скрыть ключ" else "Показать ключ"
-                                )
-                            }
-                        }
-                    )
-                    OutlinedTextField(
-                        value = model, onValueChange = { model = it },
-                        label = { Text("Model") },
-                        modifier = Modifier.width(260.dp)
-                    )
                 }
+            )
 
-                Spacer(Modifier.height(12.dp))
+            OutlinedTextField(
+                value = model,
+                onValueChange = onModelChange,
+                label = { Text("Model") },
+                modifier = Modifier.fillMaxWidth()
+            )
 
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Checkbox(
-                        checked = strictJsonEnabled,
-                        onCheckedChange = { strictJsonEnabled = it }
-                    )
-                    Spacer(Modifier.width(8.dp))
-                    Text("System-prompt")
-                }
-                if (strictJsonEnabled) {
-                    Spacer(Modifier.height(8.dp))
-                    OutlinedTextField(
-                        value = systemPromptText,
-                        onValueChange = { systemPromptText = it },
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .heightIn(min = 120.dp),
-                        label = { Text("System-prompt (используется, если включён)") }
-                    )
-                }
+            Text(text = "System prompt", style = MaterialTheme.typography.titleMedium)
 
-                Spacer(Modifier.height(12.dp))
-
-                Column(Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState())) {
-                    history.forEach { (role, text) ->
-                        Text("${role.uppercase()}: $text")
-                        Spacer(Modifier.height(6.dp))
-                    }
-                    if (isLoading) Text("…генерация ответа")
-                    error?.let { Text("Ошибка: $it", color = MaterialTheme.colorScheme.error) }
-                }
-
-                OutlinedTextField(
-                    value = input, onValueChange = { input = it },
-                    label = { Text("Сообщение") },
-                    modifier = Modifier.fillMaxWidth()
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Switch(
+                    checked = strictJsonEnabled,
+                    onCheckedChange = onStrictJsonChange
                 )
-                Spacer(Modifier.height(8.dp))
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Button(
-                        enabled = !isLoading && input.isNotBlank() && apiKey.isNotBlank(),
-                        onClick = {
-                            val prompt = input.trim()
-                            if (prompt.isEmpty()) return@Button
-                            val historySnapshot = history.toList()
-                            input = ""
-                            error = null
-                            history += "user" to prompt
-                            scope.launch {
-                                isLoading = true
-                                val reply = withContext(Dispatchers.IO) {
-                                    callApi(
-                                        provider = provider,
-                                        apiKey = apiKey,
-                                        model = model,
-                                        history = historySnapshot,
-                                        userInput = prompt,
-                                        strictJsonEnabled = strictJsonEnabled,
-                                        systemPromptText = systemPromptText
-                                    )
-                                }
-                                history += "assistant" to reply
-                                isLoading = false
-                            }
-                        }
-                    ) { Text("Отправить") }
+                Spacer(Modifier.width(8.dp))
+                Text("Использовать system prompt для строгого JSON")
+            }
 
-                    OutlinedButton(onClick = { history.clear() }, enabled = !isLoading) { Text("Очистить чат") }
-                }
+            if (strictJsonEnabled) {
+                OutlinedTextField(
+                    value = systemPromptText,
+                    onValueChange = onSystemPromptChange,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = 160.dp),
+                    label = { Text("System prompt") }
+                )
             }
         }
     }
@@ -223,8 +404,9 @@ Behavioral rules:
 
 data class ChatMessage(val role: String, val content: String)
 
-private fun buildMessagesForProvider(
-    provider: Provider,
+// OpenRouter не поддерживает отдельную роль system, поэтому внедряем system prompt
+// в первое пользовательское сообщение, если строгий режим включён.
+private fun buildMessages(
     history: List<Pair<String, String>>,
     userInput: String,
     strictEnabled: Boolean,
@@ -234,30 +416,20 @@ private fun buildMessagesForProvider(
 
     if (!strictEnabled) return base
 
-    val supportsSystemRole = when (provider) {
-        Provider.OpenAI,
-        Provider.Groq -> true
-        Provider.OpenRouter -> false // OpenRouter rejects requests that start with a system-only task
+    if (base.isEmpty()) {
+        return listOf(ChatMessage(role = "user", content = systemText))
     }
 
-    return if (supportsSystemRole) {
-        listOf(ChatMessage(role = "system", content = systemText)) + base
+    val userIndex = base.indexOfFirst { it.role == "user" }
+    return if (userIndex == -1) {
+        listOf(ChatMessage(role = "user", content = systemText)) + base
     } else {
-        if (base.isEmpty()) {
-            listOf(ChatMessage(role = "user", content = systemText))
-        } else {
-            val userIndex = base.indexOfFirst { it.role == "user" }
-            if (userIndex == -1) {
-                listOf(ChatMessage(role = "user", content = systemText)) + base
-            } else {
-                val updated = base[userIndex].copy(content = systemText + "\n\n" + base[userIndex].content)
-                base.mapIndexed { index, message -> if (index == userIndex) updated else message }
-            }
-        }
+        val updated = base[userIndex].copy(content = systemText + "\n\n" + base[userIndex].content)
+        base.mapIndexed { index, message -> if (index == userIndex) updated else message }
     }
 }
 
-// Для chat.completions (Groq/OpenRouter) нужен простой формат messages
+// Для chat.completions OpenRouter нужен простой формат messages
 private fun messagesToJson(messages: List<ChatMessage>): String {
     val sb = StringBuilder("[")
     var first = true
@@ -279,7 +451,7 @@ private fun messagesToJson(messages: List<ChatMessage>): String {
 }
 
 private fun callApi(
-    provider: Provider,
+    provider: ProviderOption,
     apiKey: String,
     model: String,
     history: List<Pair<String, String>>,
@@ -287,73 +459,30 @@ private fun callApi(
     strictJsonEnabled: Boolean,
     systemPromptText: String
 ): String {
+    if (provider != ProviderOption.OpenRouter) {
+        return "Провайдер ${provider.displayName} не поддерживается"
+    }
+
     return try {
         val client = HttpClient.newHttpClient()
-        val messages = buildMessagesForProvider(
-            provider = provider,
+        val messages = buildMessages(
             history = history,
             userInput = userInput,
             strictEnabled = strictJsonEnabled,
             systemText = systemPromptText
         )
-        val response = when (provider) {
-            Provider.OpenAI -> {
-                // OpenAI Responses API (как было)
-                val messagesJson = buildString {
-                    append('[')
-                    var first = true
-                    for ((role, content) in messages) {
-                        if (!first) append(',')
-                        first = false
-                        append("{\"role\":\"")
-                        append(role)
-                        append("\",\"content\":[{\"type\":\"text\",\"text\":\"")
-                        append(
-                            content.replace("\\", "\\\\")
-                                .replace("\"", "\\\"")
-                                .replace("\n", " ")
-                        )
-                        append("\"}]}")
-                    }
-                    append(']')
-                }
-                val body = "{\"model\":\"$model\",\"input\":$messagesJson}"
-                val req = HttpRequest.newBuilder()
-                    .uri(URI.create("https://api.openai.com/v1/responses"))
-                    .header("Authorization", "Bearer $apiKey")
-                    .header("Content-Type", "application/json")
-                    .POST(HttpRequest.BodyPublishers.ofString(body))
-                    .build()
-                client.send(req, HttpResponse.BodyHandlers.ofString())
-            }
-            Provider.Groq -> {
-                // Groq: chat/completions
-                val preparedMessages = messagesToJson(messages)
-                val body = "{\"model\":\"$model\",\"messages\":$preparedMessages}"
-                val req = HttpRequest.newBuilder()
-                    .uri(URI.create("https://api.groq.com/openai/v1/chat/completions"))
-                    .header("Authorization", "Bearer $apiKey")
-                    .header("Content-Type", "application/json")
-                    .POST(HttpRequest.BodyPublishers.ofString(body))
-                    .build()
-                client.send(req, HttpResponse.BodyHandlers.ofString())
-            }
-            Provider.OpenRouter -> {
-                // OpenRouter: chat/completions
-                val preparedMessages = messagesToJson(messages)
-                val body = "{\"model\":\"$model\",\"messages\":$preparedMessages}"
-                val req = HttpRequest.newBuilder()
-                    .uri(URI.create("https://openrouter.ai/api/v1/chat/completions"))
-                    .header("Authorization", "Bearer $apiKey")
-                    .header("Content-Type", "application/json")
-                    // Рекомендуемые хедеры
-                    .header("HTTP-Referer", OPENROUTER_REFERER)
-                    .header("X-Title", OPENROUTER_TITLE)
-                    .POST(HttpRequest.BodyPublishers.ofString(body))
-                    .build()
-                client.send(req, HttpResponse.BodyHandlers.ofString())
-            }
-        }
+        val preparedMessages = messagesToJson(messages)
+        val body = "{\"model\":\"$model\",\"messages\":$preparedMessages}"
+        val req = HttpRequest.newBuilder()
+            .uri(URI.create("https://openrouter.ai/api/v1/chat/completions"))
+            .header("Authorization", "Bearer $apiKey")
+            .header("Content-Type", "application/json")
+            // Рекомендуемые хедеры
+            .header("HTTP-Referer", OPENROUTER_REFERER)
+            .header("X-Title", OPENROUTER_TITLE)
+            .POST(HttpRequest.BodyPublishers.ofString(body))
+            .build()
+        val response = client.send(req, HttpResponse.BodyHandlers.ofString())
 
         if (response.statusCode() !in 200..299) {
             val headers = response.headers().map().entries.joinToString { (k, v) -> "$k=$v" }
@@ -365,22 +494,8 @@ private fun callApi(
         }
 
         val s = response.body()
-        // Groq/OpenRouter: choices[0].message.content
-        if (provider == Provider.Groq || provider == Provider.OpenRouter) {
-            extractJsonStringValue(s, "\"content\":\"")?.let { value ->
-                return value.ifBlank { "(пустой ответ)" }
-            }
-        }
-        // OpenAI Responses: сначала output_text, затем text
-        run {
-            extractJsonStringValue(s, "\"output_text\":\"")?.let { value ->
-                return value.ifBlank { "(пустой ответ)" }
-            }
-        }
-        run {
-            extractJsonStringValue(s, "\"text\":\"")?.let { value ->
-                return value.ifBlank { "(пустой ответ)" }
-            }
+        extractJsonStringValue(s, "\"content\":\"")?.let { value ->
+            return value.ifBlank { "(пустой ответ)" }
         }
         "(не удалось распарсить ответ)"
     } catch (t: Throwable) {
