@@ -8,30 +8,30 @@ import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
-import androidx.compose.ui.Modifier
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Window
 import androidx.compose.ui.window.application
+import com.bigdotdev.aospbugreportanalyzer.vpn.DesktopVpnController
+import com.bigdotdev.aospbugreportanalyzer.vpn.DesktopVpnSession
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import java.net.ConnectException
+import java.io.IOException
 import java.net.URI
-import java.net.UnknownHostException
 import java.net.http.HttpClient
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
-import java.net.http.HttpTimeoutException
+import kotlin.io.path.absolutePathString
 
 private enum class Provider { OpenAI, Groq, OpenRouter }
 
 // Необязательные, но рекомендуемые заголовки для OpenRouter
 private const val OPENROUTER_REFERER = "https://github.com/aas-aosp-dev/AOSPBugreportAnalyzer"
 private const val OPENROUTER_TITLE = "AOSP Bugreport Analyzer"
-private const val DEFAULT_VPN_SERVER_URL = "http://localhost:8080"
 
 @OptIn(ExperimentalMaterial3Api::class)
 fun main() = application {
@@ -51,13 +51,12 @@ fun main() = application {
 
             var strictJsonEnabled by remember { mutableStateOf(true) }
 
-            val vpnServerBaseUrl = remember {
-                sanitizeBaseUrl(System.getenv("VPN_SERVER_URL") ?: DEFAULT_VPN_SERVER_URL)
-            }
             var vpnVlessKey by remember { mutableStateOf("") }
             var vpnConnectionState by remember { mutableStateOf<VpnConnectionViewData?>(null) }
             var vpnBanner by remember { mutableStateOf<VpnBannerMessage?>(null) }
             var vpnBusy by remember { mutableStateOf(false) }
+            var vpnHasActiveSession by remember { mutableStateOf(false) }
+            val vpnController = remember { DesktopVpnController() }
 
             val DEFAULT_SYSTEM_PROMPT = """
 You are a strict JSON formatter. Return ONLY valid JSON (UTF-8), no Markdown, no comments, no extra text.
@@ -144,12 +143,18 @@ Behavioral rules:
                                         vpnBusy = true
                                         vpnBanner = null
                                         val result = withContext(Dispatchers.IO) {
-                                            connectVpn(
-                                                serverUrl = vpnServerBaseUrl,
+                                            connectDesktopVpn(
+                                                controller = vpnController,
                                                 vlessKey = key
                                             )
                                         }
                                         vpnBusy = false
+                                        vpnHasActiveSession = vpnController.currentSession() != null
+                                        if (result.session == null) {
+                                            vpnController.currentSession()?.let { current ->
+                                                vpnConnectionState = current.toViewData(status = "Активно")
+                                            }
+                                        }
                                         result.session?.let { session ->
                                             vpnConnectionState = session
                                             vpnBanner = VpnBannerMessage("VPN подключено", isError = false)
@@ -164,21 +169,23 @@ Behavioral rules:
                             }
 
                             OutlinedButton(
-                                enabled = !vpnBusy && vpnConnectionState != null,
+                                enabled = !vpnBusy && vpnHasActiveSession,
                                 onClick = {
-                                    val active = vpnConnectionState ?: return@OutlinedButton
                                     scope.launch {
                                         vpnBusy = true
                                         vpnBanner = null
                                         val result = withContext(Dispatchers.IO) {
-                                            disconnectVpn(
-                                                serverUrl = vpnServerBaseUrl,
-                                                connectionId = active.connectionId
-                                            )
+                                            disconnectDesktopVpn(vpnController)
                                         }
                                         vpnBusy = false
-                                        result.status?.let { status ->
-                                            vpnConnectionState = active.copy(status = status)
+                                        vpnHasActiveSession = vpnController.currentSession() != null
+                                        if (result.session == null) {
+                                            vpnController.currentSession()?.let { current ->
+                                                vpnConnectionState = current.toViewData(status = "Активно")
+                                            }
+                                        }
+                                        result.session?.let {
+                                            vpnConnectionState = null
                                             vpnBanner = VpnBannerMessage("VPN отключено", isError = false)
                                         }
                                         result.error?.let { message ->
@@ -207,6 +214,18 @@ Behavioral rules:
                                 }
                                 session.parametersDescription?.let { parameters ->
                                     Text("Параметры: $parameters")
+                                }
+                                session.engine?.let { engine ->
+                                    Text("Движок: $engine")
+                                }
+                                session.proxyEndpoint?.let { endpoint ->
+                                    Text("Локальный прокси: $endpoint")
+                                }
+                                session.binaryPath?.let { path ->
+                                    Text("Бинарник: $path")
+                                }
+                                session.logFile?.let { log ->
+                                    Text("Лог: $log")
                                 }
                                 Text("ID сессии: ${session.connectionId}")
                             }
@@ -346,6 +365,10 @@ private data class VpnConnectionViewData(
     val userId: String?,
     val displayName: String?,
     val parametersDescription: String?,
+    val engine: String?,
+    val proxyEndpoint: String?,
+    val logFile: String?,
+    val binaryPath: String?,
 )
 
 private data class VpnConnectResult(
@@ -354,7 +377,7 @@ private data class VpnConnectResult(
 )
 
 private data class VpnDisconnectResult(
-    val status: String?,
+    val session: VpnConnectionViewData?,
     val error: String?,
 )
 
@@ -418,66 +441,51 @@ private fun messagesToJson(messages: List<ChatMessage>): String {
     return sb.toString()
 }
 
-private fun connectVpn(serverUrl: String, vlessKey: String): VpnConnectResult {
-    val base = sanitizeBaseUrl(serverUrl)
+private fun connectDesktopVpn(controller: DesktopVpnController, vlessKey: String): VpnConnectResult {
     return try {
-        val client = HttpClient.newHttpClient()
-        val body = """{"vlessKey":"${escapeJsonValue(vlessKey)}"}"""
-        val request = HttpRequest.newBuilder()
-            .uri(URI.create("$base/vpn/connect"))
-            .header("Content-Type", "application/json")
-            .POST(HttpRequest.BodyPublishers.ofString(body))
-            .build()
-        val response = client.send(request, HttpResponse.BodyHandlers.ofString())
-        val status = response.statusCode()
-        val payload = response.body()
-        if (status !in 200..299) {
-            val message = extractJsonStringValue(payload, "\"message\":\"")
-                ?.ifBlank { null }
-                ?: payload.take(400)
-            return VpnConnectResult(null, "Ошибка сервера ($status): $message")
-        }
-        val parsed = parseVpnConnectionResponse(payload)
-            ?: return VpnConnectResult(null, "Не удалось распознать ответ VPN-сервера")
-        VpnConnectResult(parsed, null)
-    } catch (t: Throwable) {
-        VpnConnectResult(session = null, error = mapNetworkError(t, base))
+        val session = controller.connect(vlessKey)
+        VpnConnectResult(session = session.toViewData(status = "Активно"), error = null)
+    } catch (failure: Throwable) {
+        VpnConnectResult(session = null, error = mapDesktopVpnError(failure))
     }
 }
 
-private fun disconnectVpn(serverUrl: String, connectionId: String): VpnDisconnectResult {
-    val base = sanitizeBaseUrl(serverUrl)
+private fun disconnectDesktopVpn(controller: DesktopVpnController): VpnDisconnectResult {
     return try {
-        val client = HttpClient.newHttpClient()
-        val body = """{"connectionId":"${escapeJsonValue(connectionId)}"}"""
-        val request = HttpRequest.newBuilder()
-            .uri(URI.create("$base/vpn/disconnect"))
-            .header("Content-Type", "application/json")
-            .POST(HttpRequest.BodyPublishers.ofString(body))
-            .build()
-        val response = client.send(request, HttpResponse.BodyHandlers.ofString())
-        val status = response.statusCode()
-        val payload = response.body()
-        if (status !in 200..299) {
-            val message = extractJsonStringValue(payload, "\"message\":\"")
-                ?.ifBlank { null }
-                ?: payload.take(400)
-            return VpnDisconnectResult(null, "Ошибка сервера ($status): $message")
-        }
-        val parsedStatus = parseVpnDisconnectResponse(payload)
-            ?: return VpnDisconnectResult(null, "Не удалось распознать ответ VPN-сервера")
-        VpnDisconnectResult(parsedStatus, null)
-    } catch (t: Throwable) {
-        VpnDisconnectResult(status = null, error = mapNetworkError(t, base))
+        val session = controller.disconnect()
+        VpnDisconnectResult(session = session.toViewData(status = "Отключено"), error = null)
+    } catch (failure: Throwable) {
+        VpnDisconnectResult(session = null, error = mapDesktopVpnError(failure))
     }
 }
 
-private fun mapNetworkError(error: Throwable, baseUrl: String): String {
+private fun DesktopVpnSession.toViewData(status: String): VpnConnectionViewData {
+    val parametersText = if (vlessUri.parameters.isEmpty()) {
+        null
+    } else {
+        vlessUri.parameters.entries.joinToString { (key, value) -> "$key=$value" }
+    }
+    return VpnConnectionViewData(
+        connectionId = id,
+        status = status,
+        host = vlessUri.host,
+        port = vlessUri.port,
+        userId = vlessUri.userId,
+        displayName = vlessUri.displayName,
+        parametersDescription = parametersText,
+        engine = engine.displayName,
+        proxyEndpoint = "127.0.0.1:$localProxyPort",
+        logFile = logPath.absolutePathString(),
+        binaryPath = binaryPath,
+    )
+}
+
+private fun mapDesktopVpnError(error: Throwable): String {
     val root = findRootCause(error)
     return when (root) {
-        is ConnectException -> "Не удалось подключиться к VPN-серверу ($baseUrl). Проверьте, что он запущен и доступен."
-        is UnknownHostException -> "VPN-сервер ($baseUrl) не найден. Проверьте адрес."
-        is HttpTimeoutException -> "Истекло время ожидания ответа VPN-сервера ($baseUrl). Попробуйте ещё раз позже."
+        is IllegalArgumentException -> root.message ?: "Некорректный VLESS ключ"
+        is IllegalStateException -> root.message ?: "Операция недоступна"
+        is IOException -> root.message ?: "Ошибка ввода-вывода при работе с VPN"
         else -> root.message ?: root::class.simpleName ?: "Неизвестная ошибка"
     }
 }
@@ -490,50 +498,6 @@ private fun findRootCause(error: Throwable): Throwable {
         current = current.cause!!
     }
     return current
-}
-
-private fun sanitizeBaseUrl(input: String): String {
-    val trimmed = input.trim().ifEmpty { DEFAULT_VPN_SERVER_URL }
-    return trimmed.trimEnd('/')
-}
-
-private fun parseVpnConnectionResponse(payload: String): VpnConnectionViewData? {
-    val connectionId = extractJsonStringValue(payload, "\"connectionId\":\"") ?: return null
-    val status = extractJsonStringValue(payload, "\"status\":\"") ?: "UNKNOWN"
-    val host = extractJsonStringValue(payload, "\"host\":\"")
-    val port = extractJsonNumberValue(payload, "\"port\":")
-    val userId = extractJsonStringValue(payload, "\"userId\":\"")
-    val displayName = extractJsonStringValue(payload, "\"displayName\":\"")
-    val parameters = extractJsonObjectValue(payload, "\"parameters\":")
-    return VpnConnectionViewData(
-        connectionId = connectionId,
-        status = status,
-        host = host,
-        port = port,
-        userId = userId,
-        displayName = displayName,
-        parametersDescription = parameters,
-    )
-}
-
-private fun parseVpnDisconnectResponse(payload: String): String? {
-    return extractJsonStringValue(payload, "\"status\":\"")
-}
-
-private fun escapeJsonValue(value: String): String {
-    if (value.isEmpty()) return value
-    val builder = StringBuilder(value.length + 16)
-    value.forEach { ch ->
-        when (ch) {
-            '\\' -> builder.append("\\\\")
-            '"' -> builder.append("\\\"")
-            '\n' -> builder.append("\\n")
-            '\r' -> builder.append("\\r")
-            '\t' -> builder.append("\\t")
-            else -> builder.append(ch)
-        }
-    }
-    return builder.toString()
 }
 
 private fun callApi(
@@ -644,53 +608,6 @@ private fun callApi(
     } catch (t: Throwable) {
         "Ошибка: " + (t.message ?: t::class.simpleName)
     }
-}
-
-private fun extractJsonNumberValue(source: String, marker: String): Int? {
-    val startIndex = source.indexOf(marker)
-    if (startIndex < 0) return null
-    var index = startIndex + marker.length
-    while (index < source.length && source[index].isWhitespace()) {
-        index++
-    }
-    if (index >= source.length) return null
-    val builder = StringBuilder()
-    while (index < source.length) {
-        val ch = source[index]
-        if (ch.isDigit()) {
-            builder.append(ch)
-            index++
-        } else {
-            break
-        }
-    }
-    return builder.toString().toIntOrNull()
-}
-
-private fun extractJsonObjectValue(source: String, marker: String): String? {
-    val startIndex = source.indexOf(marker)
-    if (startIndex < 0) return null
-    var index = startIndex + marker.length
-    while (index < source.length && source[index] != '{') {
-        index++
-    }
-    if (index >= source.length || source[index] != '{') return null
-    var depth = 0
-    var i = index
-    while (i < source.length) {
-        val ch = source[i]
-        when (ch) {
-            '{' -> depth++
-            '}' -> {
-                depth--
-                if (depth == 0) {
-                    return source.substring(index, i + 1)
-                }
-            }
-        }
-        i++
-    }
-    return null
 }
 
 private fun extractJsonStringValue(source: String, marker: String): String? {
