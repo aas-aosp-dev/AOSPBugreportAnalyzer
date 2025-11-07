@@ -3,6 +3,7 @@ package com.bigdotdev.aospbugreportanalyzer.infra
 import com.bigdotdev.aospbugreportanalyzer.domain.ChatMessage
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
@@ -82,7 +83,8 @@ class OpenRouterClient(
     private data class OpenRouterRequest(
         val model: String,
         val messages: List<ChatMessagePayload>,
-        val response_format: ResponseFormat? = null,
+        @SerialName("response_format")
+        val responseFormat: ResponseFormat? = null,
         val temperature: Double? = null
     )
 
