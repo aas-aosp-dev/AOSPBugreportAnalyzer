@@ -4,42 +4,41 @@ import com.bigdotdev.aospbugreportanalyzer.domain.ChatMessage
 import com.bigdotdev.aospbugreportanalyzer.domain.ChatRequest
 import com.bigdotdev.aospbugreportanalyzer.domain.SystemPromptPolicy
 
+private val GREETING_REGEX = Regex("^(hi|hello|hey|привет|здравствуй|hola|bonjour)([!., ]|$)", RegexOption.IGNORE_CASE)
+
 class BuildPrompt {
     operator fun invoke(request: ChatRequest): List<ChatMessage> {
         val messages = mutableListOf<ChatMessage>()
 
-        val systemPrompt = resolveSystemPrompt(request)
-        if (systemPrompt != null) {
-            messages += ChatMessage(role = "system", content = systemPrompt)
+        resolveSystemPrompt(request)?.let { prompt ->
+            messages += ChatMessage(role = "system", content = prompt)
         }
 
         if (request.history.isNotEmpty()) {
             messages += request.history
         }
 
-        val userContent = request.userInput.ifBlank {
-            if (request.strictJson) {
-                "Summarize the conversation so far and echo the latest user intent as a summary item."
-            } else {
-                "Provide a helpful summary of the conversation so far."
-            }
-        }
-
-        messages += ChatMessage(role = "user", content = userContent)
+        val userMessage = ChatMessage(role = "user", content = buildUserContent(request))
+        messages += userMessage
 
         return messages
     }
 
     private fun resolveSystemPrompt(request: ChatRequest): String? {
-        val requestedPrompt = request.systemPrompt?.takeIf { it.isNotBlank() }
-        if (requestedPrompt != null) {
-            return requestedPrompt
+        val override = request.systemPrompt?.takeIf { it.isNotBlank() }
+        return override ?: request.strictJson.takeIf { it }?.let { SystemPromptPolicy.DEFAULT }
+    }
+
+    private fun buildUserContent(request: ChatRequest): String {
+        val trimmed = request.userInput.trim()
+        if (!request.strictJson) {
+            return trimmed.ifEmpty { "Please summarise our discussion so far and continue the conversation." }
         }
 
-        return if (request.strictJson) {
-            SystemPromptPolicy.DEFAULT
-        } else {
-            null
+        if (trimmed.isEmpty() || GREETING_REGEX.containsMatchIn(trimmed)) {
+            return "Summarise the existing conversation and produce at least one item describing the user's greeting. Echo the user input verbatim in the summary item."
         }
+
+        return trimmed
     }
 }

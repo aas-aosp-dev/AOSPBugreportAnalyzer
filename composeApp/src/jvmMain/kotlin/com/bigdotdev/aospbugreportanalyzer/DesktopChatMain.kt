@@ -21,9 +21,9 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
@@ -35,6 +35,10 @@ import androidx.compose.ui.window.application
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonElement
+import java.util.UUID
 
 private const val DEFAULT_OPENROUTER_MODEL = "gpt-4o-mini"
 
@@ -103,6 +107,8 @@ private enum class ProviderOption(val displayName: String, val apiName: String) 
     OpenRouter("OpenRouter", "openrouter")
 }
 
+private val JsonPrettyPrinter = Json { prettyPrint = true }
+
 @OptIn(ExperimentalMaterial3Api::class)
 fun main() = application {
     Window(onCloseRequest = ::exitApplication, title = "AOSP Bugreport Analyzer — Chat") {
@@ -116,6 +122,7 @@ fun main() = application {
 @Composable
 private fun DesktopChatApp() {
     val scope = rememberCoroutineScope()
+    val sessionId = remember { UUID.randomUUID().toString() }
 
     var provider by remember { mutableStateOf(ProviderOption.OpenRouter) }
     var model by remember {
@@ -171,16 +178,22 @@ private fun DesktopChatApp() {
                         } else {
                             systemPromptText
                         },
-                        responseFormat = if (strictJsonEnabled || researchModeEnabled) "json" else "text"
+                        responseFormat = if (strictJsonEnabled || researchModeEnabled) "json" else "text",
+                        sessionId = sessionId
                     )
                 )
             }
 
             if (!response.ok) {
-                error = response.error ?: response.text ?: "Неизвестная ошибка сервера"
+                val baseError = response.error ?: response.text ?: "Неизвестная ошибка сервера"
+                error = if (response.retryAfterMs != null) {
+                    "$baseError (повторите через ${response.retryAfterMs} мс)"
+                } else {
+                    baseError
+                }
             } else {
                 val assistantReply = when (response.contentType.lowercase()) {
-                    "json" -> response.data ?: "{}"
+                    "json" -> response.data?.let { JsonPrettyPrinter.encodeToString(JsonElement.serializer(), it) } ?: "{}"
                     else -> response.text ?: ""
                 }
                 history += "assistant" to assistantReply.ifBlank { "(пустой ответ)" }

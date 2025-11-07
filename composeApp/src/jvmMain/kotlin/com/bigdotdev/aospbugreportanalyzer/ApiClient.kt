@@ -11,8 +11,10 @@ import java.net.URI
 import java.net.http.HttpClient
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
+import java.time.Duration
 
 private const val DEFAULT_BFF_URL = "http://localhost:8080"
+private val CLIENT_JSON = Json { ignoreUnknownKeys = true; prettyPrint = false }
 
 @Serializable
 data class ChatBffRequest(
@@ -22,7 +24,9 @@ data class ChatBffRequest(
     @SerialName("user_input") val userInput: String,
     @SerialName("strict_json") val strictJson: Boolean,
     @SerialName("system_prompt") val systemPrompt: String?,
-    @SerialName("response_format") val responseFormat: String = "json"
+    @SerialName("response_format") val responseFormat: String = "json",
+    @SerialName("session_id") val sessionId: String? = null,
+    val agent: String? = null
 )
 
 @Serializable
@@ -37,26 +41,30 @@ private data class ChatBffResponsePayload(
     @SerialName("content_type") val contentType: String,
     val data: JsonElement? = null,
     val text: String? = null,
-    val error: String? = null
+    val error: String? = null,
+    val retryAfterMs: Long? = null
 )
 
 data class ChatBffResponse(
     val ok: Boolean,
     val contentType: String,
-    val data: String? = null,
+    val data: JsonElement? = null,
     val text: String? = null,
-    val error: String? = null
+    val error: String? = null,
+    val retryAfterMs: Long? = null
 )
 
 object ApiClient {
-    private val httpClient: HttpClient = HttpClient.newBuilder().build()
-    private val json = Json { ignoreUnknownKeys = true; prettyPrint = false }
+    private val httpClient: HttpClient = HttpClient.newBuilder()
+        .connectTimeout(Duration.ofSeconds(30))
+        .build()
 
     suspend fun chatComplete(request: ChatBffRequest, baseUrl: String = DEFAULT_BFF_URL): ChatBffResponse {
-        val body = json.encodeToString(request)
+        val body = CLIENT_JSON.encodeToString(request)
         val httpRequest = HttpRequest.newBuilder()
             .uri(URI.create("$baseUrl/api/v1/chat/complete"))
             .header("Content-Type", "application/json")
+            .timeout(Duration.ofSeconds(30))
             .POST(HttpRequest.BodyPublishers.ofString(body))
             .build()
 
@@ -68,37 +76,39 @@ object ApiClient {
             return ChatBffResponse(
                 ok = false,
                 contentType = "text",
-                text = null,
-                error = throwable.message ?: "Failed to call BFF"
+                error = throwable.message ?: "Не удалось подключиться к серверу"
             )
         }
 
         val responseBody = response.body()
+        val payload = runCatching { CLIENT_JSON.decodeFromString(ChatBffResponsePayload.serializer(), responseBody) }
+            .getOrElse { throwable ->
+                return ChatBffResponse(
+                    ok = response.statusCode() in 200..299,
+                    contentType = "text",
+                    text = responseBody,
+                    error = throwable.message ?: "Не удалось прочитать ответ сервера"
+                )
+            }
+
         if (response.statusCode() !in 200..299) {
             return ChatBffResponse(
                 ok = false,
-                contentType = "text",
-                text = responseBody,
-                error = "BFF returned ${response.statusCode()}"
+                contentType = payload.contentType,
+                data = payload.data,
+                text = payload.text,
+                error = payload.error ?: "Сервер вернул ошибку ${response.statusCode()}",
+                retryAfterMs = payload.retryAfterMs
             )
         }
-
-        val payload = runCatching { json.decodeFromString<ChatBffResponsePayload>(responseBody) }
-            .getOrElse { throwable ->
-                return ChatBffResponse(
-                    ok = false,
-                    contentType = "text",
-                    text = responseBody,
-                    error = throwable.message ?: "Failed to decode BFF response"
-                )
-            }
 
         return ChatBffResponse(
             ok = payload.ok,
             contentType = payload.contentType,
-            data = payload.data?.let { json.encodeToString(JsonElement.serializer(), it) },
+            data = payload.data,
             text = payload.text,
-            error = payload.error
+            error = payload.error,
+            retryAfterMs = payload.retryAfterMs
         )
     }
 }

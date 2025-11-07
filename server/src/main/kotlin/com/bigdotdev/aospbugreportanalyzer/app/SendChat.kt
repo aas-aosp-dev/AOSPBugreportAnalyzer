@@ -3,6 +3,7 @@ package com.bigdotdev.aospbugreportanalyzer.app
 import com.bigdotdev.aospbugreportanalyzer.domain.ChatMessage
 import com.bigdotdev.aospbugreportanalyzer.domain.ChatRequest
 import com.bigdotdev.aospbugreportanalyzer.domain.ChatResponse
+import com.bigdotdev.aospbugreportanalyzer.domain.SystemPromptPolicy
 import com.bigdotdev.aospbugreportanalyzer.infra.ConversationStore
 import com.bigdotdev.aospbugreportanalyzer.infra.ProviderRouter
 
@@ -14,60 +15,56 @@ class SendChat(
 ) {
     suspend operator fun invoke(request: ChatRequest): ChatResponse {
         val persistedHistory = request.sessionId?.let(conversationStore::get).orEmpty()
-        val effectiveRequest = if (request.history.isEmpty() && persistedHistory.isNotEmpty()) {
-            request.copy(history = persistedHistory)
+        val messages = if (request.history.isEmpty() && persistedHistory.isNotEmpty()) {
+            buildPrompt(request.copy(history = persistedHistory))
         } else {
-            request
+            buildPrompt(request)
         }
 
-        val messages = buildPrompt(effectiveRequest)
+        val client = providerRouter.requireClient(request.provider)
+        val jsonMode = request.strictJson || request.responseFormat.equals("json", ignoreCase = true)
 
-        val client = providerRouter.route(request.provider)
-        val result = client.complete(
-            model = request.model,
-            messages = messages,
-            jsonMode = request.strictJson || request.responseFormat.equals("json", ignoreCase = true)
-        )
-
-        if (!result.ok) {
-            return ChatResponse(
-                ok = false,
-                contentType = "text",
-                text = result.error,
-                raw = result.raw
-            )
-        }
-
-        val rawContent = result.content.orEmpty()
+        val rawContent = client.complete(request.model, messages, jsonMode)
 
         request.sessionId?.let { sessionId ->
-            val userMessage = messages.lastOrNull { it.role == "user" }
-            if (userMessage != null) {
-                conversationStore.append(sessionId, userMessage)
-            }
+            messages.filter { it.role == "user" }.lastOrNull()?.let { conversationStore.append(sessionId, it) }
         }
 
-        return if (request.strictJson || request.responseFormat.equals("json", ignoreCase = true)) {
-            val json = ensureJson.ensure(rawContent)
+        if (!jsonMode) {
             request.sessionId?.let { sessionId ->
                 conversationStore.append(sessionId, ChatMessage("assistant", rawContent))
             }
-            ChatResponse(
-                ok = true,
-                contentType = "json",
-                data = json,
-                raw = rawContent
-            )
-        } else {
-            request.sessionId?.let { sessionId ->
-                conversationStore.append(sessionId, ChatMessage("assistant", rawContent))
-            }
-            ChatResponse(
+            return ChatResponse(
                 ok = true,
                 contentType = "text",
-                text = rawContent,
-                raw = rawContent
+                text = rawContent
             )
         }
+
+        val json = ensureJson.ensure(rawContent) { raw ->
+            runCatching {
+                client.complete(
+                    model = request.model,
+                    messages = listOf(
+                        ChatMessage(role = "system", content = SystemPromptPolicy.DEFAULT),
+                        ChatMessage(
+                            role = "user",
+                            content = "Return ONLY valid JSON. Fix this text to valid JSON without explanations: $raw"
+                        )
+                    ),
+                    jsonMode = true
+                )
+            }.getOrNull()
+        }
+
+        request.sessionId?.let { sessionId ->
+            conversationStore.append(sessionId, ChatMessage("assistant", rawContent))
+        }
+
+        return ChatResponse(
+            ok = true,
+            contentType = "json",
+            data = json
+        )
     }
 }

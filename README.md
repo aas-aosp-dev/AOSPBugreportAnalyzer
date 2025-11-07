@@ -12,7 +12,18 @@ This project contains a Compose Multiplatform desktop client and a Ktor-based ba
 ./gradlew :server:run
 ```
 
-The server starts on port `8080` by default. Configure provider credentials via environment variables before launching (for example, `OPENROUTER_API_KEY`).
+The server starts on port `8080` by default. Configure provider credentials via environment variables before launching:
+
+| Variable | Required for | Default |
+| --- | --- | --- |
+| `OPENROUTER_API_KEY` | OpenRouter access | – |
+| `OPENROUTER_BASE_URL` | OpenRouter base URL | `https://openrouter.ai/api/v1` |
+| `OPENROUTER_REFERER` | Optional HTTP referer header | Project GitHub URL |
+| `OPENROUTER_TITLE` | Optional `X-Title` header | `AOSP Bugreport Analyzer` |
+| `OPENAI_API_KEY` | OpenAI access | – |
+| `GROQ_API_KEY` | Groq access | – |
+
+If a provider key is missing the backend returns `400 { "ok": false, "error": "provider not configured" }`.
 
 ### 2. Run the desktop client
 
@@ -21,6 +32,8 @@ The server starts on port `8080` by default. Configure provider credentials via 
 ```
 
 The desktop app connects to `http://localhost:8080` and proxies all chat requests through the BFF. Provider API keys are **never** entered in the UI.
+
+> ℹ️ Conversation history is stored in-memory on the server and resets when the Ktor process restarts. SSE streaming is stubbed and currently returns `501`.
 
 ## HTTP API quickstart
 
