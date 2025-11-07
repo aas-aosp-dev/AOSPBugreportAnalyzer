@@ -12,8 +12,8 @@ import io.ktor.server.routing.get
 import io.ktor.server.routing.post
 import io.ktor.server.routing.route
 
+@Suppress("UNUSED_PARAMETER")
 fun Route.chatRoutes(sendChat: SendChat, streamChat: StreamChat) {
-    val _ = streamChat
     route("/api/v1/chat") {
         post("/complete") {
             val requestDto = runCatching { call.receive<ChatCompleteRequestDto>() }
