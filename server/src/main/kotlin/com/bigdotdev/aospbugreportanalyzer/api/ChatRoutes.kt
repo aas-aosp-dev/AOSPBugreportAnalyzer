@@ -7,21 +7,48 @@ import com.bigdotdev.aospbugreportanalyzer.infra.ProviderNotConfiguredException
 import com.bigdotdev.aospbugreportanalyzer.infra.ProviderRequestException
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.application.call
-import io.ktor.server.request.receive
+import io.ktor.server.request.receiveText
 import io.ktor.server.response.respond
 import io.ktor.server.routing.Route
 import io.ktor.server.routing.get
 import io.ktor.server.routing.post
 import io.ktor.server.routing.route
+import kotlinx.serialization.SerializationException
+import kotlinx.serialization.json.Json
 
 fun Route.chatRoutes(sendChat: SendChat, streamChat: StreamChat) {
     route("/api/v1/chat") {
         post("/complete") {
-            val dto = runCatching { call.receive<ChatCompleteRequest>() }
+            val rawBody = runCatching { call.receiveText() }
                 .getOrElse { throwable ->
                     call.respond(
                         HttpStatusCode.BadRequest,
-                        ChatCompleteResponse(ok = false, contentType = "text", error = throwable.message ?: "Invalid request")
+                        ChatCompleteResponse(
+                            ok = false,
+                            contentType = "text",
+                            error = throwable.message ?: "Unable to read request body"
+                        )
+                    )
+                    return@post
+                }
+
+            if (rawBody.isBlank()) {
+                call.respond(
+                    HttpStatusCode.BadRequest,
+                    ChatCompleteResponse(ok = false, contentType = "text", error = "Request body is empty")
+                )
+                return@post
+            }
+
+            val dto = runCatching { ApiJson.decodeFromString(ChatCompleteRequest.serializer(), rawBody) }
+                .getOrElse { throwable ->
+                    val message = when (throwable) {
+                        is SerializationException -> "Invalid request payload"
+                        else -> throwable.message ?: "Invalid request payload"
+                    }
+                    call.respond(
+                        HttpStatusCode.BadRequest,
+                        ChatCompleteResponse(ok = false, contentType = "text", error = message)
                     )
                     return@post
                 }
@@ -92,3 +119,5 @@ private fun ChatResponse.toDto(): ChatCompleteResponse = ChatCompleteResponse(
     error = error,
     retryAfterMs = retryAfterMs
 )
+
+private val ApiJson = Json { ignoreUnknownKeys = true }
