@@ -51,6 +51,8 @@ import java.util.UUID
 private enum class TeamId { DEV, DESIGN, ANALYTICS }
 private enum class Role { USER, TEAM_LEAD, EMPLOYEE }
 
+private enum class Screen { MAIN, SETTINGS }
+
 private data class Member(
     val name: String,
     val role: Role,
@@ -132,18 +134,31 @@ private data class ORRequest(
     val temperature: Double? = 0.2
 )
 
-private val SYSTEM_V3 = """
-You are a concise teammate. Keep answers short and actionable.
-If JSON mode is enabled, return ONLY valid JSON (UTF-8) with keys: version, ok, generated_at, items, error.
+private val SYSTEM_TEXT = """
+You are a concise teammate. Keep answers short, actionable, and plain text without extra formatting.
 """.trimIndent()
+
+private val SYSTEM_JSON = """
+You are a concise teammate. Keep answers short and actionable.
+Return ONLY valid JSON (UTF-8) with keys: version, ok, generated_at, items, error.
+""".trimIndent()
+
+data class AppSettings(
+    val openRouterApiKey: String = System.getenv("OPENROUTER_API_KEY") ?: "",
+    val openRouterModel: String = "openai/gpt-4o-mini",
+    val strictJsonEnabled: Boolean = false
+)
+
+private fun selectSystemPrompt(forceJson: Boolean): String = if (forceJson) SYSTEM_JSON else SYSTEM_TEXT
 
 private fun buildMessagesForMember(
     member: Member,
     team: Team,
     task: String,
-    priorTeamMessages: List<ChatMessage>
+    priorTeamMessages: List<ChatMessage>,
+    systemPrompt: String
 ): List<ORMessage> {
-    val sys = ORMessage("system", SYSTEM_V3)
+    val sys = ORMessage("system", systemPrompt)
     val persona = ORMessage(
         "system",
         "Your name: ${member.name}. Role: ${member.position}. Persona: ${member.prompt}. Team: ${team.title}."
@@ -166,7 +181,7 @@ private fun callOpenRouter(
 ): String {
     val key = apiKeyOverride?.takeIf { it.isNotBlank() } ?: OpenRouterConfig.apiKey
     if (key.isNullOrBlank()) {
-        return jsonError("openrouter api key missing")
+        return errorResponse(forceJson, "openrouter api key missing")
     }
 
     val request = ORRequest(
@@ -212,12 +227,12 @@ private fun callOpenRouter(
     return try {
         val response = httpClient.send(httpRequest, HttpResponse.BodyHandlers.ofString())
         if (response.statusCode() / 100 != 2) {
-            return jsonError("openrouter http ${response.statusCode()}")
+            return errorResponse(forceJson, "openrouter http ${response.statusCode()}")
         }
         val content = extractContentFromOpenAIJson(response.body())
-        content ?: jsonError("openrouter empty content")
+        content ?: errorResponse(forceJson, "openrouter empty content")
     } catch (t: Throwable) {
-        jsonError(t.message ?: t::class.simpleName ?: "unknown error")
+        errorResponse(forceJson, t.message ?: t::class.simpleName ?: "unknown error")
     }
 }
 
@@ -300,6 +315,9 @@ private fun jsonError(message: String): String {
     return "{\"version\":\"1.0\",\"ok\":false,\"generated_at\":\"\",\"items\":[],\"error\":\"$escaped\"}"
 }
 
+private fun errorResponse(forceJson: Boolean, message: String): String =
+    if (forceJson) jsonError(message) else "Error: $message"
+
 private fun ConversationState.clone(activeRoomOverride: ChatRoomId = activeRoom): ConversationState {
     val mainCopy = main.toMutableList()
     val threadsCopy = mutableMapOf<TeamId, MutableList<ChatMessage>>()
@@ -335,6 +353,7 @@ private class TeamLLMOrchestrator(
     private val maxTeamMsgs = 10
     private val maxMainDebateMsgs = 10
     private val mutex = Mutex()
+    private val systemPrompt = selectSystemPrompt(forceJson)
 
     suspend fun runTeamRound(teamId: TeamId, task: String) {
         val team = teams.first { it.id == teamId }
@@ -347,7 +366,7 @@ private class TeamLLMOrchestrator(
                 if (thread.size >= maxTeamMsgs) return
                 thread.toList()
             }
-            val msgs = buildMessagesForMember(member, team, task, context)
+            val msgs = buildMessagesForMember(member, team, task, context, systemPrompt)
             val content = callOpenRouter(model, msgs, forceJson, apiKeyProvider())
             val newState = mutex.withLock {
                 val snapshot = getState()
@@ -382,7 +401,7 @@ private class TeamLLMOrchestrator(
     suspend fun postTeamSummariesToMain(task: String) {
         for (team in teams) {
             val msgs = listOf(
-                ORMessage("system", SYSTEM_V3),
+                ORMessage("system", systemPrompt),
                 ORMessage("system", "You are ${team.lead.name}, ${team.lead.position}."),
                 ORMessage("user", "Summarize your team's solution for the main room in 2–3 sentences. Task: $task")
             )
@@ -418,7 +437,7 @@ private class TeamLLMOrchestrator(
                 snapshot.main.takeLast(4)
             }
             val msgs = mutableListOf(
-                ORMessage("system", SYSTEM_V3),
+                ORMessage("system", systemPrompt),
                 ORMessage("system", "You are ${team.lead.name}, ${team.lead.position}. Debate briefly.")
             )
             msgs += context.map { ORMessage("user", "[${it.author}] ${it.text}") }
@@ -454,7 +473,7 @@ private class TeamLLMOrchestrator(
     suspend fun sendLeadMessage(teamId: TeamId, task: String) {
         val team = teams.first { it.id == teamId }
         val context = mutex.withLock { getState().teamThreads.getValue(teamId).toList() }
-        val msgs = buildMessagesForMember(team.lead, team, task, context)
+        val msgs = buildMessagesForMember(team.lead, team, task, context, systemPrompt)
         val content = callOpenRouter(model, msgs, forceJson, apiKeyProvider())
         val newState = mutex.withLock {
             val snapshot = getState()
@@ -502,20 +521,18 @@ private fun DesktopChatApp() {
     val scope = rememberCoroutineScope()
     val teams = remember { teamsSeed }
     var state by remember { mutableStateOf(ConversationState()) }
-    var apiKey by remember { mutableStateOf(OpenRouterConfig.apiKey.orEmpty()) }
-    var model by remember { mutableStateOf("openai/gpt-4o-mini") }
-    var forceJson by remember { mutableStateOf(false) }
+    var settings by remember { mutableStateOf(AppSettings()) }
+    var screen by remember { mutableStateOf(Screen.MAIN) }
     var taskInput by remember { mutableStateOf("") }
     var isProcessing by remember { mutableStateOf(false) }
     var lastTask by remember { mutableStateOf("") }
-    var showApiKey by remember { mutableStateOf(false) }
 
-    val apiKeyState by rememberUpdatedState(apiKey)
+    val apiKeyState by rememberUpdatedState(settings.openRouterApiKey)
 
-    val orchestrator = remember(teams, model, forceJson) {
+    val orchestrator = remember(teams, settings.openRouterModel, settings.strictJsonEnabled) {
         TeamLLMOrchestrator(
-            model = model,
-            forceJson = forceJson,
+            model = settings.openRouterModel,
+            forceJson = settings.strictJsonEnabled,
             teams = teams,
             getState = { state },
             setState = { newState -> state = newState },
@@ -538,7 +555,7 @@ private fun DesktopChatApp() {
     fun sendTask() {
         val task = taskInput.trim()
         if (task.isEmpty() || isProcessing) return
-        val resolvedKey = apiKey.takeIf { it.isNotBlank() } ?: OpenRouterConfig.apiKey
+        val resolvedKey = settings.openRouterApiKey.takeIf { it.isNotBlank() } ?: OpenRouterConfig.apiKey
         if (resolvedKey.isNullOrBlank()) {
             appendUserMessage("OPENROUTER_API_KEY is not set")
             taskInput = ""
@@ -567,159 +584,195 @@ private fun DesktopChatApp() {
     }
 
     LaunchedEffect(Unit) {
-        if ((apiKey.takeIf { it.isNotBlank() } ?: OpenRouterConfig.apiKey).isNullOrBlank()) {
+        if ((settings.openRouterApiKey.takeIf { it.isNotBlank() } ?: OpenRouterConfig.apiKey).isNullOrBlank()) {
             appendUserMessage("Задайте OPENROUTER_API_KEY, чтобы команды могли отвечать.")
         }
     }
 
-    Scaffold(
-        topBar = {
-            TopAppBar(title = { Text("Командный чат — OpenRouter") })
-        }
-    ) { padding ->
-        Column(
-            Modifier
-                .padding(padding)
-                .fillMaxSize()
-                .padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(16.dp)
-        ) {
-            ConnectionSettings(
-                apiKey = apiKey,
-                onApiKeyChange = { apiKey = it },
-                model = model,
-                onModelChange = { model = it },
-                forceJson = forceJson,
-                onForceJsonChange = { forceJson = it },
-                showApiKey = showApiKey,
-                onToggleApiVisibility = { showApiKey = !showApiKey }
-            )
-
-            RoomNavigation(
-                teams = teams,
-                activeRoom = state.activeRoom,
-                onSelect = { room -> state = state.withActiveRoom(room) }
-            )
-
-            val messages = when (val room = state.activeRoom) {
-                ChatRoomId.Main -> state.main.toList()
-                is ChatRoomId.TeamRoom -> state.teamThreads[room.teamId]?.toList().orEmpty()
-            }
-
-            Box(
-                Modifier
-                    .weight(1f)
-                    .fillMaxWidth()
-            ) {
-                MessageList(messages)
-                if (isProcessing) {
-                    Box(
-                        modifier = Modifier
-                            .fillMaxSize(),
-                        contentAlignment = Alignment.BottomEnd
-                    ) {
-                        CircularProgressIndicator()
-                    }
-                }
-            }
-
-            when (val room = state.activeRoom) {
-                ChatRoomId.Main -> {
-                    OutlinedTextField(
-                        value = taskInput,
-                        onValueChange = { taskInput = it },
-                        modifier = Modifier.fillMaxWidth(),
-                        label = { Text("Задача для команд") }
+    when (screen) {
+        Screen.MAIN -> {
+            Scaffold(
+                topBar = {
+                    TopAppBar(
+                        title = { Text("Командный чат — OpenRouter") },
+                        actions = {
+                            TextButton(onClick = { screen = Screen.SETTINGS }) {
+                                Text("Настройки")
+                            }
+                        }
                     )
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
+                }
+            ) { padding ->
+                Column(
+                    Modifier
+                        .padding(padding)
+                        .fillMaxSize()
+                        .padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(16.dp)
+                ) {
+                    RoomNavigation(
+                        teams = teams,
+                        activeRoom = state.activeRoom,
+                        onSelect = { room -> state = state.withActiveRoom(room) }
+                    )
+
+                    val messages = when (val room = state.activeRoom) {
+                        ChatRoomId.Main -> state.main.toList()
+                        is ChatRoomId.TeamRoom -> state.teamThreads[room.teamId]?.toList().orEmpty()
+                    }
+
+                    Box(
+                        Modifier
+                            .weight(1f)
+                            .fillMaxWidth()
                     ) {
-                        Button(
-                            onClick = { sendTask() },
-                            enabled = taskInput.isNotBlank() && !isProcessing
-                        ) {
-                            Text("Отправить в команды")
-                        }
-                        if (lastTask.isNotBlank()) {
-                            Text("Текущая задача: ${lastTask}")
+                        MessageList(messages)
+                        if (isProcessing) {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxSize(),
+                                contentAlignment = Alignment.BottomEnd
+                            ) {
+                                CircularProgressIndicator()
+                            }
                         }
                     }
-                }
-                is ChatRoomId.TeamRoom -> {
-                    val team = teams.first { it.id == room.teamId }
-                    Column(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        Text("Внутренний чат команды \"${team.title}\"")
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text("Лимит: ${state.teamThreads[team.id]?.size ?: 0} / 10")
-                            TextButton(
-                                onClick = {
-                                    if (lastTask.isNotBlank() && !isProcessing) {
-                                        scope.launch(Dispatchers.IO) {
-                                            orchestrator.sendLeadMessage(team.id, lastTask)
-                                        }
-                                    }
-                                },
-                                enabled = lastTask.isNotBlank() && !isProcessing && !orchestrator.reachedTeamLimit(team.id)
+
+                    when (val room = state.activeRoom) {
+                        ChatRoomId.Main -> {
+                            OutlinedTextField(
+                                value = taskInput,
+                                onValueChange = { taskInput = it },
+                                modifier = Modifier.fillMaxWidth(),
+                                label = { Text("Задача для команд") }
+                            )
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
                             ) {
-                                Text("Отправить (тимлид)")
+                                Button(
+                                    onClick = { sendTask() },
+                                    enabled = taskInput.isNotBlank() && !isProcessing
+                                ) {
+                                    Text("Отправить в команды")
+                                }
+                                if (lastTask.isNotBlank()) {
+                                    Text("Текущая задача: ${lastTask}")
+                                }
+                            }
+                        }
+                        is ChatRoomId.TeamRoom -> {
+                            val team = teams.first { it.id == room.teamId }
+                            Column(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                Text("Внутренний чат команды \"${team.title}\"")
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Text("Лимит: ${state.teamThreads[team.id]?.size ?: 0} / 10")
+                                    TextButton(
+                                        onClick = {
+                                            if (lastTask.isNotBlank() && !isProcessing) {
+                                                scope.launch(Dispatchers.IO) {
+                                                    orchestrator.sendLeadMessage(team.id, lastTask)
+                                                }
+                                            }
+                                        },
+                                        enabled = lastTask.isNotBlank() && !isProcessing && !orchestrator.reachedTeamLimit(team.id)
+                                    ) {
+                                        Text("Отправить (тимлид)")
+                                    }
+                                }
                             }
                         }
                     }
                 }
             }
         }
+        Screen.SETTINGS -> {
+            SettingsScreen(
+                settings = settings,
+                onChange = { settings = it },
+                onClose = { screen = Screen.MAIN }
+            )
+        }
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun ConnectionSettings(
-    apiKey: String,
-    onApiKeyChange: (String) -> Unit,
-    model: String,
-    onModelChange: (String) -> Unit,
-    forceJson: Boolean,
-    onForceJsonChange: (Boolean) -> Unit,
-    showApiKey: Boolean,
-    onToggleApiVisibility: () -> Unit
+private fun SettingsScreen(
+    settings: AppSettings,
+    onChange: (AppSettings) -> Unit,
+    onClose: () -> Unit
 ) {
-    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Text("Настройки OpenRouter", style = MaterialTheme.typography.titleMedium)
-        OutlinedTextField(
-            value = apiKey,
-            onValueChange = onApiKeyChange,
-            label = { Text("API Key") },
-            modifier = Modifier.fillMaxWidth(),
-            visualTransformation = if (showApiKey) VisualTransformation.None else PasswordVisualTransformation(),
-            trailingIcon = {
-                IconButton(onClick = onToggleApiVisibility) {
-                    Icon(
-                        imageVector = if (showApiKey) Icons.Default.Visibility else Icons.Default.VisibilityOff,
-                        contentDescription = if (showApiKey) "Скрыть ключ" else "Показать ключ"
-                    )
+    var draft by remember(settings) { mutableStateOf(settings) }
+    var showApiKey by remember { mutableStateOf(false) }
+
+    Scaffold(
+        topBar = {
+            TopAppBar(title = { Text("Настройки OpenRouter") })
+        }
+    ) { padding ->
+        Column(
+            modifier = Modifier
+                .padding(padding)
+                .fillMaxSize()
+                .padding(24.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp)
+        ) {
+            OutlinedTextField(
+                value = draft.openRouterApiKey,
+                onValueChange = { draft = draft.copy(openRouterApiKey = it) },
+                label = { Text("API Key") },
+                modifier = Modifier.fillMaxWidth(),
+                visualTransformation = if (showApiKey) VisualTransformation.None else PasswordVisualTransformation(),
+                trailingIcon = {
+                    IconButton(onClick = { showApiKey = !showApiKey }) {
+                        Icon(
+                            imageVector = if (showApiKey) Icons.Default.Visibility else Icons.Default.VisibilityOff,
+                            contentDescription = if (showApiKey) "Скрыть ключ" else "Показать ключ"
+                        )
+                    }
+                }
+            )
+            OutlinedTextField(
+                value = draft.openRouterModel,
+                onValueChange = { draft = draft.copy(openRouterModel = it) },
+                label = { Text("Модель") },
+                modifier = Modifier.fillMaxWidth()
+            )
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Switch(
+                    checked = draft.strictJsonEnabled,
+                    onCheckedChange = { draft = draft.copy(strictJsonEnabled = it) }
+                )
+                Text("Строгий JSON (response_format)")
+            }
+            Spacer(modifier = Modifier.weight(1f))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp, Alignment.End),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Button(onClick = {
+                    onChange(draft)
+                    onClose()
+                }) {
+                    Text("Сохранить")
+                }
+                TextButton(onClick = onClose) {
+                    Text("Назад")
                 }
             }
-        )
-        OutlinedTextField(
-            value = model,
-            onValueChange = onModelChange,
-            label = { Text("Модель") },
-            modifier = Modifier.fillMaxWidth()
-        )
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            Switch(checked = forceJson, onCheckedChange = onForceJsonChange)
-            Text("Строгий JSON (response_format)")
         }
     }
 }
