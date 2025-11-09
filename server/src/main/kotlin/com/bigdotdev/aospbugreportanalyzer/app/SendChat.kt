@@ -15,23 +15,31 @@ class SendChat(
 ) {
     suspend operator fun invoke(request: ChatRequest): ChatResponse {
         val persistedHistory = request.sessionId?.let(conversationStore::get).orEmpty()
-        val messages = if (request.history.isEmpty() && persistedHistory.isNotEmpty()) {
-            buildPrompt(request.copy(history = persistedHistory))
-        } else {
-            buildPrompt(request)
+        val combinedHistory = when {
+            persistedHistory.isEmpty() -> request.history
+            request.history.isEmpty() -> persistedHistory
+            persistedHistory.size >= request.history.size &&
+                persistedHistory.takeLast(request.history.size) == request.history -> persistedHistory
+            else -> persistedHistory + request.history
         }
+
+        val effectiveRequest = if (combinedHistory === request.history) {
+            request
+        } else {
+            request.copy(history = combinedHistory)
+        }
+
+        val messages = buildPrompt(effectiveRequest)
+        val userMessage = messages.lastOrNull { it.role == "user" }
 
         val client = providerRouter.requireClient(request.provider)
         val jsonMode = request.strictJson || request.responseFormat.equals("json", ignoreCase = true)
 
         val rawContent = client.complete(request.model, messages, jsonMode)
 
-        request.sessionId?.let { sessionId ->
-            messages.filter { it.role == "user" }.lastOrNull()?.let { conversationStore.append(sessionId, it) }
-        }
-
         if (!jsonMode) {
             request.sessionId?.let { sessionId ->
+                userMessage?.let { conversationStore.append(sessionId, it) }
                 conversationStore.append(sessionId, ChatMessage("assistant", rawContent))
             }
             return ChatResponse(
@@ -58,7 +66,8 @@ class SendChat(
         }
 
         request.sessionId?.let { sessionId ->
-            conversationStore.append(sessionId, ChatMessage("assistant", rawContent))
+            userMessage?.let { conversationStore.append(sessionId, it) }
+            conversationStore.append(sessionId, ChatMessage("assistant", json.toString()))
         }
 
         return ChatResponse(
