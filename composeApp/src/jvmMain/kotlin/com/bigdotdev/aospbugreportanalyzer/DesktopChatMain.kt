@@ -132,7 +132,7 @@ private data class ORRequest(
     val temperature: Double? = 0.2
 )
 
-private const val SYSTEM_V3 = """
+private val SYSTEM_V3 = """
 You are a concise teammate. Keep answers short and actionable.
 If JSON mode is enabled, return ONLY valid JSON (UTF-8) with keys: version, ok, generated_at, items, error.
 """.trimIndent()
