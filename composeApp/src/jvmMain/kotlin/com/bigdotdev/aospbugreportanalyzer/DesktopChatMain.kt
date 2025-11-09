@@ -1,125 +1,495 @@
 package com.bigdotdev.aospbugreportanalyzer
 
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.ArrowBack
-import androidx.compose.material.icons.filled.ContentCopy
-import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material3.Button
-import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.ExposedDropdownMenuBox
-import androidx.compose.material3.ExposedDropdownMenuDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.mutableStateListOf
-import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.platform.LocalClipboardManager
-import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Window
 import androidx.compose.ui.window.application
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.net.URI
 import java.net.http.HttpClient
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
+import java.time.Instant
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
+import java.util.UUID
 
-// Необязательные, но рекомендуемые заголовки для OpenRouter
-private const val OPENROUTER_REFERER = "https://github.com/aas-aosp-dev/AOSPBugreportAnalyzer"
-private const val OPENROUTER_TITLE = "AOSP Bugreport Analyzer"
-private const val DEFAULT_OPENROUTER_MODEL = "gpt-4o-mini"
+private enum class TeamId { DEV, DESIGN, ANALYTICS }
+private enum class Role { USER, TEAM_LEAD, EMPLOYEE }
 
-private val RESEARCH_MODE_PROMPT = """
-Ты — аналитик и фасилитатор. Общайся кратко, задавай по одному уточняющему вопросу за раз.
-Цель: собрать требования и в нужный момент выдать итоговый документ (ТЗ).
+private data class Member(
+    val name: String,
+    val role: Role,
+    val position: String,
+    val prompt: String
+)
 
-Когда информации недостаточно — задавай уточнения.
-Когда информации достаточно — сформируй ТЗ строго по итоговому формату (см. ниже), затем выведи маркер <END_TZ> и остановись.
+private data class Team(
+    val id: TeamId,
+    val title: String,
+    val lead: Member,
+    val employees: List<Member>
+)
 
-Итоговый формат (строго JSON UTF-8, без Markdown и лишнего текста):
-{
-  "complete": true,
-  "generated_at": "<ISO8601>",
-  "tz": {
-    "title": "<строка>",
-    "problem": "<1-3 предложения>",
-    "goals": ["<цель 1>", "<цель 2>"],
-    "non_goals": ["<что не делаем>"],
-    "scope": {
-      "in": ["<что входит>"],
-      "out": ["<что не входит>"]
-    },
-    "stakeholders": ["<кто участвует>"],
-    "inputs": ["<исходные данные>"],
-    "deliverables": ["<результаты/артефакты>"],
-    "acceptance": ["<критерии приёмки>"],
-    "risks": ["<риски>"],
-    "timeline": "<оценка сроков/этапов>"
-  }
+private sealed class ChatRoomId {
+    data object Main : ChatRoomId()
+    data class TeamRoom(val teamId: TeamId) : ChatRoomId()
 }
 
-Во время диалога (до готовности) отвечай только в виде JSON:
-{
-  "complete": false,
-  "ask": "<один конкретный вопрос пользователю>",
-  "known": { "title": "...", "goals": [...], "...": "..." }
+private data class ChatMessage(
+    val id: String,
+    val room: ChatRoomId,
+    val author: String,
+    val role: Role,
+    val text: String,
+    val timestamp: Long
+)
+
+private data class ConversationState(
+    val main: MutableList<ChatMessage> = mutableListOf(),
+    val teamThreads: MutableMap<TeamId, MutableList<ChatMessage>> = mutableMapOf(
+        TeamId.DEV to mutableListOf(),
+        TeamId.DESIGN to mutableListOf(),
+        TeamId.ANALYTICS to mutableListOf()
+    ),
+    val activeRoom: ChatRoomId = ChatRoomId.Main
+)
+
+private val teamsSeed = listOf(
+    Team(
+        id = TeamId.DEV, title = "Разработка",
+        lead = Member("Тимлид Разраб", Role.TEAM_LEAD, "Tech Lead Android", prompt = "Act as Android tech lead. Provide concise, actionable steps with trade-offs."),
+        employees = listOf(
+            Member("Иван", Role.EMPLOYEE, "Senior Android Developer", prompt = "Senior Android dev. Focus on feasibility, code-level steps."),
+            Member("Максим", Role.EMPLOYEE, "Middle Android Developer", prompt = "Middle Android dev. Add implementation details and pitfalls.")
+        )
+    ),
+    Team(
+        id = TeamId.DESIGN, title = "Дизайн",
+        lead = Member("Тимлид Дизайн", Role.TEAM_LEAD, "Lead Product Designer", prompt = "Lead designer. Propose UX options with pros/cons."),
+        employees = listOf(
+            Member("Ольга", Role.EMPLOYEE, "Senior Product Designer", prompt = "Senior designer. Provide guidelines alignment."),
+            Member("Егор", Role.EMPLOYEE, "Middle UI Designer", prompt = "Middle UI designer. Provide specific UI states.")
+        )
+    ),
+    Team(
+        id = TeamId.ANALYTICS, title = "Аналитика",
+        lead = Member("Тимлид Аналитика", Role.TEAM_LEAD, "Lead Analyst", prompt = "Lead analyst. Define metrics, success criteria."),
+        employees = listOf(
+            Member("Илья", Role.EMPLOYEE, "Junior Analyst", prompt = "Junior analyst. Ask clarifying questions."),
+            Member("Анна", Role.EMPLOYEE, "Middle Data Analyst", prompt = "Middle data analyst. Add data collection plan.")
+        )
+    )
+)
+
+private object OpenRouterConfig {
+    const val BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
+    val apiKey: String? get() = System.getenv("OPENROUTER_API_KEY")
+    const val referer: String = "http://localhost"
+    const val title: String = "AOSPBugreportAnalyzer"
 }
 
-Строго:
-- Всегда JSON, без Markdown и пояснений.
-- Когда ТЗ готово, только один JSON с "complete": true, затем маркер <END_TZ>.
+private data class ORMessage(val role: String, val content: String)
+
+private data class ORRequest(
+    val model: String,
+    val messages: List<ORMessage>,
+    val response_format: Map<String, String>? = null,
+    val temperature: Double? = 0.2
+)
+
+private const val SYSTEM_V3 = """
+You are a concise teammate. Keep answers short and actionable.
+If JSON mode is enabled, return ONLY valid JSON (UTF-8) with keys: version, ok, generated_at, items, error.
 """.trimIndent()
 
-private val DEFAULT_SYSTEM_PROMPT = """
-You are a strict JSON formatter. Return ONLY valid JSON (UTF-8), no Markdown, no comments, no extra text.
-
-Always return an object:
-{
-  "version": "1.0",
-  "ok": true,
-  "generated_at": "<ISO8601>",
-  "items": [],
-  "error": ""
+private fun buildMessagesForMember(
+    member: Member,
+    team: Team,
+    task: String,
+    priorTeamMessages: List<ChatMessage>
+): List<ORMessage> {
+    val sys = ORMessage("system", SYSTEM_V3)
+    val persona = ORMessage(
+        "system",
+        "Your name: ${member.name}. Role: ${member.position}. Persona: ${member.prompt}. Team: ${team.title}."
+    )
+    val contextTail = priorTeamMessages.takeLast(3).map {
+        val role = if (it.role == Role.TEAM_LEAD || it.role == Role.EMPLOYEE) "user" else "system"
+        ORMessage(role, "[${it.author}] ${it.text}")
+    }
+    val taskMsg = ORMessage("user", "Task: $task")
+    return listOf(sys, persona) + contextTail + taskMsg
 }
 
-Behavioral rules:
-- Never return errors. If the request is unclear, conversational, or empty, still output ok=true and include a single item describing the user's intent.
-- Always include at least one item. Use this shape for the first item:
-  { "type": "summary", "intent": "<one-word label like 'greeting'|'smalltalk'|'other'>", "echo": "<verbatim user text>" }
-- If you can extract structured results, append them as additional items (e.g., { "type": "result", ... }).
-- Do not invent failures. Keep "error" empty.
-""".trimIndent()
+private val httpClient: HttpClient = HttpClient.newHttpClient()
 
-private enum class ProviderOption(val displayName: String) {
-    OpenRouter("OpenRouter")
+private fun callOpenRouter(
+    model: String,
+    messages: List<ORMessage>,
+    forceJson: Boolean,
+    apiKeyOverride: String?
+): String {
+    val key = apiKeyOverride?.takeIf { it.isNotBlank() } ?: OpenRouterConfig.apiKey
+    if (key.isNullOrBlank()) {
+        return jsonError("openrouter api key missing")
+    }
+
+    val request = ORRequest(
+        model = model,
+        messages = messages,
+        response_format = if (forceJson) mapOf("type" to "json_object") else null,
+        temperature = if (forceJson) 0.0 else 0.2
+    )
+
+    val body = buildString {
+        append('{')
+        append("\"model\":\"").append(encodeJsonString(request.model)).append('\"')
+        append(",\"messages\":[")
+        request.messages.forEachIndexed { index, msg ->
+            if (index > 0) append(',')
+            append('{')
+            append("\"role\":\"").append(encodeJsonString(msg.role)).append('\"')
+            append(",\"content\":\"").append(encodeJsonString(msg.content)).append('\"')
+            append('}')
+        }
+        append(']')
+        request.response_format?.let { format ->
+            append(",\"response_format\":{\"type\":\"")
+            append(encodeJsonString(format["type"] ?: "json_object"))
+            append("\"}")
+        }
+        request.temperature?.let {
+            append(",\"temperature\":")
+            append(it)
+        }
+        append('}')
+    }
+
+    val httpRequest = HttpRequest.newBuilder()
+        .uri(URI.create(OpenRouterConfig.BASE_URL))
+        .header("Authorization", "Bearer $key")
+        .header("Content-Type", "application/json")
+        .header("HTTP-Referer", OpenRouterConfig.referer)
+        .header("X-Title", OpenRouterConfig.title)
+        .POST(HttpRequest.BodyPublishers.ofString(body))
+        .build()
+
+    return try {
+        val response = httpClient.send(httpRequest, HttpResponse.BodyHandlers.ofString())
+        if (response.statusCode() / 100 != 2) {
+            return jsonError("openrouter http ${response.statusCode()}")
+        }
+        val content = extractContentFromOpenAIJson(response.body())
+        content ?: jsonError("openrouter empty content")
+    } catch (t: Throwable) {
+        jsonError(t.message ?: t::class.simpleName ?: "unknown error")
+    }
 }
+
+private fun encodeJsonString(value: String): String {
+    val sb = StringBuilder()
+    value.forEach { c ->
+        when (c) {
+            '\\' -> sb.append("\\\\")
+            '\"' -> sb.append("\\\"")
+            '\n' -> sb.append("\\n")
+            '\r' -> sb.append("\\r")
+            '\t' -> sb.append("\\t")
+            else -> sb.append(c)
+        }
+    }
+    return sb.toString()
+}
+
+private fun decodeJsonString(value: String): String {
+    val sb = StringBuilder()
+    var i = 0
+    while (i < value.length) {
+        val c = value[i]
+        if (c == '\\' && i + 1 < value.length) {
+            when (val next = value[i + 1]) {
+                '\\', '\"', '/' -> {
+                    sb.append(next)
+                    i += 2
+                }
+                'b' -> {
+                    sb.append('\b')
+                    i += 2
+                }
+                'f' -> {
+                    sb.append('\u000c')
+                    i += 2
+                }
+                'n' -> {
+                    sb.append('\n')
+                    i += 2
+                }
+                'r' -> {
+                    sb.append('\r')
+                    i += 2
+                }
+                't' -> {
+                    sb.append('\t')
+                    i += 2
+                }
+                'u' -> {
+                    if (i + 5 < value.length) {
+                        val hex = value.substring(i + 2, i + 6)
+                        hex.toIntOrNull(16)?.let { sb.append(it.toChar()) }
+                        i += 6
+                    } else {
+                        i++
+                    }
+                }
+                else -> {
+                    sb.append(next)
+                    i += 2
+                }
+            }
+        } else {
+            sb.append(c)
+            i++
+        }
+    }
+    return sb.toString()
+}
+
+private fun extractContentFromOpenAIJson(body: String): String? {
+    val regex = "\"content\"\\s*:\\s*\"((?:\\\\.|[^\\\\\"])*)\"".toRegex()
+    val match = regex.find(body) ?: return null
+    return decodeJsonString(match.groupValues[1]).ifBlank { null }
+}
+
+private fun jsonError(message: String): String {
+    val escaped = encodeJsonString(message)
+    return "{\"version\":\"1.0\",\"ok\":false,\"generated_at\":\"\",\"items\":[],\"error\":\"$escaped\"}"
+}
+
+private fun ConversationState.clone(activeRoomOverride: ChatRoomId = activeRoom): ConversationState {
+    val mainCopy = main.toMutableList()
+    val threadsCopy = mutableMapOf<TeamId, MutableList<ChatMessage>>()
+    for (teamId in TeamId.values()) {
+        threadsCopy[teamId] = (teamThreads[teamId] ?: mutableListOf()).toMutableList()
+    }
+    return ConversationState(mainCopy, threadsCopy, activeRoomOverride)
+}
+
+private fun ConversationState.addMainMessage(message: ChatMessage): ConversationState {
+    val copy = clone()
+    copy.main.add(message)
+    return copy
+}
+
+private fun ConversationState.addTeamMessage(teamId: TeamId, message: ChatMessage): ConversationState {
+    val copy = clone()
+    val list = copy.teamThreads.getValue(teamId)
+    list.add(message)
+    return copy
+}
+
+private fun ConversationState.withActiveRoom(room: ChatRoomId): ConversationState = clone(room)
+
+private class TeamLLMOrchestrator(
+    private val model: String,
+    private val forceJson: Boolean,
+    private val teams: List<Team>,
+    private val getState: () -> ConversationState,
+    private val setState: (ConversationState) -> Unit,
+    private val apiKeyProvider: () -> String?
+) {
+    private val maxTeamMsgs = 10
+    private val maxMainDebateMsgs = 10
+    private val mutex = Mutex()
+
+    suspend fun runTeamRound(teamId: TeamId, task: String) {
+        val team = teams.first { it.id == teamId }
+        val currentSize = mutex.withLock { getState().teamThreads.getValue(teamId).size }
+        if (currentSize >= maxTeamMsgs) return
+
+        suspend fun addFrom(member: Member) {
+            val context = mutex.withLock {
+                val thread = getState().teamThreads.getValue(teamId)
+                if (thread.size >= maxTeamMsgs) return
+                thread.toList()
+            }
+            val msgs = buildMessagesForMember(member, team, task, context)
+            val content = callOpenRouter(model, msgs, forceJson, apiKeyProvider())
+            val newState = mutex.withLock {
+                val snapshot = getState()
+                val thread = snapshot.teamThreads.getValue(teamId)
+                if (thread.size >= maxTeamMsgs) return
+                val message = ChatMessage(
+                    id = UUID.randomUUID().toString(),
+                    room = ChatRoomId.TeamRoom(teamId),
+                    author = member.name,
+                    role = member.role,
+                    text = content,
+                    timestamp = System.currentTimeMillis()
+                )
+                snapshot.addTeamMessage(teamId, message)
+            }
+            if (newState != null) {
+                withContext(Dispatchers.Main) {
+                    setState(newState)
+                }
+            }
+        }
+
+        val emp1 = team.employees.getOrNull(0)
+        val emp2 = team.employees.getOrNull(1)
+
+        addFrom(team.lead)
+        if (!reachedTeamLimit(teamId) && emp1 != null) addFrom(emp1)
+        if (!reachedTeamLimit(teamId) && emp2 != null) addFrom(emp2)
+        if (!reachedTeamLimit(teamId)) addFrom(team.lead)
+    }
+
+    suspend fun postTeamSummariesToMain(task: String) {
+        for (team in teams) {
+            val msgs = listOf(
+                ORMessage("system", SYSTEM_V3),
+                ORMessage("system", "You are ${team.lead.name}, ${team.lead.position}."),
+                ORMessage("user", "Summarize your team's solution for the main room in 2–3 sentences. Task: $task")
+            )
+            val content = callOpenRouter(model, msgs, forceJson, apiKeyProvider())
+            val newState = mutex.withLock {
+                val snapshot = getState()
+                val message = ChatMessage(
+                    id = UUID.randomUUID().toString(),
+                    room = ChatRoomId.Main,
+                    author = team.lead.name,
+                    role = Role.TEAM_LEAD,
+                    text = content,
+                    timestamp = System.currentTimeMillis()
+                )
+                snapshot.addMainMessage(message)
+            }
+            withContext(Dispatchers.Main) {
+                setState(newState)
+            }
+        }
+    }
+
+    suspend fun runLeadsDebate(task: String) {
+        val dev = teams.first { it.id == TeamId.DEV }
+        val design = teams.first { it.id == TeamId.DESIGN }
+        val analytics = teams.first { it.id == TeamId.ANALYTICS }
+
+        suspend fun leaderReply(team: Team, cue: String) {
+            val context = mutex.withLock {
+                val snapshot = getState()
+                val leadCount = snapshot.main.count { it.role == Role.TEAM_LEAD }
+                if (leadCount >= maxMainDebateMsgs) return
+                snapshot.main.takeLast(4)
+            }
+            val msgs = mutableListOf(
+                ORMessage("system", SYSTEM_V3),
+                ORMessage("system", "You are ${team.lead.name}, ${team.lead.position}. Debate briefly.")
+            )
+            msgs += context.map { ORMessage("user", "[${it.author}] ${it.text}") }
+            msgs += ORMessage("user", "Task: $task. Respond: $cue")
+
+            val content = callOpenRouter(model, msgs, forceJson, apiKeyProvider())
+            val newState = mutex.withLock {
+                val snapshot = getState()
+                val leadCount = snapshot.main.count { it.role == Role.TEAM_LEAD }
+                if (leadCount >= maxMainDebateMsgs) return
+                val message = ChatMessage(
+                    id = UUID.randomUUID().toString(),
+                    room = ChatRoomId.Main,
+                    author = team.lead.name,
+                    role = Role.TEAM_LEAD,
+                    text = content,
+                    timestamp = System.currentTimeMillis()
+                )
+                snapshot.addMainMessage(message)
+            }
+            if (newState != null) {
+                withContext(Dispatchers.Main) {
+                    setState(newState)
+                }
+            }
+        }
+
+        leaderReply(dev, "Argue for solution A briefly.")
+        leaderReply(design, "Add design constraints briefly.")
+        leaderReply(analytics, "Add analytics KPIs briefly.")
+    }
+
+    suspend fun sendLeadMessage(teamId: TeamId, task: String) {
+        val team = teams.first { it.id == teamId }
+        val context = mutex.withLock { getState().teamThreads.getValue(teamId).toList() }
+        val msgs = buildMessagesForMember(team.lead, team, task, context)
+        val content = callOpenRouter(model, msgs, forceJson, apiKeyProvider())
+        val newState = mutex.withLock {
+            val snapshot = getState()
+            val thread = snapshot.teamThreads.getValue(teamId)
+            if (thread.size >= maxTeamMsgs) return
+            val message = ChatMessage(
+                id = UUID.randomUUID().toString(),
+                room = ChatRoomId.TeamRoom(teamId),
+                author = team.lead.name,
+                role = team.lead.role,
+                text = content,
+                timestamp = System.currentTimeMillis()
+            )
+            snapshot.addTeamMessage(teamId, message)
+        }
+        if (newState != null) {
+            withContext(Dispatchers.Main) {
+                setState(newState)
+            }
+        }
+    }
+
+    fun reachedTeamLimit(teamId: TeamId): Boolean =
+        getState().teamThreads.getValue(teamId).size >= maxTeamMsgs
+}
+
+private val timeFormatter: DateTimeFormatter =
+    DateTimeFormatter.ofPattern("HH:mm:ss").withZone(ZoneId.systemDefault())
+
+private fun formatTimestamp(timestamp: Long): String =
+    timeFormatter.format(Instant.ofEpochMilli(timestamp))
 
 @OptIn(ExperimentalMaterial3Api::class)
 fun main() = application {
-    Window(onCloseRequest = ::exitApplication, title = "AOSP Bugreport Analyzer — Chat") {
+    Window(onCloseRequest = ::exitApplication, title = "AOSP Bugreport Analyzer — Команды") {
         MaterialTheme {
             DesktopChatApp()
         }
@@ -130,437 +500,274 @@ fun main() = application {
 @Composable
 private fun DesktopChatApp() {
     val scope = rememberCoroutineScope()
+    val teams = remember { teamsSeed }
+    var state by remember { mutableStateOf(ConversationState()) }
+    var apiKey by remember { mutableStateOf(OpenRouterConfig.apiKey.orEmpty()) }
+    var model by remember { mutableStateOf("openai/gpt-4o-mini") }
+    var forceJson by remember { mutableStateOf(false) }
+    var taskInput by remember { mutableStateOf("") }
+    var isProcessing by remember { mutableStateOf(false) }
+    var lastTask by remember { mutableStateOf("") }
+    var showApiKey by remember { mutableStateOf(false) }
 
-    var provider by remember { mutableStateOf(ProviderOption.OpenRouter) }
-    var apiKey by remember { mutableStateOf(System.getenv("OPENROUTER_API_KEY") ?: "") }
-    var model by remember {
-        mutableStateOf(
-            System.getenv("OPENROUTER_MODEL")?.takeIf { it.isNotBlank() } ?: DEFAULT_OPENROUTER_MODEL
-        )
-    }
-    var strictJsonEnabled by remember { mutableStateOf(true) }
-    var systemPromptText by remember { mutableStateOf(DEFAULT_SYSTEM_PROMPT) }
-    var researchModeEnabled by remember { mutableStateOf(false) }
+    val apiKeyState by rememberUpdatedState(apiKey)
 
-    var input by remember { mutableStateOf("") }
-    var isLoading by remember { mutableStateOf(false) }
-    var error by remember { mutableStateOf<String?>(null) }
-    val history = remember { mutableStateListOf<Pair<String, String>>() } // role -> content
-
-    var showSettings by remember { mutableStateOf(false) }
-
-    if (showSettings) {
-        SettingsScreen(
-            provider = provider,
-            onProviderChange = { provider = it },
-            apiKey = apiKey,
-            onApiKeyChange = { apiKey = it },
+    val orchestrator = remember(teams, model, forceJson) {
+        TeamLLMOrchestrator(
             model = model,
-            onModelChange = { model = it },
-            strictJsonEnabled = strictJsonEnabled,
-            onStrictJsonChange = { strictJsonEnabled = it },
-            systemPromptText = systemPromptText,
-            onSystemPromptChange = { systemPromptText = it },
-            onClose = { showSettings = false }
+            forceJson = forceJson,
+            teams = teams,
+            getState = { state },
+            setState = { newState -> state = newState },
+            apiKeyProvider = { apiKeyState.takeIf { it.isNotBlank() } ?: OpenRouterConfig.apiKey }
         )
-        return
     }
 
-    fun sendMessage() {
-        val prompt = input.trim()
-        if (prompt.isEmpty()) return
-        val historySnapshot = history.toList()
-        input = ""
-        error = null
-        history += "user" to prompt
-        scope.launch {
-            isLoading = true
-            val reply = withContext(Dispatchers.IO) {
-                callApi(
-                    provider = provider,
-                    apiKey = apiKey,
-                    model = model,
-                    history = historySnapshot,
-                    userInput = prompt,
-                    strictJsonEnabled = strictJsonEnabled || researchModeEnabled,
-                    systemPromptText = if (researchModeEnabled) {
-                        RESEARCH_MODE_PROMPT
-                    } else {
-                        systemPromptText
-                    }
-                )
+    fun appendUserMessage(text: String) {
+        val message = ChatMessage(
+            id = UUID.randomUUID().toString(),
+            room = ChatRoomId.Main,
+            author = "USER",
+            role = Role.USER,
+            text = text,
+            timestamp = System.currentTimeMillis()
+        )
+        state = state.addMainMessage(message).withActiveRoom(ChatRoomId.Main)
+    }
+
+    fun sendTask() {
+        val task = taskInput.trim()
+        if (task.isEmpty() || isProcessing) return
+        val resolvedKey = apiKey.takeIf { it.isNotBlank() } ?: OpenRouterConfig.apiKey
+        if (resolvedKey.isNullOrBlank()) {
+            appendUserMessage("OPENROUTER_API_KEY is not set")
+            taskInput = ""
+            return
+        }
+        appendUserMessage(task)
+        taskInput = ""
+        lastTask = task
+        isProcessing = true
+        val jobs = TeamId.values().map { teamId ->
+            scope.launch(Dispatchers.IO) {
+                orchestrator.runTeamRound(teamId, task)
             }
-            history += "assistant" to reply
-            isLoading = false
+        }
+        scope.launch(Dispatchers.IO) {
+            try {
+                jobs.joinAll()
+                orchestrator.postTeamSummariesToMain(task)
+                orchestrator.runLeadsDebate(task)
+            } finally {
+                withContext(Dispatchers.Main) {
+                    isProcessing = false
+                }
+            }
         }
     }
 
-    ChatScreen(
-        history = history,
-        isLoading = isLoading,
-        error = error,
-        input = input,
-        onInputChange = { input = it },
-        onSend = { sendMessage() },
-        onClearHistory = { history.clear() },
-        onOpenSettings = { showSettings = true },
-        researchModeEnabled = researchModeEnabled,
-        onResearchModeToggle = { researchModeEnabled = !researchModeEnabled },
-        canSend = !isLoading && input.isNotBlank() && apiKey.isNotBlank() && model.isNotBlank()
-    )
-}
+    LaunchedEffect(Unit) {
+        if ((apiKey.takeIf { it.isNotBlank() } ?: OpenRouterConfig.apiKey).isNullOrBlank()) {
+            appendUserMessage("Задайте OPENROUTER_API_KEY, чтобы команды могли отвечать.")
+        }
+    }
 
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-private fun ChatScreen(
-    history: List<Pair<String, String>>,
-    isLoading: Boolean,
-    error: String?,
-    input: String,
-    onInputChange: (String) -> Unit,
-    onSend: () -> Unit,
-    onClearHistory: () -> Unit,
-    onOpenSettings: () -> Unit,
-    researchModeEnabled: Boolean,
-    onResearchModeToggle: () -> Unit,
-    canSend: Boolean
-) {
     Scaffold(
         topBar = {
-            TopAppBar(
-                title = { Text("Чат") },
-                actions = {
-                    Button(onClick = onResearchModeToggle) {
-                        Text(
-                            if (researchModeEnabled) "Выключить режим исследования" else "Включить режим исследования"
-                        )
-                    }
-                    IconButton(onClick = onOpenSettings) {
-                        Icon(imageVector = Icons.Default.Settings, contentDescription = "Настройки")
-                    }
-                }
-            )
+            TopAppBar(title = { Text("Командный чат — OpenRouter") })
         }
     ) { padding ->
         Column(
             Modifier
                 .padding(padding)
                 .fillMaxSize()
-                .padding(16.dp)
+                .padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
-            Column(
+            ConnectionSettings(
+                apiKey = apiKey,
+                onApiKeyChange = { apiKey = it },
+                model = model,
+                onModelChange = { model = it },
+                forceJson = forceJson,
+                onForceJsonChange = { forceJson = it },
+                showApiKey = showApiKey,
+                onToggleApiVisibility = { showApiKey = !showApiKey }
+            )
+
+            RoomNavigation(
+                teams = teams,
+                activeRoom = state.activeRoom,
+                onSelect = { room -> state = state.withActiveRoom(room) }
+            )
+
+            val messages = when (val room = state.activeRoom) {
+                ChatRoomId.Main -> state.main.toList()
+                is ChatRoomId.TeamRoom -> state.teamThreads[room.teamId]?.toList().orEmpty()
+            }
+
+            Box(
                 Modifier
                     .weight(1f)
                     .fillMaxWidth()
-                    .verticalScroll(rememberScrollState())
             ) {
-                if (researchModeEnabled) {
-                    Text(
-                        text = "Режим исследования включён",
-                        color = MaterialTheme.colorScheme.primary,
-                        style = MaterialTheme.typography.labelLarge
-                    )
-                    Spacer(Modifier.height(8.dp))
-                }
-                val clipboardManager = LocalClipboardManager.current
-                history.forEach { (role, text) ->
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically
+                MessageList(messages)
+                if (isProcessing) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize(),
+                        contentAlignment = Alignment.BottomEnd
                     ) {
-                        Text(
-                            text = "${role.uppercase()}: $text",
-                            modifier = Modifier.weight(1f)
-                        )
-                        IconButton(onClick = {
-                            clipboardManager.setText(AnnotatedString("${role.uppercase()}: $text"))
-                        }) {
-                            Icon(
-                                imageVector = Icons.Default.ContentCopy,
-                                contentDescription = "Скопировать сообщение"
-                            )
-                        }
+                        CircularProgressIndicator()
                     }
-                    Spacer(Modifier.height(6.dp))
                 }
-                if (isLoading) Text("…генерация ответа")
-                error?.let { Text("Ошибка: $it", color = MaterialTheme.colorScheme.error) }
             }
 
-            OutlinedTextField(
-                value = input,
-                onValueChange = onInputChange,
-                label = { Text("Сообщение") },
-                modifier = Modifier.fillMaxWidth()
-            )
-            Spacer(Modifier.height(8.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(
-                    enabled = canSend,
-                    onClick = onSend
-                ) { Text("Отправить") }
-
-                OutlinedButton(onClick = onClearHistory, enabled = !isLoading) { Text("Очистить чат") }
+            when (val room = state.activeRoom) {
+                ChatRoomId.Main -> {
+                    OutlinedTextField(
+                        value = taskInput,
+                        onValueChange = { taskInput = it },
+                        modifier = Modifier.fillMaxWidth(),
+                        label = { Text("Задача для команд") }
+                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Button(
+                            onClick = { sendTask() },
+                            enabled = taskInput.isNotBlank() && !isProcessing
+                        ) {
+                            Text("Отправить в команды")
+                        }
+                        if (lastTask.isNotBlank()) {
+                            Text("Текущая задача: ${lastTask}")
+                        }
+                    }
+                }
+                is ChatRoomId.TeamRoom -> {
+                    val team = teams.first { it.id == room.teamId }
+                    Column(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Text("Внутренний чат команды \"${team.title}\"")
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text("Лимит: ${state.teamThreads[team.id]?.size ?: 0} / 10")
+                            TextButton(
+                                onClick = {
+                                    if (lastTask.isNotBlank() && !isProcessing) {
+                                        scope.launch(Dispatchers.IO) {
+                                            orchestrator.sendLeadMessage(team.id, lastTask)
+                                        }
+                                    }
+                                },
+                                enabled = lastTask.isNotBlank() && !isProcessing && !orchestrator.reachedTeamLimit(team.id)
+                            ) {
+                                Text("Отправить (тимлид)")
+                            }
+                        }
+                    }
+                }
             }
         }
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun SettingsScreen(
-    provider: ProviderOption,
-    onProviderChange: (ProviderOption) -> Unit,
+private fun ConnectionSettings(
     apiKey: String,
     onApiKeyChange: (String) -> Unit,
     model: String,
     onModelChange: (String) -> Unit,
-    strictJsonEnabled: Boolean,
-    onStrictJsonChange: (Boolean) -> Unit,
-    systemPromptText: String,
-    onSystemPromptChange: (String) -> Unit,
-    onClose: () -> Unit
+    forceJson: Boolean,
+    onForceJsonChange: (Boolean) -> Unit,
+    showApiKey: Boolean,
+    onToggleApiVisibility: () -> Unit
 ) {
-    var providersExpanded by remember { mutableStateOf(false) }
-    var apiKeyVisible by remember { mutableStateOf(false) }
-
-    Scaffold(
-        topBar = {
-            TopAppBar(
-                title = { Text("Настройки") },
-                navigationIcon = {
-                    IconButton(onClick = onClose) {
-                        Icon(imageVector = Icons.Default.ArrowBack, contentDescription = "Назад")
-                    }
-                }
-            )
-        }
-    ) { padding ->
-        Column(
-            Modifier
-                .padding(padding)
-                .fillMaxSize()
-                .padding(16.dp)
-                .verticalScroll(rememberScrollState()),
-            verticalArrangement = Arrangement.spacedBy(16.dp)
-        ) {
-            Text(text = "Подключение", style = MaterialTheme.typography.titleMedium)
-
-            ExposedDropdownMenuBox(
-                expanded = providersExpanded,
-                onExpandedChange = { providersExpanded = it }
-            ) {
-                OutlinedTextField(
-                    value = provider.displayName,
-                    onValueChange = {},
-                    readOnly = true,
-                    label = { Text("Провайдер") },
-                    trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = providersExpanded) },
-                    modifier = Modifier.fillMaxWidth()
-                )
-                ExposedDropdownMenu(
-                    expanded = providersExpanded,
-                    onDismissRequest = { providersExpanded = false }
-                ) {
-                    ProviderOption.values().forEach { option ->
-                        DropdownMenuItem(
-                            text = { Text(option.displayName) },
-                            onClick = {
-                                onProviderChange(option)
-                                providersExpanded = false
-                            }
-                        )
-                    }
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text("Настройки OpenRouter", style = MaterialTheme.typography.titleMedium)
+        OutlinedTextField(
+            value = apiKey,
+            onValueChange = onApiKeyChange,
+            label = { Text("API Key") },
+            modifier = Modifier.fillMaxWidth(),
+            visualTransformation = if (showApiKey) VisualTransformation.None else PasswordVisualTransformation(),
+            trailingIcon = {
+                IconButton(onClick = onToggleApiVisibility) {
+                    Icon(
+                        imageVector = if (showApiKey) Icons.Default.Visibility else Icons.Default.VisibilityOff,
+                        contentDescription = if (showApiKey) "Скрыть ключ" else "Показать ключ"
+                    )
                 }
             }
-
-            OutlinedTextField(
-                value = apiKey,
-                onValueChange = onApiKeyChange,
-                label = { Text("API Key") },
-                modifier = Modifier.fillMaxWidth(),
-                visualTransformation = if (apiKeyVisible) VisualTransformation.None else PasswordVisualTransformation(),
-                trailingIcon = {
-                    IconButton(onClick = { apiKeyVisible = !apiKeyVisible }) {
-                        Icon(
-                            imageVector = if (apiKeyVisible) Icons.Default.Visibility else Icons.Default.VisibilityOff,
-                            contentDescription = if (apiKeyVisible) "Скрыть ключ" else "Показать ключ"
-                        )
-                    }
-                }
-            )
-
-            OutlinedTextField(
-                value = model,
-                onValueChange = onModelChange,
-                label = { Text("Model") },
-                modifier = Modifier.fillMaxWidth()
-            )
-
-            Text(text = "System prompt", style = MaterialTheme.typography.titleMedium)
-
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Switch(
-                    checked = strictJsonEnabled,
-                    onCheckedChange = onStrictJsonChange
-                )
-                Spacer(Modifier.width(8.dp))
-                Text("Использовать system prompt для строгого JSON")
-            }
-
-            if (strictJsonEnabled) {
-                OutlinedTextField(
-                    value = systemPromptText,
-                    onValueChange = onSystemPromptChange,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .heightIn(min = 160.dp),
-                    label = { Text("System prompt") }
-                )
-            }
-        }
-    }
-}
-
-data class ChatMessage(val role: String, val content: String)
-
-// OpenRouter не поддерживает отдельную роль system, поэтому внедряем system prompt
-// в первое пользовательское сообщение, если строгий режим включён.
-private fun buildMessages(
-    history: List<Pair<String, String>>,
-    userInput: String,
-    strictEnabled: Boolean,
-    systemText: String
-): List<ChatMessage> {
-    val base = history.map { ChatMessage(it.first, it.second) } + ChatMessage(role = "user", content = userInput)
-
-    if (!strictEnabled) return base
-
-    if (base.isEmpty()) {
-        return listOf(ChatMessage(role = "user", content = systemText))
-    }
-
-    val userIndex = base.indexOfFirst { it.role == "user" }
-    return if (userIndex == -1) {
-        listOf(ChatMessage(role = "user", content = systemText)) + base
-    } else {
-        val updated = base[userIndex].copy(content = systemText + "\n\n" + base[userIndex].content)
-        base.mapIndexed { index, message -> if (index == userIndex) updated else message }
-    }
-}
-
-// Для chat.completions OpenRouter нужен простой формат messages
-private fun messagesToJson(messages: List<ChatMessage>): String {
-    val sb = StringBuilder("[")
-    var first = true
-    for ((role, content) in messages) {
-        if (!first) sb.append(',')
-        first = false
-        sb.append("{\"role\":\"")
-            .append(role)
-            .append("\",\"content\":\"")
-            .append(
-                content.replace("\\", "\\\\")
-                    .replace("\"", "\\\"")
-                    .replace("\n", "\\n")
-            )
-            .append("\"}")
-    }
-    sb.append(']')
-    return sb.toString()
-}
-
-private fun callApi(
-    provider: ProviderOption,
-    apiKey: String,
-    model: String,
-    history: List<Pair<String, String>>,
-    userInput: String,
-    strictJsonEnabled: Boolean,
-    systemPromptText: String
-): String {
-    if (provider != ProviderOption.OpenRouter) {
-        return "Провайдер ${provider.displayName} не поддерживается"
-    }
-
-    return try {
-        val client = HttpClient.newHttpClient()
-        val messages = buildMessages(
-            history = history,
-            userInput = userInput,
-            strictEnabled = strictJsonEnabled,
-            systemText = systemPromptText
         )
-        val preparedMessages = messagesToJson(messages)
-        val body = "{\"model\":\"$model\",\"messages\":$preparedMessages}"
-        val req = HttpRequest.newBuilder()
-            .uri(URI.create("https://openrouter.ai/api/v1/chat/completions"))
-            .header("Authorization", "Bearer $apiKey")
-            .header("Content-Type", "application/json")
-            // Рекомендуемые хедеры
-            .header("HTTP-Referer", OPENROUTER_REFERER)
-            .header("X-Title", OPENROUTER_TITLE)
-            .POST(HttpRequest.BodyPublishers.ofString(body))
-            .build()
-        val response = client.send(req, HttpResponse.BodyHandlers.ofString())
-
-        if (response.statusCode() !in 200..299) {
-            val headers = response.headers().map().entries.joinToString { (k, v) -> "$k=$v" }
-            return buildString {
-                appendLine("HTTP ${response.statusCode()}")
-                appendLine(headers)
-                appendLine(response.body())
-            }.take(4000)
+        OutlinedTextField(
+            value = model,
+            onValueChange = onModelChange,
+            label = { Text("Модель") },
+            modifier = Modifier.fillMaxWidth()
+        )
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Switch(checked = forceJson, onCheckedChange = onForceJsonChange)
+            Text("Строгий JSON (response_format)")
         }
-
-        val s = response.body()
-        extractJsonStringValue(s, "\"content\":\"")?.let { value ->
-            return value.ifBlank { "(пустой ответ)" }
-        }
-        "(не удалось распарсить ответ)"
-    } catch (t: Throwable) {
-        "Ошибка: " + (t.message ?: t::class.simpleName)
     }
 }
 
-private fun extractJsonStringValue(source: String, marker: String): String? {
-    val startIndex = source.indexOf(marker)
-    if (startIndex < 0) return null
-    val from = startIndex + marker.length
-    if (from >= source.length) return null
-    val sb = StringBuilder()
-    var i = from
-    var escaping = false
-    while (i < source.length) {
-        val c = source[i]
-        if (escaping) {
-            when (c) {
-                '\\', '"', '/' -> sb.append(c)
-                'b' -> sb.append('\b')
-                'f' -> sb.append('\u000C')
-                'n' -> sb.append('\n')
-                'r' -> sb.append('\r')
-                't' -> sb.append('\t')
-                'u' -> {
-                    if (i + 4 < source.length) {
-                        val hex = source.substring(i + 1, i + 5)
-                        hex.toIntOrNull(16)?.let { code ->
-                            sb.append(code.toChar())
-                            i += 4
-                        }
-                    }
-                }
-                else -> sb.append(c)
-            }
-            escaping = false
-        } else {
-            when (c) {
-                '\\' -> escaping = true
-                '"' -> return sb.toString()
-                else -> sb.append(c)
+@Composable
+private fun RoomNavigation(
+    teams: List<Team>,
+    activeRoom: ChatRoomId,
+    onSelect: (ChatRoomId) -> Unit
+) {
+    Row(
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Button(
+            onClick = { onSelect(ChatRoomId.Main) },
+            enabled = activeRoom !is ChatRoomId.Main
+        ) { Text("Главный чат") }
+        teams.forEach { team ->
+            val room = ChatRoomId.TeamRoom(team.id)
+            Button(
+                onClick = { onSelect(room) },
+                enabled = activeRoom != room
+            ) { Text(team.title) }
+        }
+    }
+}
+
+@Composable
+private fun MessageList(messages: List<ChatMessage>) {
+    if (messages.isEmpty()) {
+        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            Text("Сообщений пока нет")
+        }
+        return
+    }
+    LazyColumn(
+        modifier = Modifier.fillMaxSize(),
+        verticalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        items(messages, key = { it.id }) { message ->
+            Column(modifier = Modifier.fillMaxWidth()) {
+                Text(
+                    text = "${formatTimestamp(message.timestamp)} · ${message.author} (${message.role.name})",
+                    style = MaterialTheme.typography.labelSmall
+                )
+                Text(message.text)
             }
         }
-        i++
     }
-    return sb.toString()
 }
