@@ -41,6 +41,7 @@ import kotlinx.serialization.json.JsonElement
 import java.util.UUID
 
 private const val DEFAULT_OPENROUTER_MODEL = "gpt-4o-mini"
+private const val DEFAULT_BFF_BASE_URL = "http://localhost:8080"
 
 private val RESEARCH_MODE_PROMPT = """
 Ты — аналитик и фасилитатор. Общайся кратко, задавай по одному уточняющему вопросу за раз.
@@ -133,6 +134,14 @@ private fun DesktopChatApp() {
     var strictJsonEnabled by remember { mutableStateOf(true) }
     var systemPromptText by remember { mutableStateOf(DEFAULT_SYSTEM_PROMPT) }
     var researchModeEnabled by remember { mutableStateOf(false) }
+    var serverUrl by remember {
+        mutableStateOf(
+            System.getenv("AOSPBAR_BFF_URL")
+                ?.trim()
+                ?.takeIf { it.isNotEmpty() }
+                ?: DEFAULT_BFF_BASE_URL
+        )
+    }
 
     var input by remember { mutableStateOf("") }
     var isLoading by remember { mutableStateOf(false) }
@@ -151,6 +160,8 @@ private fun DesktopChatApp() {
             onStrictJsonChange = { strictJsonEnabled = it },
             systemPromptText = systemPromptText,
             onSystemPromptChange = { systemPromptText = it },
+            serverUrl = serverUrl,
+            onServerUrlChange = { serverUrl = it },
             onClose = { showSettings = false }
         )
         return
@@ -165,6 +176,7 @@ private fun DesktopChatApp() {
         history += "user" to prompt
         scope.launch {
             isLoading = true
+            val targetServerUrl = serverUrl.trim()
             val response = withContext(Dispatchers.IO) {
                 ApiClient.chatComplete(
                     request = ChatBffRequest(
@@ -180,7 +192,8 @@ private fun DesktopChatApp() {
                         },
                         responseFormat = if (strictJsonEnabled || researchModeEnabled) "json" else "text",
                         sessionId = sessionId
-                    )
+                    ),
+                    baseUrl = targetServerUrl
                 )
             }
 
@@ -213,7 +226,7 @@ private fun DesktopChatApp() {
         onOpenSettings = { showSettings = true },
         researchModeEnabled = researchModeEnabled,
         onResearchModeToggle = { researchModeEnabled = !researchModeEnabled },
-        canSend = !isLoading && input.isNotBlank() && model.isNotBlank()
+        canSend = !isLoading && input.isNotBlank() && model.isNotBlank() && serverUrl.trim().isNotEmpty()
     )
 }
 
@@ -307,6 +320,8 @@ private fun SettingsScreen(
     onStrictJsonChange: (Boolean) -> Unit,
     systemPromptText: String,
     onSystemPromptChange: (String) -> Unit,
+    serverUrl: String,
+    onServerUrlChange: (String) -> Unit,
     onClose: () -> Unit
 ) {
     var providersExpanded by remember { mutableStateOf(false) }
@@ -364,6 +379,14 @@ private fun SettingsScreen(
                 onValueChange = onModelChange,
                 label = { Text("Model") },
                 modifier = Modifier.fillMaxWidth()
+            )
+
+            OutlinedTextField(
+                value = serverUrl,
+                onValueChange = onServerUrlChange,
+                label = { Text("BFF URL") },
+                modifier = Modifier.fillMaxWidth(),
+                singleLine = true
             )
 
             Text(text = "System prompt", style = MaterialTheme.typography.titleMedium)

@@ -33,7 +33,7 @@ If a provider key is missing the backend returns `400 { "ok": false, "error": "p
 ./gradlew :composeApp:run
 ```
 
-The desktop app connects to `http://localhost:8080` and proxies all chat requests through the BFF. Provider API keys are **never** entered in the UI.
+The desktop app connects to `http://localhost:8080` and proxies all chat requests through the BFF. Provider API keys are **never** entered in the UI. Override the base URL with the `AOSPBAR_BFF_URL` environment variable if you run the server on a different host/port.
 
 > ℹ️ Conversation history is stored in-memory on the server and resets when the Ktor process restarts. SSE streaming is stubbed and currently returns `501`.
 
