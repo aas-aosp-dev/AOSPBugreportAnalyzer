@@ -298,6 +298,8 @@ private fun buildMessagesForMember(
 
 private val httpClient: HttpClient = HttpClient.newHttpClient()
 
+private const val OPENROUTER_DEBUG = true
+
 private fun callOpenRouter(
     model: String,
     messages: List<ORMessage>,
@@ -310,7 +312,8 @@ private fun callOpenRouter(
         return errorResponse(forceJson, "openrouter api key missing")
     }
 
-    val safeTemperature = temperature.coerceIn(0.0, 2.0)
+    val effectiveTemperature = if (forceJson) 0.0 else temperature
+    val safeTemperature = effectiveTemperature.coerceIn(0.0, 2.0)
     val request = ORRequest(
         model = model,
         messages = messages,
@@ -342,6 +345,10 @@ private fun callOpenRouter(
         append('}')
     }
 
+    if (OPENROUTER_DEBUG) {
+        println("OpenRouter body: ${body.take(800)}")
+    }
+
     val httpRequest = HttpRequest.newBuilder()
         .uri(URI.create(OpenRouterConfig.BASE_URL))
         .header("Authorization", "Bearer $key")
@@ -353,12 +360,18 @@ private fun callOpenRouter(
 
     return try {
         val response = httpClient.send(httpRequest, HttpResponse.BodyHandlers.ofString())
+        if (OPENROUTER_DEBUG) {
+            println("OpenRouter response status=${response.statusCode()}")
+        }
         if (response.statusCode() / 100 != 2) {
             return errorResponse(forceJson, "openrouter http ${response.statusCode()}")
         }
         val content = extractContentFromOpenAIJson(response.body())
         content ?: errorResponse(forceJson, "openrouter empty content")
     } catch (t: Throwable) {
+        if (OPENROUTER_DEBUG) {
+            println("OpenRouter request failed: ${t.message}")
+        }
         errorResponse(forceJson, t.message ?: t::class.simpleName ?: "unknown error")
     }
 }
@@ -689,6 +702,7 @@ fun main() = application {
 @Composable
 private fun DesktopChatApp() {
     val scope = rememberCoroutineScope()
+    val clipboard = LocalClipboardManager.current
     var teams by remember { mutableStateOf(defaultTeams().sortedForDisplay()) }
     var selectedTeamId by remember { mutableStateOf(teams.firstOrNull()?.id) }
     var state by remember { mutableStateOf(ConversationState()) }
@@ -893,6 +907,24 @@ private fun DesktopChatApp() {
                     val messages = when (val room = state.activeRoom) {
                         ChatRoomId.Main -> state.main.toList()
                         is ChatRoomId.TeamRoom -> state.teamThreads[room.teamId]?.toList().orEmpty()
+                    }
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.End
+                    ) {
+                        TextButton(
+                            onClick = {
+                                if (messages.isNotEmpty()) {
+                                    val text = messages.joinToString("\n") { "[${'$'}{it.author}] ${'$'}{it.text}" }
+                                    clipboard.setText(AnnotatedString(text))
+                                    copyFeedback = "Чат скопирован"
+                                }
+                            },
+                            enabled = messages.isNotEmpty()
+                        ) {
+                            Text("Скопировать чат")
+                        }
                     }
 
                     Box(
