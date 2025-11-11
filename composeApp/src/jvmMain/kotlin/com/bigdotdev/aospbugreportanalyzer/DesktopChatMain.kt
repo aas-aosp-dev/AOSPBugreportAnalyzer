@@ -34,6 +34,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
@@ -56,6 +57,7 @@ import java.net.URI
 import java.net.http.HttpClient
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
+import java.time.Duration
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
@@ -253,14 +255,37 @@ private fun selectSystemPrompt(forceJson: Boolean): String = if (forceJson) SYST
 
 private data class Price(val inPerM: Double, val outPerM: Double)
 
-private val modelBenchPriceMap = mapOf(
-    "meta-llama/llama-3.1-8b-instruct" to Price(inPerM = 0.05, outPerM = 0.08),
-    "mistralai/mixtral-8x7b-instruct" to Price(inPerM = 0.20, outPerM = 0.60),
-    "qwen/qwen2.5-72b-instruct" to Price(inPerM = 0.90, outPerM = 1.10)
+data class BenchModel(val alias: String, val id: String)
+
+val benchModels = listOf(
+    BenchModel("Mixtral 8x7B Instruct", "mistralai/mixtral-8x7b-instruct"),
+    BenchModel("DeepSeek R1", "deepseek/deepseek-r1"),
+    BenchModel("OpenAI GPT-OSS 120B", "openai/gpt-oss-120b"),
+    BenchModel("Qwen2.5 7B Instruct", "qwen/qwen-2.5-7b-instruct"),
+    BenchModel("Qwen2.5 72B Instruct", "qwen/qwen-2.5-72b-instruct"),
+    BenchModel("Gemma 2 9B IT", "google/gemma-2-9b-it"),
+    BenchModel("Llama 3.2 3B Instruct", "meta-llama/llama-3.2-3b-instruct"),
+    BenchModel("Llama 3.1 8B Instruct", "meta-llama/llama-3.1-8b-instruct"),
+    BenchModel("Sao10K L3 Stheno 8B", "sao10k/l3-stheno-8b"),
+    BenchModel("MiniMax M2", "minimax/minimax-m2")
 )
 
-private data class ModelBenchResult(
-    val model: String,
+private val modelBenchPriceMap = mapOf(
+    "mistralai/mixtral-8x7b-instruct" to Price(inPerM = 0.20, outPerM = 0.60),
+    "deepseek/deepseek-r1" to Price(inPerM = 2.00, outPerM = 2.00),
+    "openai/gpt-oss-120b" to Price(inPerM = 1.50, outPerM = 1.50),
+    "qwen/qwen-2.5-7b-instruct" to Price(inPerM = 0.18, outPerM = 0.24),
+    "qwen/qwen-2.5-72b-instruct" to Price(inPerM = 0.90, outPerM = 1.10),
+    "google/gemma-2-9b-it" to Price(inPerM = 0.11, outPerM = 0.11),
+    "meta-llama/llama-3.2-3b-instruct" to Price(inPerM = 0.04, outPerM = 0.08),
+    "meta-llama/llama-3.1-8b-instruct" to Price(inPerM = 0.05, outPerM = 0.08),
+    "sao10k/l3-stheno-8b" to Price(inPerM = 0.32, outPerM = 0.48),
+    "minimax/minimax-m2" to Price(inPerM = 0.25, outPerM = 0.35)
+)
+
+data class BenchRunResult(
+    val modelId: String,
+    val ok: Boolean,
     val timeMs: Long?,
     val promptTokens: Int?,
     val completionTokens: Int?,
@@ -290,7 +315,9 @@ private fun buildMessagesForMember(
     return listOf(sys, persona) + contextTail + taskMsg
 }
 
-private val httpClient: HttpClient = HttpClient.newHttpClient()
+private val httpClient: HttpClient = HttpClient.newBuilder()
+    .connectTimeout(Duration.ofSeconds(60))
+    .build()
 
 private fun callOpenRouter(
     model: String,
@@ -439,8 +466,8 @@ private val promptTokensRegex = "\"prompt_tokens\"\\s*:\\s*(\\d+)".toRegex()
 private val completionTokensRegex = "\"completion_tokens\"\\s*:\\s*(\\d+)".toRegex()
 private val totalTokensRegex = "\"total_tokens\"\\s*:\\s*(\\d+)".toRegex()
 
-private fun parseBenchResponse(body: String): BenchParsed {
-    val content = extractContentFromOpenAIJson(body)
+private fun parseBenchResponse(body: String): BenchParsed? {
+    val content = extractContentFromOpenAIJson(body) ?: return null
     val prompt = promptTokensRegex.find(body)?.groupValues?.getOrNull(1)?.toIntOrNull()
     val completion = completionTokensRegex.find(body)?.groupValues?.getOrNull(1)?.toIntOrNull()
     val total = totalTokensRegex.find(body)?.groupValues?.getOrNull(1)?.toIntOrNull()
@@ -467,35 +494,36 @@ private data class ModelBenchSummary(
     val cost: String
 )
 
-private fun buildModelBenchSummary(results: List<ModelBenchResult>): ModelBenchSummary {
-    if (results.isEmpty()) {
+private fun buildModelBenchSummary(results: List<BenchRunResult>): ModelBenchSummary {
+    val okResults = results.filter { it.ok }
+    if (okResults.isEmpty()) {
         return ModelBenchSummary(
             speed = "Speed: no data.",
             quality = "Quality: no data.",
             cost = "Cost: no data."
         )
     }
-    val mixtral = results.firstOrNull { it.model == "mistralai/mixtral-8x7b-instruct" }
+    val mixtral = okResults.firstOrNull { it.modelId == "mistralai/mixtral-8x7b-instruct" }
 
-    val fastest = results.filter { it.timeMs != null }.minByOrNull { it.timeMs!! }
-    val cheapest = results.filter { it.costUsd != null }.minByOrNull { it.costUsd!! }
-    val mostDetailed = results.maxByOrNull {
+    val fastest = okResults.filter { it.timeMs != null }.minByOrNull { it.timeMs!! }
+    val cheapest = okResults.filter { it.costUsd != null }.minByOrNull { it.costUsd!! }
+    val mostDetailed = okResults.maxByOrNull {
         val tokens = it.totalTokens ?: 0
         val textLength = it.text?.length ?: 0
         tokens * 10_000 + textLength
     }
-    val mostExpensive = results.filter { it.costUsd != null }.maxByOrNull { it.costUsd!! }
+    val mostExpensive = okResults.filter { it.costUsd != null }.maxByOrNull { it.costUsd!! }
 
     val speedLine = when {
         fastest == null -> "Speed: no timing data."
-        fastest.model == "meta-llama/llama-3.1-8b-instruct" -> "Speed: Llama 3.1 8B responded the fastest."
-        fastest.model == "mistralai/mixtral-8x7b-instruct" -> "Speed: Mixtral 8x7B delivered the quickest turnaround."
-        fastest.model == "qwen/qwen2.5-72b-instruct" -> "Speed: Qwen 72B led the pack on this run."
+        fastest.modelId == "meta-llama/llama-3.1-8b-instruct" -> "Speed: Llama 3.1 8B responded the fastest."
+        fastest.modelId == "mistralai/mixtral-8x7b-instruct" -> "Speed: Mixtral 8x7B delivered the quickest turnaround."
+        fastest.modelId == "qwen/qwen-2.5-72b-instruct" -> "Speed: Qwen 72B led the pack on this run."
         else -> "Speed: mixed timing results."
     }
 
-    val qualityLine = when (mostDetailed?.model) {
-        "qwen/qwen2.5-72b-instruct" -> "Quality: Qwen 72B produced the most detailed answer."
+    val qualityLine = when (mostDetailed?.modelId) {
+        "qwen/qwen-2.5-72b-instruct" -> "Quality: Qwen 72B produced the most detailed answer."
         "mistralai/mixtral-8x7b-instruct" -> "Quality: Mixtral 8x7B balanced detail and brevity."
         "meta-llama/llama-3.1-8b-instruct" -> "Quality: Llama 3.1 8B kept the answer concise."
         null -> "Quality: no clear winner."
@@ -504,49 +532,57 @@ private fun buildModelBenchSummary(results: List<ModelBenchResult>): ModelBenchS
 
     var costLine = when {
         cheapest == null -> "Cost: no pricing data."
-        cheapest.model == "meta-llama/llama-3.1-8b-instruct" && fastest?.model == "meta-llama/llama-3.1-8b-instruct" ->
+        cheapest.modelId == "meta-llama/llama-3.1-8b-instruct" && fastest?.modelId == "meta-llama/llama-3.1-8b-instruct" ->
             "Cost: Llama 3.1 8B — лучшее по скорости/цене."
-        cheapest.model == "meta-llama/llama-3.1-8b-instruct" ->
+        cheapest.modelId == "meta-llama/llama-3.1-8b-instruct" ->
             "Cost: Llama 3.1 8B was the most affordable run."
-        cheapest.model == "mistralai/mixtral-8x7b-instruct" ->
+        cheapest.modelId == "mistralai/mixtral-8x7b-instruct" ->
             "Cost: Mixtral 8x7B sat in the mid-range for spend."
-        cheapest.model == "qwen/qwen2.5-72b-instruct" ->
+        cheapest.modelId == "qwen/qwen-2.5-72b-instruct" ->
             "Cost: Qwen 72B ended up cheapest on this prompt."
         else -> "Cost: pricing varied across models."
     }
 
-    if (mostExpensive?.model == "qwen/qwen2.5-72b-instruct" && cheapest?.model != "qwen/qwen2.5-72b-instruct") {
+    if (mostExpensive?.modelId == "qwen/qwen-2.5-72b-instruct" && cheapest?.modelId != "qwen/qwen-2.5-72b-instruct") {
         costLine += " Qwen 72B дороже и работает дольше на сложных задачах."
-    } else if (mixtral != null && cheapest?.model != mixtral.model && mostDetailed?.model == mixtral.model) {
+    } else if (mixtral != null && cheapest?.modelId != mixtral.modelId && mostDetailed?.modelId == mixtral.modelId) {
         costLine += " Mixtral 8x7B даёт баланс качества и скорости."
     }
 
     return ModelBenchSummary(speedLine, qualityLine, costLine)
 }
 
-private fun buildModelBenchMarkdown(prompt: String, results: List<ModelBenchResult>): String {
+private fun buildModelBenchMarkdown(prompt: String, results: List<BenchRunResult>): String {
     val summary = buildModelBenchSummary(results)
     val resultsBlock = buildString {
         results.forEach { result ->
+            val alias = benchModels.firstOrNull { it.id == result.modelId }?.alias ?: result.modelId
             append("- ")
-            append(result.model)
+            append(alias)
+            append(" [")
+            append(result.modelId)
+            append(']')
             append(" — time: ")
             append(result.timeMs?.toString() ?: "-")
             append(" ms, tokens: ")
             append(formatTokenTriple(result.promptTokens, result.completionTokens, result.totalTokens))
             append(", cost: ")
             append(formatCostUsd(result.costUsd))
-            if (result.error != null) {
-                append(", error: ")
-                append(result.error)
+            if (!result.ok) {
+                append(", status: ")
+                append(result.error ?: "⚠️ Unknown error")
             }
             append('\n')
         }
     }
     val linksBlock = buildString {
         results.forEach { result ->
+            val alias = benchModels.firstOrNull { it.id == result.modelId }?.alias ?: result.modelId
             append("* ")
-            append(result.model)
+            append(alias)
+            append(" [")
+            append(result.modelId)
+            append(']')
             append(": <TODO>\n")
         }
         if (results.isEmpty()) {
@@ -575,7 +611,7 @@ private fun buildModelBenchMarkdown(prompt: String, results: List<ModelBenchResu
     }
 }
 
-private fun buildModelBenchJson(prompt: String, results: List<ModelBenchResult>): String {
+private fun buildModelBenchJson(prompt: String, results: List<BenchRunResult>): String {
     val sb = StringBuilder()
     sb.append('{')
     sb.append("\"prompt\":\"").append(encodeJsonString(prompt)).append('\"')
@@ -583,7 +619,11 @@ private fun buildModelBenchJson(prompt: String, results: List<ModelBenchResult>)
     results.forEachIndexed { index, result ->
         if (index > 0) sb.append(',')
         sb.append('{')
-        sb.append("\"model\":\"").append(encodeJsonString(result.model)).append('\"')
+        sb.append("\"model\":\"").append(encodeJsonString(result.modelId)).append('\"')
+        sb.append(",\"alias\":\"")
+        sb.append(encodeJsonString(benchModels.firstOrNull { it.id == result.modelId }?.alias ?: result.modelId))
+        sb.append('\"')
+        sb.append(",\"ok\":").append(if (result.ok) "true" else "false")
         sb.append(",\"ms\":").append(result.timeMs?.toString() ?: "null")
         sb.append(",\"usage\":{")
         sb.append("\"prompt\":").append(result.promptTokens?.toString() ?: "null")
@@ -627,68 +667,158 @@ private fun buildModelBenchRequestBody(
     }
 }
 
-private fun runModelBenchRequest(
+private suspend fun runModelBenchRequest(
     model: String,
     messages: List<ORMessage>,
     strictJson: Boolean,
     apiKey: String
-): ModelBenchResult {
+): BenchRunResult {
     val requestBody = buildModelBenchRequestBody(model, messages, strictJson)
-    val httpRequest = HttpRequest.newBuilder()
-        .uri(URI.create(OpenRouterConfig.BASE_URL))
-        .header("Authorization", "Bearer $apiKey")
-        .header("Content-Type", "application/json")
-        .header("HTTP-Referer", OpenRouterConfig.referer)
-        .header("X-Title", OpenRouterConfig.title)
-        .POST(HttpRequest.BodyPublishers.ofString(requestBody))
-        .build()
-
-    val start = System.nanoTime()
-    return try {
-        val response = httpClient.send(httpRequest, HttpResponse.BodyHandlers.ofString())
-        val elapsed = (System.nanoTime() - start) / 1_000_000
-        if (response.statusCode() / 100 != 2) {
-            val bodySnippet = response.body().take(200).ifBlank { "" }
-            ModelBenchResult(
-                model = model,
-                timeMs = elapsed,
-                promptTokens = null,
-                completionTokens = null,
-                totalTokens = null,
-                costUsd = null,
-                text = null,
-                error = "HTTP ${response.statusCode()} ${bodySnippet}".trim()
-            )
-        } else {
-            val parsed = parseBenchResponse(response.body())
+    var attempt = 0
+    var lastError: String? = null
+    while (attempt < 2) {
+        val httpRequest = HttpRequest.newBuilder()
+            .uri(URI.create(OpenRouterConfig.BASE_URL))
+            .header("Authorization", "Bearer $apiKey")
+            .header("Content-Type", "application/json")
+            .header("HTTP-Referer", OpenRouterConfig.referer)
+            .header("X-Title", OpenRouterConfig.title)
+            .timeout(Duration.ofSeconds(60))
+            .POST(HttpRequest.BodyPublishers.ofString(requestBody))
+            .build()
+        val start = System.nanoTime()
+        try {
+            val response = httpClient.send(httpRequest, HttpResponse.BodyHandlers.ofString())
+            val elapsed = (System.nanoTime() - start) / 1_000_000
+            if (response.statusCode() == 400) {
+                return BenchRunResult(
+                    modelId = model,
+                    ok = false,
+                    timeMs = elapsed,
+                    promptTokens = null,
+                    completionTokens = null,
+                    totalTokens = null,
+                    costUsd = null,
+                    text = null,
+                    error = "❌ Invalid model id"
+                )
+            }
+            if (response.statusCode() / 100 != 2) {
+                val snippet = response.body()
+                    .lineSequence()
+                    .firstOrNull { it.isNotBlank() }
+                    ?.take(160)
+                    ?.replace('\n', ' ')
+                    ?.trim()
+                    .orEmpty()
+                val message = buildString {
+                    append("⚠️ Provider error (")
+                    append(response.statusCode())
+                    if (snippet.isNotEmpty()) {
+                        append(": ")
+                        append(snippet)
+                    }
+                    append(')')
+                }
+                if (response.statusCode() >= 500 && attempt == 0) {
+                    lastError = message
+                    delay(600)
+                    attempt++
+                    continue
+                }
+                return BenchRunResult(
+                    modelId = model,
+                    ok = false,
+                    timeMs = elapsed,
+                    promptTokens = null,
+                    completionTokens = null,
+                    totalTokens = null,
+                    costUsd = null,
+                    text = null,
+                    error = message
+                )
+            }
+            val parsed = try {
+                parseBenchResponse(response.body())
+            } catch (_: Throwable) {
+                null
+            }
+            if (parsed == null) {
+                return BenchRunResult(
+                    modelId = model,
+                    ok = false,
+                    timeMs = elapsed,
+                    promptTokens = null,
+                    completionTokens = null,
+                    totalTokens = null,
+                    costUsd = null,
+                    text = null,
+                    error = "⚠️ Invalid response schema"
+                )
+            }
             val price = modelBenchPriceMap[model]
             val cost = if (price != null && parsed.promptTokens != null && parsed.completionTokens != null) {
                 ((parsed.promptTokens * price.inPerM) + (parsed.completionTokens * price.outPerM)) / 1_000_000.0
-            } else null
-            ModelBenchResult(
-                model = model,
+            } else {
+                null
+            }
+            return BenchRunResult(
+                modelId = model,
+                ok = true,
                 timeMs = elapsed,
                 promptTokens = parsed.promptTokens,
                 completionTokens = parsed.completionTokens,
                 totalTokens = parsed.totalTokens,
                 costUsd = cost,
                 text = parsed.content,
-                error = if (parsed.content == null) "Empty response" else null
+                error = null
+            )
+        } catch (timeout: java.net.http.HttpTimeoutException) {
+            val elapsed = (System.nanoTime() - start) / 1_000_000
+            return BenchRunResult(
+                modelId = model,
+                ok = false,
+                timeMs = elapsed,
+                promptTokens = null,
+                completionTokens = null,
+                totalTokens = null,
+                costUsd = null,
+                text = null,
+                error = "⏱ Timeout"
+            )
+        } catch (t: Exception) {
+            val elapsed = (System.nanoTime() - start) / 1_000_000
+            val message = "⚠️ Provider error (${t.message ?: t::class.simpleName ?: "unknown"})"
+            if (attempt == 0) {
+                lastError = message
+                delay(600)
+                attempt++
+                continue
+            }
+            return BenchRunResult(
+                modelId = model,
+                ok = false,
+                timeMs = elapsed,
+                promptTokens = null,
+                completionTokens = null,
+                totalTokens = null,
+                costUsd = null,
+                text = null,
+                error = message
             )
         }
-    } catch (t: Throwable) {
-        val elapsed = (System.nanoTime() - start) / 1_000_000
-        ModelBenchResult(
-            model = model,
-            timeMs = elapsed,
-            promptTokens = null,
-            completionTokens = null,
-            totalTokens = null,
-            costUsd = null,
-            text = null,
-            error = t.message ?: t::class.simpleName ?: "unknown error"
-        )
     }
+    return BenchRunResult(
+        modelId = model,
+        ok = false,
+        timeMs = null,
+        promptTokens = null,
+        completionTokens = null,
+        totalTokens = null,
+        costUsd = null,
+        text = null,
+        error = lastError ?: "⚠️ Provider error"
+    )
 }
 
 private fun jsonError(message: String): String {
@@ -1353,23 +1483,17 @@ private fun ModelBenchScreen(
     val scope = rememberCoroutineScope()
     val clipboardManager = LocalClipboardManager.current
     val scrollState = rememberScrollState()
-    val availableModels = remember {
-        listOf(
-            "meta-llama/llama-3.1-8b-instruct",
-            "mistralai/mixtral-8x7b-instruct",
-            "qwen/qwen2.5-72b-instruct"
-        )
-    }
+    val availableModels = remember { benchModels }
     val modelSelections = remember {
         mutableStateMapOf<String, Boolean>().apply {
-            availableModels.forEach { put(it, true) }
+            availableModels.forEach { put(it.id, true) }
         }
     }
 
     var prompt by remember { mutableStateOf("") }
     var strictJson by remember { mutableStateOf(false) }
     var isRunning by remember { mutableStateOf(false) }
-    var results by remember { mutableStateOf<List<ModelBenchResult>>(emptyList()) }
+    var results by remember { mutableStateOf<List<BenchRunResult>>(emptyList()) }
     var runError by remember { mutableStateOf<String?>(null) }
     var statusMessage by remember { mutableStateOf<String?>(null) }
 
@@ -1407,12 +1531,21 @@ private fun ModelBenchScreen(
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text("Models")
                 availableModels.forEach { model ->
+                    val checked = modelSelections[model.id] == true
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Checkbox(
-                            checked = modelSelections[model] == true,
-                            onCheckedChange = { checked -> modelSelections[model] = checked }
+                            checked = checked,
+                            onCheckedChange = { checkedValue -> modelSelections[model.id] = checkedValue },
+                            enabled = !isRunning
                         )
-                        Text(model, modifier = Modifier.padding(start = 8.dp))
+                        Column(modifier = Modifier.padding(start = 8.dp)) {
+                            Text(model.alias)
+                            Text(
+                                model.id,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
                     }
                 }
             }
@@ -1425,7 +1558,7 @@ private fun ModelBenchScreen(
                 Text("Strict JSON (response_format)")
             }
 
-            val selectedModels = availableModels.filter { modelSelections[it] == true }
+            val selectedModels = availableModels.filter { modelSelections[it.id] == true }
             val runEnabled = !isRunning && prompt.isNotBlank() && selectedModels.isNotEmpty()
             Row(
                 horizontalArrangement = Arrangement.spacedBy(12.dp),
@@ -1451,6 +1584,7 @@ private fun ModelBenchScreen(
                                 return@launch
                             }
                             isRunning = true
+                            results = emptyList()
                             try {
                                 val messages = listOf(
                                     ORMessage("system", MODEL_BENCH_SYSTEM_PROMPT),
@@ -1458,11 +1592,12 @@ private fun ModelBenchScreen(
                                 )
                                 val responses = selectedModels.map { model ->
                                     async(Dispatchers.IO) {
-                                        runModelBenchRequest(model, messages, strictJson, key)
+                                        runModelBenchRequest(model.id, messages, strictJson, key)
                                     }
                                 }.awaitAll()
                                 results = responses
-                                statusMessage = "Готово: ${responses.size} запуск(ов)."
+                                val okCount = responses.count { it.ok }
+                                statusMessage = "Готово: ${okCount} успешных из ${responses.size}."
                             } finally {
                                 isRunning = false
                             }
@@ -1519,30 +1654,33 @@ private fun ModelBenchScreen(
                         val currentResults = results
                         if (currentResults.isEmpty()) return@TextButton
                         runError = null
+                        val successful = currentResults.filter { it.ok && !it.text.isNullOrBlank() }
+                        if (successful.isEmpty()) {
+                            statusMessage = "Нет успешных ответов для копирования."
+                            return@TextButton
+                        }
                         val buffer = buildString {
-                            currentResults.forEach { result ->
+                            successful.forEach { result ->
+                                val alias = benchModels.firstOrNull { it.id == result.modelId }?.alias ?: result.modelId
                                 append("=== ")
-                                append(result.model)
-                                append(" (time ")
+                                append(alias)
+                                append(" [")
+                                append(result.modelId)
+                                append("] (time ")
                                 append(result.timeMs?.toString() ?: "-")
                                 append(" ms, ")
                                 append(formatTokenTriple(result.promptTokens, result.completionTokens, result.totalTokens))
                                 append(", ")
                                 append(formatCostUsd(result.costUsd))
                                 append(") ===\n")
-                                if (result.error != null) {
-                                    append("Error: ")
-                                    append(result.error)
-                                    append('\n')
-                                }
-                                result.text?.let { append(it) }
+                                append(result.text)
                                 append("\n\n")
                             }
                         }.trimEnd()
                         clipboardManager.setText(AnnotatedString(buffer))
-                        statusMessage = "Outputs copied (${currentResults.size})."
+                        statusMessage = "Outputs copied (${successful.size})."
                     },
-                    enabled = results.isNotEmpty()
+                    enabled = results.any { it.ok && !it.text.isNullOrBlank() }
                 ) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Icon(
@@ -1578,15 +1716,16 @@ private fun ModelBenchScreen(
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text("Модель", modifier = Modifier.weight(2.2f))
+                        Text("Модель", modifier = Modifier.weight(2.5f))
                         Text("Время, ms", modifier = Modifier.weight(1f))
                         Text("Tokens P/C/T", modifier = Modifier.weight(1.4f))
                         Text("Стоимость", modifier = Modifier.weight(1.2f))
+                        Text("Статус", modifier = Modifier.weight(1.2f))
                         Text("Ответ", modifier = Modifier.weight(0.8f))
                     }
                     Divider()
                     results.forEach { result ->
-                        key(result.model, result.timeMs, result.text, result.error) {
+                        key(result.modelId, result.timeMs, result.text, result.error) {
                             var expanded by remember { mutableStateOf(false) }
                             Column(modifier = Modifier.fillMaxWidth()) {
                                 Row(
@@ -1595,7 +1734,17 @@ private fun ModelBenchScreen(
                                         .padding(vertical = 8.dp),
                                     verticalAlignment = Alignment.CenterVertically
                                 ) {
-                                    Text(result.model, modifier = Modifier.weight(2.2f))
+                                    val alias = benchModels.firstOrNull { it.id == result.modelId }?.alias
+                                        ?: result.modelId
+                                    Column(modifier = Modifier.weight(2.5f)) {
+                                        Text(alias)
+                                        Text(
+                                            result.modelId,
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            fontFamily = FontFamily.Monospace
+                                        )
+                                    }
                                     Text(result.timeMs?.toString() ?: "-", modifier = Modifier.weight(1f))
                                     Text(
                                         formatTokenTriple(result.promptTokens, result.completionTokens, result.totalTokens),
@@ -1605,23 +1754,17 @@ private fun ModelBenchScreen(
                                         formatCostUsd(result.costUsd),
                                         modifier = Modifier.weight(1.2f)
                                     )
+                                    val statusText = if (result.ok) "✅ OK" else result.error ?: "⚠️ Unknown"
+                                    Text(statusText, modifier = Modifier.weight(1.2f))
                                     TextButton(
                                         onClick = { expanded = !expanded },
-                                        enabled = result.text != null,
+                                        enabled = result.ok && !result.text.isNullOrBlank(),
                                         modifier = Modifier.weight(0.8f)
                                     ) {
                                         Text(if (expanded) "Скрыть" else "Показать")
                                     }
                                 }
-                                result.error?.let { errorMessage ->
-                                    Text(
-                                        "Ошибка: $errorMessage",
-                                        color = MaterialTheme.colorScheme.error,
-                                        style = MaterialTheme.typography.bodySmall,
-                                        modifier = Modifier.padding(bottom = 8.dp)
-                                    )
-                                }
-                                if (expanded && result.text != null) {
+                                if (expanded && result.ok && !result.text.isNullOrBlank()) {
                                     Text(
                                         result.text,
                                         modifier = Modifier
