@@ -11,7 +11,9 @@ import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.Divider
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExposedDropdownMenuBox
@@ -38,12 +40,18 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Window
 import androidx.compose.ui.window.application
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import java.nio.file.Files
+import java.nio.file.Path
+import java.nio.file.Paths
+import java.nio.file.StandardOpenOption
 import java.net.URI
 import java.net.http.HttpClient
 import java.net.http.HttpRequest
@@ -58,7 +66,7 @@ private enum class TeamDirection { DEVELOPMENT, DESIGN, ANALYTICS }
 private enum class MemberRole { TEAM_LEAD, EMPLOYEE }
 private enum class AuthorRole { USER, TEAM_LEAD, EMPLOYEE }
 
-private enum class Screen { MAIN, SETTINGS, TEAMS }
+private enum class Screen { MAIN, SETTINGS, TEAMS, MODEL_BENCH }
 
 private data class Member(
     val id: String = UUID.randomUUID().toString(),
@@ -243,6 +251,25 @@ data class AppSettings(
 
 private fun selectSystemPrompt(forceJson: Boolean): String = if (forceJson) SYSTEM_JSON else SYSTEM_TEXT
 
+private data class Price(val inPerM: Double, val outPerM: Double)
+
+private val modelBenchPriceMap = mapOf(
+    "meta-llama/llama-3.1-8b-instruct" to Price(inPerM = 0.05, outPerM = 0.08),
+    "mistralai/mixtral-8x7b-instruct" to Price(inPerM = 0.20, outPerM = 0.60),
+    "qwen/qwen2.5-72b-instruct" to Price(inPerM = 0.90, outPerM = 1.10)
+)
+
+private data class ModelBenchResult(
+    val model: String,
+    val timeMs: Long?,
+    val promptTokens: Int?,
+    val completionTokens: Int?,
+    val totalTokens: Int?,
+    val costUsd: Double?,
+    val text: String?,
+    val error: String?
+)
+
 private fun buildMessagesForMember(
     member: Member,
     team: Team,
@@ -399,6 +426,269 @@ private fun extractContentFromOpenAIJson(body: String): String? {
     val regex = "\"content\"\\s*:\\s*\"((?:\\\\.|[^\\\\\"])*)\"".toRegex()
     val match = regex.find(body) ?: return null
     return decodeJsonString(match.groupValues[1]).ifBlank { null }
+}
+
+private data class BenchParsed(
+    val content: String?,
+    val promptTokens: Int?,
+    val completionTokens: Int?,
+    val totalTokens: Int?
+)
+
+private val promptTokensRegex = "\"prompt_tokens\"\\s*:\\s*(\\d+)".toRegex()
+private val completionTokensRegex = "\"completion_tokens\"\\s*:\\s*(\\d+)".toRegex()
+private val totalTokensRegex = "\"total_tokens\"\\s*:\\s*(\\d+)".toRegex()
+
+private fun parseBenchResponse(body: String): BenchParsed {
+    val content = extractContentFromOpenAIJson(body)
+    val prompt = promptTokensRegex.find(body)?.groupValues?.getOrNull(1)?.toIntOrNull()
+    val completion = completionTokensRegex.find(body)?.groupValues?.getOrNull(1)?.toIntOrNull()
+    val total = totalTokensRegex.find(body)?.groupValues?.getOrNull(1)?.toIntOrNull()
+        ?: if (prompt != null && completion != null) prompt + completion else null
+    return BenchParsed(content, prompt, completion, total)
+}
+
+private const val MODEL_BENCH_SYSTEM_PROMPT = "Be concise and clear."
+
+private fun formatTokenTriple(prompt: Int?, completion: Int?, total: Int?): String {
+    val p = prompt?.toString() ?: "-"
+    val c = completion?.toString() ?: "-"
+    val t = total?.toString() ?: "-"
+    return "$p / $c / $t"
+}
+
+private fun formatCostUsd(cost: Double?): String {
+    return cost?.let { "${'$'}" + String.format(Locale.US, "%.4f", it) } ?: "-"
+}
+
+private data class ModelBenchSummary(
+    val speed: String,
+    val quality: String,
+    val cost: String
+)
+
+private fun buildModelBenchSummary(results: List<ModelBenchResult>): ModelBenchSummary {
+    if (results.isEmpty()) {
+        return ModelBenchSummary(
+            speed = "Speed: no data.",
+            quality = "Quality: no data.",
+            cost = "Cost: no data."
+        )
+    }
+    val mixtral = results.firstOrNull { it.model == "mistralai/mixtral-8x7b-instruct" }
+
+    val fastest = results.filter { it.timeMs != null }.minByOrNull { it.timeMs!! }
+    val cheapest = results.filter { it.costUsd != null }.minByOrNull { it.costUsd!! }
+    val mostDetailed = results.maxByOrNull {
+        val tokens = it.totalTokens ?: 0
+        val textLength = it.text?.length ?: 0
+        tokens * 10_000 + textLength
+    }
+    val mostExpensive = results.filter { it.costUsd != null }.maxByOrNull { it.costUsd!! }
+
+    val speedLine = when {
+        fastest == null -> "Speed: no timing data."
+        fastest.model == "meta-llama/llama-3.1-8b-instruct" -> "Speed: Llama 3.1 8B responded the fastest."
+        fastest.model == "mistralai/mixtral-8x7b-instruct" -> "Speed: Mixtral 8x7B delivered the quickest turnaround."
+        fastest.model == "qwen/qwen2.5-72b-instruct" -> "Speed: Qwen 72B led the pack on this run."
+        else -> "Speed: mixed timing results."
+    }
+
+    val qualityLine = when (mostDetailed?.model) {
+        "qwen/qwen2.5-72b-instruct" -> "Quality: Qwen 72B produced the most detailed answer."
+        "mistralai/mixtral-8x7b-instruct" -> "Quality: Mixtral 8x7B balanced detail and brevity."
+        "meta-llama/llama-3.1-8b-instruct" -> "Quality: Llama 3.1 8B kept the answer concise."
+        null -> "Quality: no clear winner."
+        else -> "Quality: results were comparable."
+    }
+
+    var costLine = when {
+        cheapest == null -> "Cost: no pricing data."
+        cheapest.model == "meta-llama/llama-3.1-8b-instruct" && fastest?.model == "meta-llama/llama-3.1-8b-instruct" ->
+            "Cost: Llama 3.1 8B — лучшее по скорости/цене."
+        cheapest.model == "meta-llama/llama-3.1-8b-instruct" ->
+            "Cost: Llama 3.1 8B was the most affordable run."
+        cheapest.model == "mistralai/mixtral-8x7b-instruct" ->
+            "Cost: Mixtral 8x7B sat in the mid-range for spend."
+        cheapest.model == "qwen/qwen2.5-72b-instruct" ->
+            "Cost: Qwen 72B ended up cheapest on this prompt."
+        else -> "Cost: pricing varied across models."
+    }
+
+    if (mostExpensive?.model == "qwen/qwen2.5-72b-instruct" && cheapest?.model != "qwen/qwen2.5-72b-instruct") {
+        costLine += " Qwen 72B дороже и работает дольше на сложных задачах."
+    } else if (mixtral != null && cheapest?.model != mixtral.model && mostDetailed?.model == mixtral.model) {
+        costLine += " Mixtral 8x7B даёт баланс качества и скорости."
+    }
+
+    return ModelBenchSummary(speedLine, qualityLine, costLine)
+}
+
+private fun buildModelBenchMarkdown(prompt: String, results: List<ModelBenchResult>): String {
+    val summary = buildModelBenchSummary(results)
+    val resultsBlock = buildString {
+        results.forEach { result ->
+            append("- ")
+            append(result.model)
+            append(" — time: ")
+            append(result.timeMs?.toString() ?: "-")
+            append(" ms, tokens: ")
+            append(formatTokenTriple(result.promptTokens, result.completionTokens, result.totalTokens))
+            append(", cost: ")
+            append(formatCostUsd(result.costUsd))
+            if (result.error != null) {
+                append(", error: ")
+                append(result.error)
+            }
+            append('\n')
+        }
+    }
+    val linksBlock = buildString {
+        results.forEach { result ->
+            append("* ")
+            append(result.model)
+            append(": <TODO>\n")
+        }
+        if (results.isEmpty()) {
+            append("* Model 1: <TODO>\n")
+            append("* Model 2: <TODO>\n")
+            append("* Model 3: <TODO>\n")
+        }
+    }
+    return buildString {
+        append("# Model Bench\n\n")
+        append("Prompt:\n```\n")
+        append(prompt)
+        append("\n```\n\n")
+        append("Results:\n")
+        append(resultsBlock.ifBlank { "- No runs\n" })
+        append('\n')
+        append("Short takeaway:\n\n")
+        append("* ").append(summary.speed).append('\n')
+        append("* ").append(summary.quality).append('\n')
+        append("* ").append(summary.cost).append('\n')
+        append('\n')
+        append("Links:\n\n")
+        append(linksBlock.ifBlank {
+            "* Model 1: <TODO>\n* Model 2: <TODO>\n* Model 3: <TODO>\n"
+        })
+    }
+}
+
+private fun buildModelBenchJson(prompt: String, results: List<ModelBenchResult>): String {
+    val sb = StringBuilder()
+    sb.append('{')
+    sb.append("\"prompt\":\"").append(encodeJsonString(prompt)).append('\"')
+    sb.append(",\"runs\":[")
+    results.forEachIndexed { index, result ->
+        if (index > 0) sb.append(',')
+        sb.append('{')
+        sb.append("\"model\":\"").append(encodeJsonString(result.model)).append('\"')
+        sb.append(",\"ms\":").append(result.timeMs?.toString() ?: "null")
+        sb.append(",\"usage\":{")
+        sb.append("\"prompt\":").append(result.promptTokens?.toString() ?: "null")
+        sb.append(",\"completion\":").append(result.completionTokens?.toString() ?: "null")
+        sb.append(",\"total\":").append(result.totalTokens?.toString() ?: "null")
+        sb.append('}')
+        sb.append(",\"cost\":")
+        sb.append(result.costUsd?.let { String.format(Locale.US, "%.6f", it) } ?: "null")
+        sb.append(",\"text\":")
+        sb.append(result.text?.let { "\"${encodeJsonString(it)}\"" } ?: "null")
+        sb.append(",\"error\":")
+        sb.append(result.error?.let { "\"${encodeJsonString(it)}\"" } ?: "null")
+        sb.append('}')
+    }
+    sb.append(']')
+    sb.append('}')
+    return sb.toString()
+}
+
+private fun buildModelBenchRequestBody(
+    model: String,
+    messages: List<ORMessage>,
+    strictJson: Boolean
+): String {
+    return buildString {
+        append('{')
+        append("\"model\":\"").append(encodeJsonString(model)).append('\"')
+        append(",\"messages\":[")
+        messages.forEachIndexed { index, msg ->
+            if (index > 0) append(',')
+            append('{')
+            append("\"role\":\"").append(encodeJsonString(msg.role)).append('\"')
+            append(",\"content\":\"").append(encodeJsonString(msg.content)).append('\"')
+            append('}')
+        }
+        append(']')
+        if (strictJson) {
+            append(",\"response_format\":{\"type\":\"json_object\"}")
+        }
+        append('}')
+    }
+}
+
+private fun runModelBenchRequest(
+    model: String,
+    messages: List<ORMessage>,
+    strictJson: Boolean,
+    apiKey: String
+): ModelBenchResult {
+    val requestBody = buildModelBenchRequestBody(model, messages, strictJson)
+    val httpRequest = HttpRequest.newBuilder()
+        .uri(URI.create(OpenRouterConfig.BASE_URL))
+        .header("Authorization", "Bearer $apiKey")
+        .header("Content-Type", "application/json")
+        .header("HTTP-Referer", OpenRouterConfig.referer)
+        .header("X-Title", OpenRouterConfig.title)
+        .POST(HttpRequest.BodyPublishers.ofString(requestBody))
+        .build()
+
+    val start = System.nanoTime()
+    return try {
+        val response = httpClient.send(httpRequest, HttpResponse.BodyHandlers.ofString())
+        val elapsed = (System.nanoTime() - start) / 1_000_000
+        if (response.statusCode() / 100 != 2) {
+            val bodySnippet = response.body().take(200).ifBlank { "" }
+            ModelBenchResult(
+                model = model,
+                timeMs = elapsed,
+                promptTokens = null,
+                completionTokens = null,
+                totalTokens = null,
+                costUsd = null,
+                text = null,
+                error = "HTTP ${response.statusCode()} ${bodySnippet}".trim()
+            )
+        } else {
+            val parsed = parseBenchResponse(response.body())
+            val price = modelBenchPriceMap[model]
+            val cost = if (price != null && parsed.promptTokens != null && parsed.completionTokens != null) {
+                ((parsed.promptTokens * price.inPerM) + (parsed.completionTokens * price.outPerM)) / 1_000_000.0
+            } else null
+            ModelBenchResult(
+                model = model,
+                timeMs = elapsed,
+                promptTokens = parsed.promptTokens,
+                completionTokens = parsed.completionTokens,
+                totalTokens = parsed.totalTokens,
+                costUsd = cost,
+                text = parsed.content,
+                error = if (parsed.content == null) "Empty response" else null
+            )
+        }
+    } catch (t: Throwable) {
+        val elapsed = (System.nanoTime() - start) / 1_000_000
+        ModelBenchResult(
+            model = model,
+            timeMs = elapsed,
+            promptTokens = null,
+            completionTokens = null,
+            totalTokens = null,
+            costUsd = null,
+            text = null,
+            error = t.message ?: t::class.simpleName ?: "unknown error"
+        )
+    }
 }
 
 private fun jsonError(message: String): String {
@@ -832,6 +1122,9 @@ private fun DesktopChatApp() {
                     TopAppBar(
                         title = { Text("Командный чат — OpenRouter") },
                         actions = {
+                            TextButton(onClick = { screen = Screen.MODEL_BENCH }) {
+                                Text("Model Bench")
+                            }
                             TextButton(onClick = { screen = Screen.TEAMS }) {
                                 Text("Команды")
                             }
@@ -946,6 +1239,12 @@ private fun DesktopChatApp() {
                 }
             }
         }
+        Screen.MODEL_BENCH -> {
+            ModelBenchScreen(
+                userApiKey = settings.openRouterApiKey,
+                onBack = { screen = Screen.MAIN }
+            )
+        }
         Screen.SETTINGS -> {
             SettingsScreen(
                 settings = settings,
@@ -1041,6 +1340,303 @@ private fun DesktopChatApp() {
             )
         } else {
             deleteTeamId = null
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun ModelBenchScreen(
+    userApiKey: String,
+    onBack: () -> Unit
+) {
+    val scope = rememberCoroutineScope()
+    val clipboardManager = LocalClipboardManager.current
+    val scrollState = rememberScrollState()
+    val availableModels = remember {
+        listOf(
+            "meta-llama/llama-3.1-8b-instruct",
+            "mistralai/mixtral-8x7b-instruct",
+            "qwen/qwen2.5-72b-instruct"
+        )
+    }
+    val modelSelections = remember {
+        mutableStateMapOf<String, Boolean>().apply {
+            availableModels.forEach { put(it, true) }
+        }
+    }
+
+    var prompt by remember { mutableStateOf("") }
+    var strictJson by remember { mutableStateOf(false) }
+    var isRunning by remember { mutableStateOf(false) }
+    var results by remember { mutableStateOf<List<ModelBenchResult>>(emptyList()) }
+    var runError by remember { mutableStateOf<String?>(null) }
+    var statusMessage by remember { mutableStateOf<String?>(null) }
+
+    val resolvedKey = userApiKey.takeIf { it.isNotBlank() } ?: OpenRouterConfig.apiKey
+
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text("Model Bench") },
+                navigationIcon = {
+                    TextButton(onClick = onBack) { Text("Назад") }
+                }
+            )
+        }
+    ) { padding ->
+        Column(
+            modifier = Modifier
+                .padding(padding)
+                .fillMaxSize()
+                .padding(16.dp)
+                .verticalScroll(scrollState),
+            verticalArrangement = Arrangement.spacedBy(16.dp)
+        ) {
+            OutlinedTextField(
+                value = prompt,
+                onValueChange = { prompt = it },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 160.dp),
+                label = { Text("Prompt") },
+                singleLine = false,
+                maxLines = 12
+            )
+
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("Models")
+                availableModels.forEach { model ->
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Checkbox(
+                            checked = modelSelections[model] == true,
+                            onCheckedChange = { checked -> modelSelections[model] = checked }
+                        )
+                        Text(model, modifier = Modifier.padding(start = 8.dp))
+                    }
+                }
+            }
+
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Switch(checked = strictJson, onCheckedChange = { strictJson = it })
+                Text("Strict JSON (response_format)")
+            }
+
+            val selectedModels = availableModels.filter { modelSelections[it] == true }
+            val runEnabled = !isRunning && prompt.isNotBlank() && selectedModels.isNotEmpty()
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Button(
+                    onClick = {
+                        scope.launch {
+                            runError = null
+                            statusMessage = null
+                            val trimmed = prompt.trim()
+                            if (trimmed.isEmpty()) {
+                                runError = "Введите prompt."
+                                return@launch
+                            }
+                            if (selectedModels.isEmpty()) {
+                                runError = "Выберите хотя бы одну модель."
+                                return@launch
+                            }
+                            val key = resolvedKey
+                            if (key.isNullOrBlank()) {
+                                runError = "OPENROUTER_API_KEY is not set."
+                                return@launch
+                            }
+                            isRunning = true
+                            try {
+                                val messages = listOf(
+                                    ORMessage("system", MODEL_BENCH_SYSTEM_PROMPT),
+                                    ORMessage("user", trimmed)
+                                )
+                                val responses = selectedModels.map { model ->
+                                    async(Dispatchers.IO) {
+                                        runModelBenchRequest(model, messages, strictJson, key)
+                                    }
+                                }.awaitAll()
+                                results = responses
+                                statusMessage = "Готово: ${responses.size} запуск(ов)."
+                            } finally {
+                                isRunning = false
+                            }
+                        }
+                    },
+                    enabled = runEnabled
+                ) {
+                    Text(if (isRunning) "Running…" else "Run")
+                }
+                Button(
+                    onClick = {
+                        val currentResults = results
+                        if (currentResults.isEmpty()) return@Button
+                        val currentPrompt = prompt
+                        scope.launch {
+                            runError = null
+                            statusMessage = null
+                            val timestamp = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss")
+                                .withZone(ZoneId.systemDefault())
+                                .format(Instant.now())
+                            val baseDir = Paths.get("model_bench")
+                            try {
+                                withContext(Dispatchers.IO) {
+                                    Files.createDirectories(baseDir)
+                                    val markdown = buildModelBenchMarkdown(currentPrompt, currentResults)
+                                    val json = buildModelBenchJson(currentPrompt, currentResults)
+                                    Files.writeString(
+                                        baseDir.resolve("results-$timestamp.md"),
+                                        markdown,
+                                        StandardOpenOption.CREATE,
+                                        StandardOpenOption.TRUNCATE_EXISTING,
+                                        StandardOpenOption.WRITE
+                                    )
+                                    Files.writeString(
+                                        baseDir.resolve("results-$timestamp.json"),
+                                        json,
+                                        StandardOpenOption.CREATE,
+                                        StandardOpenOption.TRUNCATE_EXISTING,
+                                        StandardOpenOption.WRITE
+                                    )
+                                }
+                                statusMessage = "Exported to model_bench/results-$timestamp.*"
+                            } catch (t: Throwable) {
+                                runError = "Export failed: ${t.message ?: t::class.simpleName}".trim()
+                            }
+                        }
+                    },
+                    enabled = results.isNotEmpty()
+                ) {
+                    Text("Export")
+                }
+                TextButton(
+                    onClick = {
+                        val currentResults = results
+                        if (currentResults.isEmpty()) return@TextButton
+                        runError = null
+                        val buffer = buildString {
+                            currentResults.forEach { result ->
+                                append("=== ")
+                                append(result.model)
+                                append(" (time ")
+                                append(result.timeMs?.toString() ?: "-")
+                                append(" ms, ")
+                                append(formatTokenTriple(result.promptTokens, result.completionTokens, result.totalTokens))
+                                append(", ")
+                                append(formatCostUsd(result.costUsd))
+                                append(") ===\n")
+                                if (result.error != null) {
+                                    append("Error: ")
+                                    append(result.error)
+                                    append('\n')
+                                }
+                                result.text?.let { append(it) }
+                                append("\n\n")
+                            }
+                        }.trimEnd()
+                        clipboardManager.setText(AnnotatedString(buffer))
+                        statusMessage = "Outputs copied (${currentResults.size})."
+                    },
+                    enabled = results.isNotEmpty()
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(
+                            imageVector = Icons.Default.ContentCopy,
+                            contentDescription = "Copy"
+                        )
+                        Text(" Copy all outputs", modifier = Modifier.padding(start = 4.dp))
+                    }
+                }
+            }
+
+            if (resolvedKey.isNullOrBlank()) {
+                Text(
+                    "OPENROUTER_API_KEY не задан. Укажите ключ в настройках.",
+                    color = MaterialTheme.colorScheme.error
+                )
+            }
+
+            runError?.let {
+                Text(it, color = MaterialTheme.colorScheme.error)
+            }
+            statusMessage?.let {
+                Text(it, color = MaterialTheme.colorScheme.primary)
+            }
+
+            if (results.isNotEmpty()) {
+                Column(
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text("Модель", modifier = Modifier.weight(2.2f))
+                        Text("Время, ms", modifier = Modifier.weight(1f))
+                        Text("Tokens P/C/T", modifier = Modifier.weight(1.4f))
+                        Text("Стоимость", modifier = Modifier.weight(1.2f))
+                        Text("Ответ", modifier = Modifier.weight(0.8f))
+                    }
+                    Divider()
+                    results.forEach { result ->
+                        key(result.model, result.timeMs, result.text, result.error) {
+                            var expanded by remember { mutableStateOf(false) }
+                            Column(modifier = Modifier.fillMaxWidth()) {
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(vertical = 8.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Text(result.model, modifier = Modifier.weight(2.2f))
+                                    Text(result.timeMs?.toString() ?: "-", modifier = Modifier.weight(1f))
+                                    Text(
+                                        formatTokenTriple(result.promptTokens, result.completionTokens, result.totalTokens),
+                                        modifier = Modifier.weight(1.4f)
+                                    )
+                                    Text(
+                                        formatCostUsd(result.costUsd),
+                                        modifier = Modifier.weight(1.2f)
+                                    )
+                                    TextButton(
+                                        onClick = { expanded = !expanded },
+                                        enabled = result.text != null,
+                                        modifier = Modifier.weight(0.8f)
+                                    ) {
+                                        Text(if (expanded) "Скрыть" else "Показать")
+                                    }
+                                }
+                                result.error?.let { errorMessage ->
+                                    Text(
+                                        "Ошибка: $errorMessage",
+                                        color = MaterialTheme.colorScheme.error,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        modifier = Modifier.padding(bottom = 8.dp)
+                                    )
+                                }
+                                if (expanded && result.text != null) {
+                                    Text(
+                                        result.text,
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(bottom = 12.dp)
+                                    )
+                                }
+                                Divider()
+                            }
+                        }
+                    }
+                }
+            } else {
+                Text("Нет результатов. Запустите сравнение.")
+            }
         }
     }
 }
