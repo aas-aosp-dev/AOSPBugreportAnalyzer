@@ -42,6 +42,9 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
@@ -877,7 +880,23 @@ private fun DesktopChatApp() {
                     OutlinedTextField(
                         value = input,
                         onValueChange = { input = it },
-                        modifier = Modifier.fillMaxWidth(),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .onPreviewKeyEvent { event ->
+                                if (
+                                    event.type == KeyEventType.KeyUp &&
+                                    event.key == Key.Enter &&
+                                    !event.isShiftPressed &&
+                                    !event.isCtrlPressed &&
+                                    !event.isAltPressed &&
+                                    !event.isMetaPressed
+                                ) {
+                                    sendMessage()
+                                    true
+                                } else {
+                                    false
+                                }
+                            },
                         label = { Text("Введите сообщение") }
                     )
                     Row(
