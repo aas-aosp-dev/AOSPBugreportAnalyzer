@@ -1,11 +1,8 @@
 package app.desktop
 
-import androidx.compose.foundation.clickable
-import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
@@ -19,14 +16,14 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.ArrowDropDown
-import androidx.compose.material.icons.filled.ArrowDropUp
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.PersonAdd
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.Save
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -44,6 +41,7 @@ import androidx.compose.material3.Slider
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.TextField
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
@@ -231,35 +229,25 @@ private fun AgentSelector(agents: List<AgentConfig>, activeId: String?, onSelect
     val hasAgents = agents.isNotEmpty()
     val activeAgent = agents.firstOrNull { it.id == activeId }
     val helperText = activeAgent?.model ?: "Create or select an agent to start chatting"
+    val optionLabels = agents.map { agent -> "${agent.name} • ${agent.model}" }
+    val selectedLabel = activeAgent?.let { "${it.name} • ${it.model}" } ?: "Select an agent"
 
     Column {
         Text("Active agent", style = MaterialTheme.typography.titleMedium)
         Spacer(Modifier.height(4.dp))
-        DropdownField(
+        CompatDropdown(
             label = "Agent",
-            value = activeAgent?.name ?: "Select an agent",
+            options = optionLabels,
+            selected = selectedLabel,
+            onSelect = { label ->
+                val index = optionLabels.indexOf(label)
+                if (index >= 0) {
+                    onSelect(agents[index].id)
+                }
+            },
+            helperText = helperText,
             enabled = hasAgents,
-            helperText = helperText
-        ) { closeMenu ->
-            agents.forEach { agent ->
-                DropdownMenuItem(
-                    text = {
-                        Column {
-                            Text(agent.name)
-                            Text(
-                                agent.model,
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                        }
-                    },
-                    onClick = {
-                        closeMenu()
-                        onSelect(agent.id)
-                    }
-                )
-            }
-        }
+        )
     }
 }
 
@@ -385,7 +373,7 @@ private fun AgentEditor(
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
-            OutlinedTextField(value = agent.systemPrompt, onValueChange = { onAgentChange(agent.copy(systemPrompt = it)) }, label = { Text("System Prompt") })
+            OutlinedTextField(value = agent.systemPrompt.orEmpty(), onValueChange = { onAgentChange(agent.copy(systemPrompt = it)) }, label = { Text("System Prompt") })
             Column {
                 Text("Temperature: ${"%.2f".format(agent.temperature)}")
                 Slider(value = agent.temperature.toFloat(), onValueChange = { onAgentChange(agent.copy(temperature = validateTemperature(it.toDouble()))) }, valueRange = 0f..2f)
@@ -447,65 +435,64 @@ private fun AgentEditor(
 
 @Composable
 private fun ProviderPicker(agent: AgentConfig, onAgentChange: (AgentConfig) -> Unit) {
-    DropdownField(
+    val providers = AgentProvider.values()
+    val labels = providers.map { it.displayName }
+    CompatDropdown(
         label = "Provider",
-        value = agent.provider.displayName,
-        enabled = true,
-        helperText = null
-    ) { closeMenu ->
-        AgentProvider.values().forEach { provider ->
-            DropdownMenuItem(
-                text = { Text(provider.displayName) },
-                onClick = {
-                    closeMenu()
-                    onAgentChange(agent.copy(provider = provider))
-                }
-            )
-        }
-    }
+        options = labels,
+        selected = agent.provider.displayName,
+        onSelect = { label ->
+            val index = labels.indexOf(label)
+            if (index >= 0) {
+                onAgentChange(agent.copy(provider = providers[index]))
+            }
+        },
+    )
 }
 
 @Composable
-private fun DropdownField(
+private fun CompatDropdown(
     label: String,
-    value: String,
-    enabled: Boolean,
-    helperText: String?,
-    menuContent: @Composable ColumnScope.(closeMenu: () -> Unit) -> Unit,
+    options: List<String>,
+    selected: String,
+    onSelect: (String) -> Unit,
+    helperText: String? = null,
+    enabled: Boolean = true,
+    modifier: Modifier = Modifier,
 ) {
     var expanded by remember { mutableStateOf(false) }
-    val interactionSource = remember { MutableInteractionSource() }
 
-    Column {
+    Column(modifier) {
         Box {
-            OutlinedTextField(
-                value = value,
+            TextField(
+                value = selected,
                 onValueChange = {},
                 readOnly = true,
                 enabled = enabled,
                 label = { Text(label) },
-                interactionSource = interactionSource,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clickable(
-                        enabled = enabled,
-                        interactionSource = interactionSource,
-                        indication = null
-                    ) { expanded = !expanded },
                 trailingIcon = {
                     IconButton(onClick = { if (enabled) expanded = !expanded }) {
                         Icon(
-                            imageVector = if (expanded) Icons.Filled.ArrowDropUp else Icons.Filled.ArrowDropDown,
-                            contentDescription = if (expanded) "Collapse" else "Expand"
+                            imageVector = if (expanded) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
+                            contentDescription = if (expanded) "Collapse" else "Expand",
                         )
                     }
-                }
+                },
+                modifier = Modifier.fillMaxWidth(),
             )
             DropdownMenu(
                 expanded = expanded && enabled,
-                onDismissRequest = { expanded = false }
+                onDismissRequest = { expanded = false },
             ) {
-                menuContent { expanded = false }
+                options.forEach { option ->
+                    DropdownMenuItem(
+                        text = { Text(option) },
+                        onClick = {
+                            expanded = false
+                            onSelect(option)
+                        },
+                    )
+                }
             }
         }
         if (!helperText.isNullOrBlank()) {
@@ -513,7 +500,7 @@ private fun DropdownField(
             Text(
                 helperText,
                 style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
     }

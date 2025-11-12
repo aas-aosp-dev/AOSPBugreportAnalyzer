@@ -1,0 +1,14 @@
+name: Lint Stability
+
+on: [push, pull_request]
+
+jobs:
+  lint-stability:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Ban unstable M3 APIs
+        run: |
+          set -e
+          ! grep -R --line-number -E "ExposedDropdownMenu(Box|Defaults)?|menuAnchor" app/desktop/src || (echo "Found unstable M3 API usage" && exit 1)
+          ! grep -R --line-number -E "supportingText\\s*=" app/desktop/src || (echo "Found unsupported TextField parameter 'supportingText'" && exit 1)

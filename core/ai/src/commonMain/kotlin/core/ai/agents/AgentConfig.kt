@@ -6,23 +6,19 @@ import kotlin.random.nextInt
 import kotlinx.datetime.Clock
 import kotlinx.datetime.Instant
 
-/** Supported LLM providers. */
 enum class AgentProvider(val displayName: String) {
     OpenRouter("OpenRouter"),
     GigaChat("GigaChat"),
-    Yandex("Yandex")
+    Yandex("Yandex"),
 }
 
-/**
- * Configuration used to call an LLM.
- */
 data class AgentConfig(
     val id: String = newAgentId(),
     val name: String,
     val provider: AgentProvider,
     val model: String,
     val apiKey: String?,
-    val systemPrompt: String,
+    val systemPrompt: String?,
     val temperature: Double,
     val maxTokens: Int?,
     val topP: Double?,
@@ -42,7 +38,6 @@ fun AgentConfig.clone(newNameSuffix: String = " Copy"): AgentConfig = copy(
     updatedAt = Clock.System.now(),
 )
 
-/** Default preset used on first launch. */
 val DefaultOpenRouterAgent = AgentConfig(
     name = "OpenRouter Default",
     provider = AgentProvider.OpenRouter,

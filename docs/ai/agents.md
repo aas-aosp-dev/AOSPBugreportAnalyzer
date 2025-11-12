@@ -9,12 +9,14 @@ data class AgentConfig(
     val provider: AgentProvider,
     val model: String,
     val apiKey: String?,
-    val systemPrompt: String,
+    val systemPrompt: String?,
     val temperature: Double,
     val maxTokens: Int?,
     val topP: Double?,
     val seed: Long?,
-    val strictJson: Boolean
+    val strictJson: Boolean,
+    val createdAt: Instant,
+    val updatedAt: Instant,
 )
 ```
 

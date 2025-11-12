@@ -41,10 +41,10 @@ class OpenRouterProvider : ChatProvider {
             ?: throw IllegalStateException("OpenRouter API key is required")
 
         val messages = buildJsonArray {
-            if (agent.systemPrompt.isNotBlank()) {
+            agent.systemPrompt?.takeIf { it.isNotBlank() }?.let { prompt ->
                 add(buildJsonObject {
                     put("role", JsonPrimitive("system"))
-                    put("content", JsonPrimitive(agent.systemPrompt))
+                    put("content", JsonPrimitive(prompt))
                 })
             }
             history.forEach { message ->
