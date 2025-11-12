@@ -433,7 +433,7 @@ private fun AgentEditor(
 @Composable
 private fun ProviderPicker(agent: AgentConfig, onAgentChange: (AgentConfig) -> Unit) {
     var expanded by remember { mutableStateOf(false) }
-    ExposedDropdownMenuBox(expanded = expanded, onExpandedChange = { expanded = it }) {
+    ExposedDropdownMenuBox(expanded = expanded, onExpandedChange = { expanded = !expanded }) {
         OutlinedTextField(
             modifier = Modifier.menuAnchor(),
             value = agent.provider.displayName,
