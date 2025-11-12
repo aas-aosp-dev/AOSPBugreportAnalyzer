@@ -28,10 +28,10 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
-import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -831,13 +831,24 @@ private fun DesktopChatApp() {
         Screen.MAIN -> {
             Scaffold(
                 topBar = {
-                    TopAppBar(
-                        title = { Text("AOSP Bugreport Analyzer — Чат") },
-                        actions = {
-                            TextButton(onClick = { screen = Screen.MODEL_BENCH }) { Text("Model Bench") }
-                            TextButton(onClick = { screen = Screen.SETTINGS }) { Text("Настройки") }
+                    Surface(shadowElevation = 4.dp) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 16.dp, vertical = 12.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = "AOSP Bugreport Analyzer — Чат",
+                                style = MaterialTheme.typography.titleLarge,
+                                modifier = Modifier.weight(1f, fill = false)
+                            )
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                TextButton(onClick = { screen = Screen.MODEL_BENCH }) { Text("Model Bench") }
+                                TextButton(onClick = { screen = Screen.SETTINGS }) { Text("Настройки") }
+                            }
                         }
-                    )
+                    }
                 }
             ) { padding ->
                 Column(
