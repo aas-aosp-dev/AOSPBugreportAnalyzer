@@ -5,6 +5,7 @@ import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
@@ -43,7 +44,6 @@ import androidx.compose.material3.Slider
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
-import androidx.compose.material3.TextField
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
@@ -228,7 +228,6 @@ private fun ChatPane(modifier: Modifier, state: AppUiState, viewModel: AppViewMo
 
 @Composable
 private fun AgentSelector(agents: List<AgentConfig>, activeId: String?, onSelect: (String) -> Unit) {
-    var expanded by remember { mutableStateOf(false) }
     val hasAgents = agents.isNotEmpty()
     val activeAgent = agents.firstOrNull { it.id == activeId }
     val helperText = activeAgent?.model ?: "Create or select an agent to start chatting"
@@ -236,57 +235,31 @@ private fun AgentSelector(agents: List<AgentConfig>, activeId: String?, onSelect
     Column {
         Text("Active agent", style = MaterialTheme.typography.titleMedium)
         Spacer(Modifier.height(4.dp))
-        Box {
-            TextField(
-                value = activeAgent?.name ?: "Select an agent",
-                onValueChange = {},
-                readOnly = true,
-                enabled = hasAgents,
-                modifier = Modifier.fillMaxWidth().clickable(
-                    enabled = hasAgents,
-                    indication = null,
-                    interactionSource = remember { MutableInteractionSource() }
-                ) { expanded = !expanded },
-                trailingIcon = {
-                    IconButton(onClick = { if (hasAgents) expanded = !expanded }) {
-                        Icon(
-                            imageVector = if (expanded) Icons.Filled.ArrowDropUp else Icons.Filled.ArrowDropDown,
-                            contentDescription = if (expanded) "Collapse agents" else "Expand agents"
-                        )
-                    }
-                },
-                label = { Text("Agent") }
-            )
-            DropdownMenu(
-                expanded = expanded && hasAgents,
-                onDismissRequest = { expanded = false }
-            ) {
-                agents.forEach { agent ->
-                    DropdownMenuItem(
-                        text = {
-                            Column {
-                                Text(agent.name)
-                                Text(
-                                    agent.model,
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
-                            }
-                        },
-                        onClick = {
-                            expanded = false
-                            onSelect(agent.id)
+        DropdownField(
+            label = "Agent",
+            value = activeAgent?.name ?: "Select an agent",
+            enabled = hasAgents,
+            helperText = helperText
+        ) { closeMenu ->
+            agents.forEach { agent ->
+                DropdownMenuItem(
+                    text = {
+                        Column {
+                            Text(agent.name)
+                            Text(
+                                agent.model,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
                         }
-                    )
-                }
+                    },
+                    onClick = {
+                        closeMenu()
+                        onSelect(agent.id)
+                    }
+                )
             }
         }
-        Spacer(Modifier.height(4.dp))
-        Text(
-            helperText,
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant
-        )
     }
 }
 
@@ -474,33 +447,74 @@ private fun AgentEditor(
 
 @Composable
 private fun ProviderPicker(agent: AgentConfig, onAgentChange: (AgentConfig) -> Unit) {
+    DropdownField(
+        label = "Provider",
+        value = agent.provider.displayName,
+        enabled = true,
+        helperText = null
+    ) { closeMenu ->
+        AgentProvider.values().forEach { provider ->
+            DropdownMenuItem(
+                text = { Text(provider.displayName) },
+                onClick = {
+                    closeMenu()
+                    onAgentChange(agent.copy(provider = provider))
+                }
+            )
+        }
+    }
+}
+
+@Composable
+private fun DropdownField(
+    label: String,
+    value: String,
+    enabled: Boolean,
+    helperText: String?,
+    menuContent: @Composable ColumnScope.(closeMenu: () -> Unit) -> Unit,
+) {
     var expanded by remember { mutableStateOf(false) }
     val interactionSource = remember { MutableInteractionSource() }
-    Box {
-        OutlinedTextField(
-            modifier = Modifier
-                .fillMaxWidth()
-                .clickable(
-                    interactionSource = interactionSource,
-                    indication = null
-                ) { expanded = true },
-            value = agent.provider.displayName,
-            onValueChange = {},
-            readOnly = true,
-            interactionSource = interactionSource,
-            label = { Text("Provider") },
-            trailingIcon = { Icon(Icons.Default.ArrowDropDown, contentDescription = null) }
-        )
-        DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
-            AgentProvider.values().forEach { provider ->
-                DropdownMenuItem(
-                    text = { Text(provider.displayName) },
-                    onClick = {
-                        expanded = false
-                        onAgentChange(agent.copy(provider = provider))
+
+    Column {
+        Box {
+            OutlinedTextField(
+                value = value,
+                onValueChange = {},
+                readOnly = true,
+                enabled = enabled,
+                label = { Text(label) },
+                interactionSource = interactionSource,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable(
+                        enabled = enabled,
+                        interactionSource = interactionSource,
+                        indication = null
+                    ) { expanded = !expanded },
+                trailingIcon = {
+                    IconButton(onClick = { if (enabled) expanded = !expanded }) {
+                        Icon(
+                            imageVector = if (expanded) Icons.Filled.ArrowDropUp else Icons.Filled.ArrowDropDown,
+                            contentDescription = if (expanded) "Collapse" else "Expand"
+                        )
                     }
-                )
+                }
+            )
+            DropdownMenu(
+                expanded = expanded && enabled,
+                onDismissRequest = { expanded = false }
+            ) {
+                menuContent { expanded = false }
             }
+        }
+        if (!helperText.isNullOrBlank()) {
+            Spacer(Modifier.height(4.dp))
+            Text(
+                helperText,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
         }
     }
 }
