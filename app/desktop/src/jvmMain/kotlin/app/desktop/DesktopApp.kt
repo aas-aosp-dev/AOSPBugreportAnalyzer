@@ -1,5 +1,3 @@
-@file:OptIn(ExperimentalMaterial3Api::class)
-
 package app.desktop
 
 import androidx.compose.foundation.clickable
@@ -21,6 +19,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowDropDown
+import androidx.compose.material.icons.filled.ArrowDropUp
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
@@ -35,10 +34,6 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Divider
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
-import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.ExposedDropdownMenu
-import androidx.compose.material3.ExposedDropdownMenuBox
-import androidx.compose.material3.ExposedDropdownMenuDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -50,7 +45,6 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TextField
 import androidx.compose.material3.TopAppBar
-import androidx.compose.material3.menuAnchor
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -237,49 +231,62 @@ private fun AgentSelector(agents: List<AgentConfig>, activeId: String?, onSelect
     var expanded by remember { mutableStateOf(false) }
     val hasAgents = agents.isNotEmpty()
     val activeAgent = agents.firstOrNull { it.id == activeId }
+    val helperText = activeAgent?.model ?: "Create or select an agent to start chatting"
+
     Column {
         Text("Active agent", style = MaterialTheme.typography.titleMedium)
         Spacer(Modifier.height(4.dp))
-        ExposedDropdownMenuBox(
-            expanded = expanded && hasAgents,
-            onExpandedChange = {
-                if (hasAgents) {
-                    expanded = !expanded
-                }
-            }
-        ) {
+        Box {
             TextField(
                 value = activeAgent?.name ?: "Select an agent",
                 onValueChange = {},
                 readOnly = true,
                 enabled = hasAgents,
-                modifier = Modifier.menuAnchor().fillMaxWidth(),
-                trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
-                label = { Text("Agent") },
-                supportingText = {
-                    if (activeAgent != null) {
-                        Text(activeAgent.model, style = MaterialTheme.typography.bodySmall)
-                    } else {
-                        Text("Create or select an agent to start chatting", style = MaterialTheme.typography.bodySmall)
+                modifier = Modifier.fillMaxWidth().clickable(
+                    enabled = hasAgents,
+                    indication = null,
+                    interactionSource = remember { MutableInteractionSource() }
+                ) { expanded = !expanded },
+                trailingIcon = {
+                    IconButton(onClick = { if (hasAgents) expanded = !expanded }) {
+                        Icon(
+                            imageVector = if (expanded) Icons.Filled.ArrowDropUp else Icons.Filled.ArrowDropDown,
+                            contentDescription = if (expanded) "Collapse agents" else "Expand agents"
+                        )
                     }
-                }
+                },
+                label = { Text("Agent") }
             )
-            ExposedDropdownMenu(
+            DropdownMenu(
                 expanded = expanded && hasAgents,
                 onDismissRequest = { expanded = false }
             ) {
                 agents.forEach { agent ->
                     DropdownMenuItem(
-                        text = { Text(agent.name) },
+                        text = {
+                            Column {
+                                Text(agent.name)
+                                Text(
+                                    agent.model,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        },
                         onClick = {
                             expanded = false
                             onSelect(agent.id)
-                        },
-                        supportingText = { Text(agent.model, style = MaterialTheme.typography.bodySmall) }
+                        }
                     )
                 }
             }
         }
+        Spacer(Modifier.height(4.dp))
+        Text(
+            helperText,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
     }
 }
 
