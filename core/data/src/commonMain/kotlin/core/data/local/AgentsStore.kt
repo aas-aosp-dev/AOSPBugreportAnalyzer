@@ -56,5 +56,8 @@ class AgentsStore {
 
     fun agentById(id: String): AgentConfig? = _agents.value.find { it.id == id }
 
-    fun activeAgent(): AgentConfig? = agentById(_activeAgentId.value ?: return null)
+    fun activeAgent(): AgentConfig? {
+        val id = _activeAgentId.value ?: return null
+        return agentById(id)
+    }
 }
