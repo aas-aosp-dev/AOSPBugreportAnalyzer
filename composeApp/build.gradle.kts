@@ -41,6 +41,19 @@ kotlin {
     }
 
     sourceSets {
+        val commonMain by getting {
+            kotlin.srcDir("../core/parser/src/commonMain/kotlin")
+            kotlin.srcDir("../core/ai/src/commonMain/kotlin")
+            kotlin.srcDir("../core/domain/src/commonMain/kotlin")
+            kotlin.srcDir("../core/data/src/commonMain/kotlin")
+            kotlin.srcDir("../core/ui/src/commonMain/kotlin")
+        }
+        val jvmMain by getting {
+            kotlin.srcDir("../app/desktop/src/jvmMain/kotlin")
+        }
+        val androidMain by getting {
+            kotlin.srcDir("../app/android/src/androidMain/kotlin")
+        }
         androidMain.dependencies {
             implementation(compose.preview)
             implementation(libs.androidx.activity.compose)
@@ -56,6 +69,9 @@ kotlin {
             implementation(libs.androidx.lifecycle.runtimeCompose)
             implementation(projects.shared)
             implementation(compose.materialIconsExtended)
+            implementation(libs.kotlinx.datetime)
+            implementation(libs.ktor.client.core)
+            implementation(libs.kotlinx.serialization.json)
         }
         commonTest.dependencies {
             implementation(libs.kotlin.test)
@@ -63,6 +79,8 @@ kotlin {
         jvmMain.dependencies {
             implementation(compose.desktop.currentOs)
             implementation(libs.kotlinx.coroutinesSwing)
+            implementation(libs.ktor.client.cio)
+            implementation(libs.ktor.client.logging)
         }
     }
 }
@@ -100,7 +118,7 @@ dependencies {
 
 compose.desktop {
     application {
-        mainClass = "com.bigdotdev.aospbugreportanalyzer.DesktopChatMainKt"
+        mainClass = "com.bigdotdev.aospbugreportanalyzer.MainKt"
 
         nativeDistributions {
             targetFormats(TargetFormat.Exe)
