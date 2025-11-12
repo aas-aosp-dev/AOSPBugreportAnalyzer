@@ -3,6 +3,11 @@ enableFeaturePreview("TYPESAFE_PROJECT_ACCESSORS")
 
 pluginManagement {
     repositories {
+        gradlePluginPortal()
+        maven("https://plugins.gradle.org/m2/")
+        maven("https://cache-redirector.jetbrains.com/gradle-plugin-portal")
+        mavenCentral()
+        maven("https://maven-central.storage-download.googleapis.com/maven2/")
         google {
             mavenContent {
                 includeGroupAndSubgroups("androidx")
@@ -10,13 +15,15 @@ pluginManagement {
                 includeGroupAndSubgroups("com.google")
             }
         }
-        mavenCentral()
-        gradlePluginPortal()
+        maven("https://maven.pkg.jetbrains.space/public/p/compose/dev")
     }
 }
 
 dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
     repositories {
+        mavenCentral()
+        maven("https://maven-central.storage-download.googleapis.com/maven2/")
         google {
             mavenContent {
                 includeGroupAndSubgroups("androidx")
@@ -24,12 +31,8 @@ dependencyResolutionManagement {
                 includeGroupAndSubgroups("com.google")
             }
         }
-        mavenCentral()
+        maven("https://maven.pkg.jetbrains.space/public/p/compose/dev")
     }
-}
-
-plugins {
-    id("org.gradle.toolchains.foojay-resolver-convention") version "1.0.0"
 }
 
 include(":composeApp")
