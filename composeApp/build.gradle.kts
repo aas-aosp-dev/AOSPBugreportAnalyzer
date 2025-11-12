@@ -56,13 +56,31 @@ kotlin {
             implementation(libs.androidx.lifecycle.runtimeCompose)
             implementation(projects.shared)
             implementation(compose.materialIconsExtended)
+            implementation(libs.ktor.client.core)
+            implementation(libs.ktor.client.logging)
         }
         commonTest.dependencies {
             implementation(libs.kotlin.test)
         }
-        jvmMain.dependencies {
+        getByName("jvmMain").dependencies {
             implementation(compose.desktop.currentOs)
             implementation(libs.kotlinx.coroutinesSwing)
+            implementation(libs.ktor.client.java)
+        }
+        getByName("androidMain").dependencies {
+            implementation(libs.ktor.client.okhttp)
+        }
+        getByName("iosArm64Main").dependencies {
+            implementation(libs.ktor.client.darwin)
+        }
+        getByName("iosSimulatorArm64Main").dependencies {
+            implementation(libs.ktor.client.darwin)
+        }
+        getByName("jsMain").dependencies {
+            implementation(libs.ktor.client.js)
+        }
+        getByName("wasmJsMain").dependencies {
+            implementation(libs.ktor.client.js)
         }
     }
 }
