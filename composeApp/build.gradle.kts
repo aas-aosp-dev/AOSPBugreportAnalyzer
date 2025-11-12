@@ -50,6 +50,7 @@ kotlin {
         }
         val jvmMain by getting {
             kotlin.srcDir("../app/desktop/src/jvmMain/kotlin")
+            languageSettings.optIn("androidx.compose.material3.ExperimentalMaterial3Api")
         }
         val androidMain by getting {
             kotlin.srcDir("../app/android/src/androidMain/kotlin")

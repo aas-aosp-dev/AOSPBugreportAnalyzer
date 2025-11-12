@@ -1,3 +1,5 @@
+@file:OptIn(ExperimentalMaterial3Api::class)
+
 package app.desktop
 
 import androidx.compose.foundation.clickable
@@ -27,23 +29,28 @@ import androidx.compose.material.icons.filled.PersonAdd
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Save
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Divider
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.ExposedDropdownMenu
+import androidx.compose.material3.ExposedDropdownMenuBox
+import androidx.compose.material3.ExposedDropdownMenuDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.TextField
 import androidx.compose.material3.TopAppBar
-import androidx.compose.material3.Button
+import androidx.compose.material3.menuAnchor
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -227,15 +234,49 @@ private fun ChatPane(modifier: Modifier, state: AppUiState, viewModel: AppViewMo
 
 @Composable
 private fun AgentSelector(agents: List<AgentConfig>, activeId: String?, onSelect: (String) -> Unit) {
+    var expanded by remember { mutableStateOf(false) }
+    val hasAgents = agents.isNotEmpty()
+    val activeAgent = agents.firstOrNull { it.id == activeId }
     Column {
         Text("Active agent", style = MaterialTheme.typography.titleMedium)
         Spacer(Modifier.height(4.dp))
-        agents.forEach { agent ->
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                RadioButton(selected = agent.id == activeId, onClick = { onSelect(agent.id) })
-                Column {
-                    Text(agent.name, fontWeight = FontWeight.SemiBold)
-                    Text(agent.model, style = MaterialTheme.typography.bodySmall)
+        ExposedDropdownMenuBox(
+            expanded = expanded && hasAgents,
+            onExpandedChange = {
+                if (hasAgents) {
+                    expanded = !expanded
+                }
+            }
+        ) {
+            TextField(
+                value = activeAgent?.name ?: "Select an agent",
+                onValueChange = {},
+                readOnly = true,
+                enabled = hasAgents,
+                modifier = Modifier.menuAnchor().fillMaxWidth(),
+                trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
+                label = { Text("Agent") },
+                supportingText = {
+                    if (activeAgent != null) {
+                        Text(activeAgent.model, style = MaterialTheme.typography.bodySmall)
+                    } else {
+                        Text("Create or select an agent to start chatting", style = MaterialTheme.typography.bodySmall)
+                    }
+                }
+            )
+            ExposedDropdownMenu(
+                expanded = expanded && hasAgents,
+                onDismissRequest = { expanded = false }
+            ) {
+                agents.forEach { agent ->
+                    DropdownMenuItem(
+                        text = { Text(agent.name) },
+                        onClick = {
+                            expanded = false
+                            onSelect(agent.id)
+                        },
+                        supportingText = { Text(agent.model, style = MaterialTheme.typography.bodySmall) }
+                    )
                 }
             }
         }
