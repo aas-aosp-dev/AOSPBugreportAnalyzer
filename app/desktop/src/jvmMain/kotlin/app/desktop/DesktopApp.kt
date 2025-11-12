@@ -16,6 +16,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.MoreVert
@@ -56,6 +57,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.KeyboardOptions
@@ -183,6 +185,10 @@ private fun ChatPane(modifier: Modifier, state: AppUiState, viewModel: AppViewMo
             activeId = state.activeAgentId,
             onSelect = { viewModel.selectAgent(it) }
         )
+        state.statusMessage?.let {
+            Spacer(modifier = Modifier.height(8.dp))
+            StatusBanner(message = it, onDismiss = { viewModel.clearStatusMessage() })
+        }
         Spacer(modifier = Modifier.height(12.dp))
         Card(modifier = Modifier.weight(1f).fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)) {
             LazyColumn(modifier = Modifier.fillMaxSize().padding(16.dp)) {
@@ -356,6 +362,11 @@ private fun AgentEditor(
             ProviderPicker(agent = agent, onAgentChange = onAgentChange)
             OutlinedTextField(value = agent.model, onValueChange = { onAgentChange(agent.copy(model = it)) }, label = { Text("Model") })
             OutlinedTextField(value = agent.apiKey.orEmpty(), onValueChange = { onAgentChange(agent.copy(apiKey = it)) }, label = { Text("API Key") })
+            Text(
+                text = "Tip: store keys locally only. Required for OpenRouter requests.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
             OutlinedTextField(value = agent.systemPrompt, onValueChange = { onAgentChange(agent.copy(systemPrompt = it)) }, label = { Text("System Prompt") })
             Column {
                 Text("Temperature: ${"%.2f".format(agent.temperature)}")
@@ -448,13 +459,15 @@ private fun UsageDialog(state: core.ui.state.UsagePanelState, onClose: () -> Uni
     val clipboard = LocalClipboardManager.current
     val usage = state.usage
     val summary = buildString {
+        appendLine("Provider: ${usage.provider}")
         appendLine("Model: ${usage.model}")
-        appendLine("Latency: ${usage.latencyMs} ms")
+        appendLine("Latency: ${usage.latencyMs.takeIf { it > 0 }?.let { "$it ms" } ?: "—"}")
         appendLine("Tokens: in=${usage.inputTokens ?: "—"}, out=${usage.outputTokens ?: "—"}, total=${usage.totalTokens ?: "—"}")
         appendLine("Cost: ${usage.costUsd?.let { "$" + "%.6f".format(it) } ?: "—"}")
         appendLine("Temperature: ${usage.temperature ?: "—"}")
         appendLine("Seed: ${usage.seed ?: "—"}")
         appendLine("Timestamp: ${usage.timestamp}")
+        appendLine("Session: ${usage.sessionId ?: "—"}")
     }
     AlertDialog(
         onDismissRequest = onClose,
@@ -486,7 +499,10 @@ private fun SpecDialog(onClose: () -> Unit) {
         title = { Text("Project Specification") },
         text = {
             Box(modifier = Modifier.fillMaxWidth().height(400.dp).verticalScroll(rememberScrollState())) {
-                Text(specText.ifBlank { "Unable to load spec document." })
+                Text(
+                    specText.ifBlank { "Unable to load spec document." },
+                    fontFamily = FontFamily.Monospace,
+                )
             }
         }
     )
@@ -496,4 +512,28 @@ private fun loadSpecText(): String {
     val path: Path = Paths.get("docs/product/AOSPBugreportAnalyzer-Spec.md")
     if (!path.exists()) return "Spec file missing."
     return runCatching { Files.readString(path) }.getOrElse { "Failed to read spec: ${it.message}" }
+}
+
+@Composable
+private fun StatusBanner(message: String, onDismiss: () -> Unit) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer)
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Text(
+                text = message,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onErrorContainer,
+                modifier = Modifier.weight(1f)
+            )
+            IconButton(onClick = onDismiss) {
+                Icon(Icons.Default.Close, contentDescription = "Dismiss status")
+            }
+        }
+    }
 }

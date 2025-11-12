@@ -14,6 +14,7 @@ data class AppUiState(
     val showAgentsManager: Boolean = false,
     val showSpec: Boolean = false,
     val usageDetails: UsagePanelState? = null,
+    val statusMessage: String? = null,
 )
 
 data class UsagePanelState(

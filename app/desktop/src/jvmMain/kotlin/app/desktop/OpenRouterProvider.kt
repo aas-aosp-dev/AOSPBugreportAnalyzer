@@ -19,14 +19,10 @@ import io.ktor.http.ContentType
 import io.ktor.http.contentType
 import io.ktor.client.statement.bodyAsText
 import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.JsonArray
-import kotlinx.serialization.json.JsonNull
-import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
-import kotlinx.serialization.json.doubleOrNull
 import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
@@ -89,24 +85,27 @@ class OpenRouterProvider : ChatProvider {
             ?: throw IllegalStateException("Empty response from OpenRouter")
         val messageContent = choice["message"]?.jsonObject?.get("content")?.jsonPrimitive?.contentOrNull.orEmpty()
         val usage = payload["usage"]?.jsonObject
+        val promptTokens = usage?.get("prompt_tokens")?.jsonPrimitive?.intOrNull
+        val completionTokens = usage?.get("completion_tokens")?.jsonPrimitive?.intOrNull
+        val totalTokens = usage?.get("total_tokens")?.jsonPrimitive?.intOrNull
         val pricing = PricingTable.find(agent.model)
         val cost = pricing?.let { entry ->
-            val input = usage?.get("prompt_tokens")?.jsonPrimitive?.intOrNull?.let { tokens ->
-                entry.inputCostPer1K?.times(tokens / 1000.0)
-            } ?: 0.0
-            val output = usage?.get("completion_tokens")?.jsonPrimitive?.intOrNull?.let { tokens ->
-                entry.outputCostPer1K?.times(tokens / 1000.0)
-            } ?: 0.0
-            (input + output).takeIf { it > 0 }
+            val inputCost = promptTokens?.let { tokens ->
+                entry.inputCostPer1K?.let { price -> price * (tokens / 1000.0) }
+            }
+            val outputCost = completionTokens?.let { tokens ->
+                entry.outputCostPer1K?.let { price -> price * (tokens / 1000.0) }
+            }
+            listOfNotNull(inputCost, outputCost).takeIf { it.isNotEmpty() }?.sum()
         }
 
         val providerUsage = ProviderUsage(
             provider = agent.provider.displayName,
             model = agent.model,
             latencyMs = 0,
-            inputTokens = usage?.get("prompt_tokens")?.jsonPrimitive?.intOrNull,
-            outputTokens = usage?.get("completion_tokens")?.jsonPrimitive?.intOrNull,
-            totalTokens = usage?.get("total_tokens")?.jsonPrimitive?.intOrNull,
+            inputTokens = promptTokens,
+            outputTokens = completionTokens,
+            totalTokens = totalTokens,
             costUsd = cost,
             temperature = agent.temperature,
             seed = agent.seed,

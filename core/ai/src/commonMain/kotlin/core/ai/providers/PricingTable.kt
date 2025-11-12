@@ -18,5 +18,7 @@ object PricingTable {
         ),
     )
 
+    // TODO(billing): keep pricing values in sync with OpenRouter's published rates.
+
     fun find(model: String): Entry? = entries[model]
 }

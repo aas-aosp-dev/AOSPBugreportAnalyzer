@@ -11,6 +11,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlinx.datetime.Clock
+import kotlin.random.Random
 import kotlin.coroutines.CoroutineContext
 
 class ChatService(
@@ -21,6 +22,8 @@ class ChatService(
     private val externalScope: CoroutineScope,
     private val callContext: CoroutineContext = Dispatchers.Default,
 ) {
+    private val sessionId: String = newSessionId()
+
     fun sendMessage(content: String): Job {
         val agent = agentsStore.activeAgent() ?: return Job()
         val trimmed = content.trim()
@@ -36,7 +39,7 @@ class ChatService(
                 val result: ProviderResult = provider.execute(agent, history)
                 val end = Clock.System.now()
                 val latency = end.toEpochMilliseconds() - start.toEpochMilliseconds()
-                val usage = result.usage.copy(latencyMs = latency)
+                val usage = result.usage.copy(latencyMs = latency, sessionId = sessionId)
                 metricsStore.put(placeholder.id, usage)
                 chatStore.commitAssistantMessage(
                     id = placeholder.id,
@@ -46,6 +49,12 @@ class ChatService(
                 chatStore.markAssistantError(placeholder.id, t.message ?: "Unknown error")
             }
         }
+    }
+
+    companion object {
+        private const val SESSION_PREFIX = "session-"
+
+        private fun newSessionId(): String = SESSION_PREFIX + Random.nextInt(0x100000, 0xFFFFFF).toString(16)
     }
 }
 

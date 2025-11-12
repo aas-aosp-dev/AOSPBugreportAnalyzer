@@ -66,11 +66,22 @@ class AppViewModel(
             _uiState.value = _uiState.value.copy(isSending = false)
             return
         }
-        if (agentsStore.activeAgent() == null) {
-            _uiState.value = _uiState.value.copy(isSending = false)
+        val agent = agentsStore.activeAgent()
+        if (agent == null) {
+            _uiState.value = _uiState.value.copy(
+                isSending = false,
+                statusMessage = "Select an agent before sending a message.",
+            )
             return
         }
-        _uiState.value = _uiState.value.copy(isSending = true)
+        if (agent.apiKey.isNullOrBlank()) {
+            _uiState.value = _uiState.value.copy(
+                isSending = false,
+                statusMessage = "Add an API key for ${agent.name} in Agents to start chatting.",
+            )
+            return
+        }
+        _uiState.value = _uiState.value.copy(isSending = true, statusMessage = null)
         scope.launch {
             try {
                 chatService.sendMessage(trimmed).join()
@@ -94,6 +105,7 @@ class AppViewModel(
                 costUsd = null,
                 temperature = agent?.temperature,
                 seed = agent?.seed,
+                sessionId = null,
             )
         }
         _uiState.value = _uiState.value.copy(
@@ -103,6 +115,12 @@ class AppViewModel(
 
     fun hideUsage() {
         _uiState.value = _uiState.value.copy(usageDetails = null)
+    }
+
+    fun clearStatusMessage() {
+        if (_uiState.value.statusMessage != null) {
+            _uiState.value = _uiState.value.copy(statusMessage = null)
+        }
     }
 
     fun upsertAgent(agent: AgentConfig) {

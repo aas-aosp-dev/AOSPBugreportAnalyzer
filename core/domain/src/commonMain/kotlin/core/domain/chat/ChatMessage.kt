@@ -26,4 +26,5 @@ data class ProviderUsage(
     val temperature: Double?,
     val seed: Long?,
     val timestamp: Instant = Clock.System.now(),
+    val sessionId: String? = null,
 )
