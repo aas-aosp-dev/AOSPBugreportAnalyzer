@@ -127,7 +127,6 @@ Modules:
 | Module | Goal |
 |---|---|
 AI Team Simulation | виртуальная команда инженеров |
-Model Benchmark | скорость/качество/стоимость |
 Prompt Lab | temperature / persona tuning |
 
 Enable manually via UI.
