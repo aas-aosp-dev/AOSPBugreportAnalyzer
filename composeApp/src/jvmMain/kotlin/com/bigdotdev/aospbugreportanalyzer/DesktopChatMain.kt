@@ -52,6 +52,12 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.intOrNull
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.parseToJsonElement
 import java.net.URI
 import java.net.http.HttpClient
 import java.net.http.HttpRequest
@@ -77,7 +83,8 @@ private data class MsgMetrics(
     val completionTokens: Int?,
     val totalTokens: Int?,
     val elapsedMs: Long?,
-    val costUsd: Double?
+    val costUsd: Double?,
+    val error: String? = null
 )
 
 private data class ChatMessage(
@@ -97,14 +104,26 @@ private data class CallStats(
     val costUsd: Double?
 )
 
-private data class CallResult(
-    val content: String,
-    val stats: CallStats,
-    val success: Boolean
+private data class OpenRouterError(
+    val httpCode: Int,
+    val errorCode: Int? = null,
+    val message: String? = null,
+    val rawBody: String? = null
 )
 
+private sealed class OpenRouterResult {
+    data class Success(
+        val content: String,
+        val stats: CallStats
+    ) : OpenRouterResult()
+
+    data class Failure(
+        val error: OpenRouterError
+    ) : OpenRouterResult()
+}
+
 private fun CallStats.toMsgMetrics(): MsgMetrics =
-    MsgMetrics(promptTokens, completionTokens, totalTokens, elapsedMs, costUsd)
+    MsgMetrics(promptTokens, completionTokens, totalTokens, elapsedMs, costUsd, error = null)
 
 private object OpenRouterConfig {
     const val BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
@@ -157,6 +176,8 @@ private val modelPriceMap = mapOf(
 private val httpClient: HttpClient = HttpClient.newBuilder()
     .connectTimeout(Duration.ofSeconds(60))
     .build()
+
+private val openRouterJson = Json { ignoreUnknownKeys = true }
 
 private fun encodeJsonString(value: String): String {
     val sb = StringBuilder()
@@ -244,6 +265,51 @@ private fun jsonError(message: String): String {
 private fun errorResponse(forceJson: Boolean, message: String): String =
     if (forceJson) jsonError(message) else "Error: $message"
 
+private fun parseOpenRouterError(statusCode: Int, body: String?): OpenRouterError {
+    val safeBody = body ?: ""
+    return try {
+        val parsed = openRouterJson.parseToJsonElement(safeBody)
+        val errorObject = parsed.jsonObject["error"]?.jsonObject
+        val code = errorObject?.get("code")?.jsonPrimitive?.intOrNull
+        val message = errorObject?.get("message")?.jsonPrimitive?.contentOrNull
+        OpenRouterError(
+            httpCode = statusCode,
+            errorCode = code,
+            message = message,
+            rawBody = safeBody.take(500)
+        )
+    } catch (_: Throwable) {
+        OpenRouterError(
+            httpCode = statusCode,
+            errorCode = null,
+            message = null,
+            rawBody = safeBody.take(500).ifBlank { null }
+        )
+    }
+}
+
+private fun OpenRouterError.toUserMessage(): String {
+    val base = message?.takeIf { it.isNotBlank() }
+    val prefix = when (httpCode) {
+        0 -> base ?: "Не настроен OpenRouter API key. Откройте экран настроек и укажите ключ."
+        400 -> "Некорректный запрос к OpenRouter (400)."
+        401 -> "OpenRouter: неверный или отключённый API-ключ (401)."
+        402 -> "OpenRouter: недостаточно кредитов или баланс слишком мал (402)."
+        403 -> "OpenRouter: доступ к запросу/модели запрещён (403)."
+        408 -> "OpenRouter: тайм-аут запроса (408)."
+        429 -> "OpenRouter: превышен лимит запросов (429)."
+        500, 502, 503 -> "Проблемы на стороне провайдера/модели (код $httpCode)."
+        else -> "Ошибка OpenRouter (код $httpCode)."
+    }
+
+    return when {
+        httpCode == 0 && base != null -> base
+        base != null -> "$prefix Детали: $base"
+        !rawBody.isNullOrBlank() -> "$prefix Ответ: ${rawBody.take(200)}"
+        else -> prefix
+    }
+}
+
 private val timeFormatter: DateTimeFormatter =
     DateTimeFormatter.ofPattern("HH:mm:ss").withZone(ZoneId.systemDefault())
 
@@ -256,13 +322,15 @@ private fun callOpenRouter(
     forceJson: Boolean,
     apiKeyOverride: String?,
     temperature: Double
-): CallResult {
+): OpenRouterResult {
     val key = apiKeyOverride?.takeIf { it.isNotBlank() } ?: OpenRouterConfig.apiKey
     if (key.isNullOrBlank()) {
-        return CallResult(
-            content = errorResponse(forceJson, "openrouter api key missing"),
-            stats = CallStats(null, null, null, null, null),
-            success = false
+        return OpenRouterResult.Failure(
+            OpenRouterError(
+                httpCode = 0,
+                message = "Не настроен OpenRouter API key. Откройте экран настроек и укажите ключ.",
+                rawBody = null
+            )
         )
     }
 
@@ -308,22 +376,21 @@ private fun callOpenRouter(
     return try {
         val response = httpClient.send(httpRequest, HttpResponse.BodyHandlers.ofString())
         val elapsed = (System.nanoTime() - start) / 1_000_000
-        if (response.statusCode() / 100 != 2) {
-            return CallResult(
-                content = errorResponse(forceJson, "openrouter http ${'$'}{response.statusCode()}"),
-                stats = CallStats(null, null, null, elapsed, null),
-                success = false
-            )
+        val body = response.body()
+        if (response.statusCode() !in 200..299) {
+            return OpenRouterResult.Failure(parseOpenRouterError(response.statusCode(), body))
         }
-        val content = extractContentFromOpenAIJson(response.body())
-            ?: return CallResult(
-                content = errorResponse(forceJson, "openrouter empty content"),
-                stats = CallStats(null, null, null, elapsed, null),
-                success = false
+        val content = extractContentFromOpenAIJson(body)
+            ?: return OpenRouterResult.Failure(
+                OpenRouterError(
+                    httpCode = response.statusCode(),
+                    message = "OpenRouter вернул пустой контент.",
+                    rawBody = body.take(500)
+                )
             )
-        val prompt = promptTokensRegex.find(response.body())?.groupValues?.getOrNull(1)?.toIntOrNull()
-        val completion = completionTokensRegex.find(response.body())?.groupValues?.getOrNull(1)?.toIntOrNull()
-        val total = totalTokensRegex.find(response.body())?.groupValues?.getOrNull(1)?.toIntOrNull()
+        val prompt = promptTokensRegex.find(body)?.groupValues?.getOrNull(1)?.toIntOrNull()
+        val completion = completionTokensRegex.find(body)?.groupValues?.getOrNull(1)?.toIntOrNull()
+        val total = totalTokensRegex.find(body)?.groupValues?.getOrNull(1)?.toIntOrNull()
             ?: if (prompt != null && completion != null) prompt + completion else null
         val price = modelPriceMap[model]
         val cost = if (price != null && prompt != null && completion != null) {
@@ -331,17 +398,17 @@ private fun callOpenRouter(
         } else {
             null
         }
-        CallResult(
+        OpenRouterResult.Success(
             content = content,
-            stats = CallStats(prompt, completion, total, elapsed, cost),
-            success = true
+            stats = CallStats(prompt, completion, total, elapsed, cost)
         )
     } catch (t: Throwable) {
-        val elapsed = (System.nanoTime() - start) / 1_000_000
-        CallResult(
-            content = errorResponse(forceJson, t.message ?: t::class.simpleName ?: "unknown error"),
-            stats = CallStats(null, null, null, elapsed, null),
-            success = false
+        OpenRouterResult.Failure(
+            OpenRouterError(
+                httpCode = -1,
+                message = t.message ?: t::class.simpleName ?: "unknown error",
+                rawBody = null
+            )
         )
     }
 }
@@ -378,23 +445,12 @@ private fun DesktopChatApp() {
             author = "USER",
             role = AuthorRole.USER,
             text = text,
-            metrics = MsgMetrics(null, null, null, null, null)
+            metrics = MsgMetrics(null, null, null, null, null, error = null)
         )
         val newHistory = messages + userMessage
         messages = newHistory
         input = ""
         val apiKey = settings.openRouterApiKey.takeIf { it.isNotBlank() } ?: OpenRouterConfig.apiKey
-        if (apiKey.isNullOrBlank()) {
-            appendMessage(
-                ChatMessage(
-                    author = "Agent",
-                    role = AuthorRole.AGENT,
-                    text = "OPENROUTER_API_KEY is not set",
-                    metrics = MsgMetrics(null, null, null, null, null)
-                )
-            )
-            return
-        }
         isSending = true
         val model = settings.openRouterModel
         val strictJson = settings.strictJsonEnabled
@@ -407,12 +463,23 @@ private fun DesktopChatApp() {
                 apiKeyOverride = apiKey,
                 temperature = 0.0
             )
-            val agentMessage = ChatMessage(
-                author = "Agent",
-                role = AuthorRole.AGENT,
-                text = result.content,
-                metrics = result.stats.toMsgMetrics()
-            )
+            val agentMessage = when (result) {
+                is OpenRouterResult.Success -> ChatMessage(
+                    author = "Agent",
+                    role = AuthorRole.AGENT,
+                    text = result.content,
+                    metrics = result.stats.toMsgMetrics()
+                )
+                is OpenRouterResult.Failure -> {
+                    val errorMessage = result.error.toUserMessage()
+                    ChatMessage(
+                        author = "Agent",
+                        role = AuthorRole.AGENT,
+                        text = errorResponse(strictJson, errorMessage),
+                        metrics = MsgMetrics(null, null, null, null, null, error = errorMessage)
+                    )
+                }
+            }
             withContext(Dispatchers.Main) {
                 appendMessage(agentMessage)
                 isSending = false
@@ -427,7 +494,7 @@ private fun DesktopChatApp() {
                     author = "Agent",
                     role = AuthorRole.AGENT,
                     text = "Укажите OPENROUTER_API_KEY, чтобы агент мог отвечать.",
-                    metrics = MsgMetrics(null, null, null, null, null)
+                    metrics = MsgMetrics(null, null, null, null, null, error = null)
                 )
             )
         }
@@ -556,7 +623,7 @@ private fun MessageList(messages: List<ChatMessage>) {
 
 @Composable
 private fun MetricsLine(role: AuthorRole, metrics: MsgMetrics?) {
-    val m = metrics ?: MsgMetrics(null, null, null, null, null)
+    val m = metrics ?: MsgMetrics(null, null, null, null, null, error = null)
     val text = buildString {
         if (role == AuthorRole.USER) {
             append("P: ${m.promptTokens ?: "—"}")
@@ -575,13 +642,24 @@ private fun MetricsLine(role: AuthorRole, metrics: MsgMetrics?) {
         append(" • $")
         append(m.costUsd?.let { String.format(Locale.US, "%.4f", it) } ?: "—")
     }
-    Text(
-        text = text,
-        style = MaterialTheme.typography.bodySmall,
-        color = MaterialTheme.colorScheme.onSurfaceVariant,
-        maxLines = 1,
-        overflow = TextOverflow.Ellipsis
-    )
+    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+        Text(
+            text = text,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
+        )
+        if (!m.error.isNullOrBlank()) {
+            Text(
+                text = m.error,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error,
+                maxLines = 3,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+    }
 }
 
 @OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
