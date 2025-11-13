@@ -10,10 +10,12 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Visibility
@@ -27,6 +29,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -71,12 +74,16 @@ import java.util.UUID
 
 private enum class Screen { MAIN, SETTINGS }
 
-private enum class AuthorRole { USER, AGENT }
+private enum class AuthorRole { USER, AGENT, SUMMARY }
 
 private fun AuthorRole.displayName(): String = when (this) {
     AuthorRole.USER -> "Пользователь"
     AuthorRole.AGENT -> "Агент"
+    AuthorRole.SUMMARY -> "Сводка"
 }
+
+private const val MESSAGES_PER_SUMMARY = 10
+private const val MAX_RECENT_MESSAGES = 8
 
 private data class MsgMetrics(
     val promptTokens: Int?,
@@ -93,7 +100,25 @@ private data class ChatMessage(
     val role: AuthorRole,
     val text: String,
     val timestamp: Long = System.currentTimeMillis(),
-    val metrics: MsgMetrics? = null
+    val metrics: MsgMetrics? = null,
+    val isSummary: Boolean = false,
+    val summaryGroupId: Int? = null
+)
+
+private data class SummaryResult(
+    val text: String,
+    val promptTokens: Int?,
+    val completionTokens: Int?
+)
+
+data class CompressionStats(
+    val summaryGroupId: Int,
+    val messagesCount: Int,
+    val charsBefore: Int,
+    val charsAfter: Int,
+    val reductionPercent: Int,
+    val summaryPromptTokens: Int? = null,
+    val summaryCompletionTokens: Int? = null
 )
 
 private data class CallStats(
@@ -150,10 +175,17 @@ You are a concise teammate. Keep answers short and actionable.
 Return ONLY valid JSON (UTF-8) with keys: version, ok, generated_at, items, error.
 """.trimIndent()
 
+private val SUMMARY_SYSTEM_PROMPT = """
+Ты помощник, который сжимает диалоги.
+На основе сообщений пользователя и эксперта составь краткую сводку из 3–6 предложений на русском языке.
+Отражай только факты и выводы без лишних рассуждений.
+""".trimIndent()
+
 data class AppSettings(
     val openRouterApiKey: String = System.getenv("OPENROUTER_API_KEY") ?: "",
     val openRouterModel: String = "meta-llama/llama-4-maverick:free",
-    val strictJsonEnabled: Boolean = false
+    val strictJsonEnabled: Boolean = false,
+    val useCompression: Boolean = false
 )
 
 private fun selectSystemPrompt(forceJson: Boolean): String = if (forceJson) SYSTEM_JSON else SYSTEM_TEXT
@@ -419,10 +451,70 @@ private fun buildChatRequestMessages(
 ): List<ORMessage> {
     val messages = mutableListOf(ORMessage("system", selectSystemPrompt(forceJson)))
     history.forEach { message ->
-        val role = if (message.role == AuthorRole.USER) "user" else "assistant"
+        val role = when (message.role) {
+            AuthorRole.USER -> "user"
+            AuthorRole.AGENT -> "assistant"
+            AuthorRole.SUMMARY -> "system"
+        }
         messages += ORMessage(role, message.text)
     }
     return messages
+}
+
+private fun buildSummaryRequestMessages(messages: List<ChatMessage>): List<ORMessage> {
+    val content = buildString {
+        appendLine("Вот фрагмент диалога между пользователем и экспертом. Сожми его в краткую сводку (3–6 предложений, по-русски). Не добавляй лишних рассуждений, только факты и важные выводы.")
+        appendLine()
+        messages.forEach { msg ->
+            val roleLabel = when (msg.role) {
+                AuthorRole.USER -> "Пользователь"
+                AuthorRole.AGENT -> "Эксперт"
+                AuthorRole.SUMMARY -> "Система"
+            }
+            appendLine("$roleLabel: ${msg.text}")
+        }
+    }
+    return listOf(
+        ORMessage("system", SUMMARY_SYSTEM_PROMPT),
+        ORMessage("user", content)
+    )
+}
+
+private fun summarizeMessages(
+    messages: List<ChatMessage>,
+    model: String,
+    apiKeyOverride: String?
+): SummaryResult? {
+    val requestMessages = buildSummaryRequestMessages(messages)
+    return when (val result = callOpenRouter(
+        model = model,
+        messages = requestMessages,
+        forceJson = false,
+        apiKeyOverride = apiKeyOverride,
+        temperature = 0.0
+    )) {
+        is OpenRouterResult.Success -> {
+            val text = result.content.trim()
+            if (text.isBlank()) {
+                null
+            } else {
+                SummaryResult(
+                    text = text,
+                    promptTokens = result.stats.promptTokens,
+                    completionTokens = result.stats.completionTokens
+                )
+            }
+        }
+
+        is OpenRouterResult.Failure -> null
+    }
+}
+
+private fun trimRecentMessages(messages: List<ChatMessage>): List<ChatMessage> {
+    val nonSummary = messages.filter { !it.isSummary }
+    if (nonSummary.size <= MAX_RECENT_MESSAGES) return messages
+    val toDrop = nonSummary.take(nonSummary.size - MAX_RECENT_MESSAGES).map { it.id }.toSet()
+    return messages.filterNot { it.id in toDrop }
 }
 
 @Composable
@@ -433,9 +525,75 @@ private fun DesktopChatApp() {
     var input by remember { mutableStateOf("") }
     var isSending by remember { mutableStateOf(false) }
     var messages by remember { mutableStateOf(listOf<ChatMessage>()) }
+    var compressionStats by remember { mutableStateOf(listOf<CompressionStats>()) }
+    var summaryCounter by remember { mutableStateOf(0) }
+    var isCompressionRunning by remember { mutableStateOf(false) }
 
     fun appendMessage(message: ChatMessage) {
         messages = messages + message
+    }
+
+    fun applySummary(toCompress: List<ChatMessage>, result: SummaryResult) {
+        summaryCounter += 1
+        val groupId = summaryCounter
+        val idsToRemove = toCompress.map { it.id }.toSet()
+        val charsBefore = toCompress.sumOf { it.text.length }
+        val charsAfter = result.text.length
+        val reduction = if (charsBefore > 0) {
+            (100 - (charsAfter * 100 / charsBefore)).coerceIn(-999, 999)
+        } else {
+            0
+        }
+        val earliestTimestamp = toCompress.minOfOrNull { it.timestamp } ?: System.currentTimeMillis()
+        val summaryMessage = ChatMessage(
+            id = "summary-$groupId",
+            author = "Summary",
+            role = AuthorRole.SUMMARY,
+            text = result.text,
+            timestamp = earliestTimestamp,
+            metrics = null,
+            isSummary = true,
+            summaryGroupId = groupId
+        )
+        val remainingMessages = messages.filterNot { it.id in idsToRemove }.toMutableList()
+        val insertIndex = remainingMessages.indexOfFirst { it.timestamp > earliestTimestamp }
+        if (insertIndex >= 0) {
+            remainingMessages.add(insertIndex, summaryMessage)
+        } else {
+            remainingMessages.add(summaryMessage)
+        }
+        val trimmed = trimRecentMessages(remainingMessages)
+        messages = trimmed
+        val stats = CompressionStats(
+            summaryGroupId = groupId,
+            messagesCount = toCompress.size,
+            charsBefore = charsBefore,
+            charsAfter = charsAfter,
+            reductionPercent = reduction,
+            summaryPromptTokens = result.promptTokens,
+            summaryCompletionTokens = result.completionTokens
+        )
+        compressionStats = compressionStats + stats
+    }
+
+    fun maybeCompressHistory() {
+        if (!settings.useCompression || isCompressionRunning) return
+        val nonSummaryMessages = messages.filter { !it.isSummary }
+        if (nonSummaryMessages.size < MESSAGES_PER_SUMMARY) return
+        val apiKey = settings.openRouterApiKey.takeIf { it.isNotBlank() } ?: OpenRouterConfig.apiKey
+        if (apiKey.isNullOrBlank()) return
+        val toCompress = nonSummaryMessages.take(MESSAGES_PER_SUMMARY)
+        val model = settings.openRouterModel
+        isCompressionRunning = true
+        scope.launch(Dispatchers.IO) {
+            val result = runCatching { summarizeMessages(toCompress, model, apiKey) }.getOrNull()
+            withContext(Dispatchers.Main) {
+                if (result != null && settings.useCompression) {
+                    applySummary(toCompress, result)
+                }
+                isCompressionRunning = false
+            }
+        }
     }
 
     fun sendMessage() {
@@ -482,6 +640,7 @@ private fun DesktopChatApp() {
             }
             withContext(Dispatchers.Main) {
                 appendMessage(agentMessage)
+                maybeCompressHistory()
                 isSending = false
             }
         }
@@ -535,6 +694,9 @@ private fun DesktopChatApp() {
                             }
                         }
                     }
+                    if (compressionStats.isNotEmpty()) {
+                        CompressionStatsBlock(compressionStats)
+                    }
                     OutlinedTextField(
                         value = input,
                         onValueChange = { input = it },
@@ -566,6 +728,28 @@ private fun DesktopChatApp() {
 }
 
 @Composable
+private fun CompressionStatsBlock(stats: List<CompressionStats>) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(8.dp)
+    ) {
+        Text(
+            text = "Сжатие истории",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.primary
+        )
+        Spacer(modifier = Modifier.height(4.dp))
+        stats.takeLast(3).reversed().forEach { entry ->
+            Text(
+                text = "Сводка #${entry.summaryGroupId}: ${entry.messagesCount} сообщений → ${entry.charsBefore}→${entry.charsAfter} символов (${entry.reductionPercent}% экономии). summary токены: prompt=${entry.summaryPromptTokens ?: "—"}, completion=${entry.summaryCompletionTokens ?: "—"}",
+                style = MaterialTheme.typography.labelSmall
+            )
+        }
+    }
+}
+
+@Composable
 private fun MessageList(messages: List<ChatMessage>) {
     if (messages.isEmpty()) {
         Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
@@ -591,32 +775,59 @@ private fun MessageList(messages: List<ChatMessage>) {
                     text = "${formatTimestamp(message.timestamp)} · ${message.author} (${message.role.displayName()})",
                     style = MaterialTheme.typography.labelSmall
                 )
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.Top,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    Text(
-                        text = message.text,
-                        modifier = Modifier.weight(1f)
-                    )
-                    IconButton(onClick = {
-                        clipboard.setText(AnnotatedString(message.text))
-                        lastCopiedId = message.id
-                    }) {
-                        Icon(imageVector = Icons.Default.ContentCopy, contentDescription = "Скопировать")
+                if (message.isSummary) {
+                    SummaryBubble(message)
+                } else {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.Top,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Text(
+                            text = message.text,
+                            modifier = Modifier.weight(1f)
+                        )
+                        IconButton(onClick = {
+                            clipboard.setText(AnnotatedString(message.text))
+                            lastCopiedId = message.id
+                        }) {
+                            Icon(imageVector = Icons.Default.ContentCopy, contentDescription = "Скопировать")
+                        }
                     }
-                }
-                MetricsLine(message.role, message.metrics)
-                if (lastCopiedId == message.id) {
-                    Text(
-                        text = "Скопировано",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.primary
-                    )
+                    MetricsLine(message.role, message.metrics)
+                    if (lastCopiedId == message.id) {
+                        Text(
+                            text = "Скопировано",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                    }
                 }
                 Divider(modifier = Modifier.padding(top = 8.dp))
             }
+        }
+    }
+}
+
+@Composable
+private fun SummaryBubble(message: ChatMessage) {
+    Surface(
+        color = MaterialTheme.colorScheme.surfaceVariant,
+        tonalElevation = 2.dp,
+        shape = RoundedCornerShape(8.dp),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Column(modifier = Modifier.padding(8.dp)) {
+            Text(
+                text = message.summaryGroupId?.let { "Сводка диалога #$it" } ?: "Сводка диалога",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.primary
+            )
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(
+                text = message.text,
+                style = MaterialTheme.typography.bodySmall
+            )
         }
     }
 }
@@ -723,6 +934,21 @@ private fun SettingsScreen(
                     onCheckedChange = { draft = draft.copy(strictJsonEnabled = it) }
                 )
                 Text("Строгий JSON (response_format)")
+            }
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "Сжатие истории (summary)",
+                    modifier = Modifier.weight(1f)
+                )
+                Switch(
+                    checked = draft.useCompression,
+                    onCheckedChange = { draft = draft.copy(useCompression = it) }
+                )
             }
             Spacer(modifier = Modifier.weight(1f))
             Row(
