@@ -53,11 +53,11 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
-import kotlinx.serialization.json.parseToJsonElement
 import java.net.URI
 import java.net.http.HttpClient
 import java.net.http.HttpRequest
@@ -268,7 +268,7 @@ private fun errorResponse(forceJson: Boolean, message: String): String =
 private fun parseOpenRouterError(statusCode: Int, body: String?): OpenRouterError {
     val safeBody = body ?: ""
     return try {
-        val parsed = openRouterJson.parseToJsonElement(safeBody)
+        val parsed = openRouterJson.decodeFromString<JsonElement>(safeBody)
         val errorObject = parsed.jsonObject["error"]?.jsonObject
         val code = errorObject?.get("code")?.jsonPrimitive?.intOrNull
         val message = errorObject?.get("message")?.jsonPrimitive?.contentOrNull
