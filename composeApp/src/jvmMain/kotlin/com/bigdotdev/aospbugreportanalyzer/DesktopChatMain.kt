@@ -152,7 +152,7 @@ Return ONLY valid JSON (UTF-8) with keys: version, ok, generated_at, items, erro
 
 data class AppSettings(
     val openRouterApiKey: String = System.getenv("OPENROUTER_API_KEY") ?: "",
-    val openRouterModel: String = "openai/gpt-4o-mini",
+    val openRouterModel: String = "meta-llama/llama-4-maverick:free",
     val strictJsonEnabled: Boolean = false
 )
 
