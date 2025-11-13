@@ -276,7 +276,7 @@ private fun parseOpenRouterError(statusCode: Int, body: String?): OpenRouterErro
             httpCode = statusCode,
             errorCode = code,
             message = message,
-            rawBody = safeBody.take(500)
+            rawBody = safeBody.take(500).ifBlank { null }
         )
     } catch (_: Throwable) {
         OpenRouterError(
