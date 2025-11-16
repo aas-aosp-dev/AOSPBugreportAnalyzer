@@ -22,6 +22,7 @@ import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.Card
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Divider
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -794,9 +795,10 @@ private fun DesktopChatApp() {
                             }
                         }
                     }
-                    if (recentMemoryEntries.isNotEmpty()) {
-                        MemoryPreview(entries = recentMemoryEntries)
-                    }
+                    MemoryPreviewCard(
+                        recentEntries = recentMemoryEntries,
+                        modifier = Modifier.fillMaxWidth()
+                    )
                     if (compressionStats.isNotEmpty()) {
                         CompressionStatsBlock(compressionStats)
                     }
@@ -855,25 +857,31 @@ private fun CompressionStatsBlock(stats: List<CompressionStats>) {
 }
 
 @Composable
-private fun MemoryPreview(entries: List<AgentMemoryEntry>) {
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(8.dp),
-        verticalArrangement = Arrangement.spacedBy(8.dp)
+private fun MemoryPreviewCard(
+    recentEntries: List<AgentMemoryEntry>,
+    modifier: Modifier = Modifier
+) {
+    if (recentEntries.isEmpty()) return
+
+    Card(
+        modifier = modifier.padding(8.dp),
+        shape = RoundedCornerShape(12.dp)
     ) {
-        Text(
-            text = "Последние записи внешней памяти",
-            style = MaterialTheme.typography.labelSmall,
-            color = MaterialTheme.colorScheme.primary
-        )
-        entries.asReversed().forEach { entry ->
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(12.dp)
-            ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Text(
+                text = "Последние записи внешней памяти",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.primary
+            )
+            val orderedEntries = recentEntries.asReversed()
+            orderedEntries.forEachIndexed { index, entry ->
                 Column(
-                    modifier = Modifier.padding(12.dp),
+                    modifier = Modifier.fillMaxWidth(),
                     verticalArrangement = Arrangement.spacedBy(4.dp)
                 ) {
                     val label = if (entry.meta?.isSummaryTurn == true) "Сводка" else "Ход"
@@ -903,6 +911,9 @@ private fun MemoryPreview(entries: List<AgentMemoryEntry>) {
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }
+                }
+                if (index < orderedEntries.lastIndex) {
+                    Divider(modifier = Modifier.padding(top = 8.dp))
                 }
             }
         }
