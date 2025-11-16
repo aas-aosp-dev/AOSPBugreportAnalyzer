@@ -10,6 +10,6 @@ actual fun createAgentMemoryStore(json: Json): AgentMemoryStore {
         dir.mkdirs()
     }
     val file = File(dir, "agent_memory.json")
-    println("[AgentMemory] Using file: ${'$'}{file.absolutePath}")
+    println("[AgentMemory] Using file: ${file.absolutePath}")
     return FileAgentMemoryStore(file.absolutePath, json)
 }
