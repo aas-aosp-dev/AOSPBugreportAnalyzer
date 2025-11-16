@@ -42,7 +42,7 @@ class FileAgentMemoryStore(
     override suspend fun append(entry: AgentMemoryEntry) = withContext(Dispatchers.IO) {
         val existing = loadAll()
         val updated = existing + entry
-        val text = json.encodeToString(updated)
+        val text = json.encodeToString<List<AgentMemoryEntry>>(updated)
 
         val file = memoryFile()
         file.parentFile?.mkdirs()
