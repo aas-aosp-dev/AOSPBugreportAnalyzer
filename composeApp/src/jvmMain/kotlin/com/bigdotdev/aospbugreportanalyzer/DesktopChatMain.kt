@@ -572,7 +572,7 @@ private fun DesktopChatApp() {
             isSummaryTurn = isSummaryTurn
         )
         println(
-            "[AgentMemory] rememberTurn: user='${userMessage.take(40)}', assistant='${assistantMessage.take(40)}'"
+            "[AgentMemory] rememberTurn: user='${userMessage.take(60)}', assistant='${assistantMessage.take(60)}', isSummary=$isSummaryTurn"
         )
         return memoryRepository.getAllEntries()
     }
@@ -594,6 +594,7 @@ private fun DesktopChatApp() {
 
     LaunchedEffect(memoryRepository) {
         val entries = runCatching { memoryRepository.getAllEntries() }.getOrElse { emptyList() }
+        println("[AgentMemory] init: loaded ${entries.size} entries from repository")
         refreshMemory(entries)
         if (entries.isNotEmpty() && messages.isEmpty()) {
             messages = entries.flatMap { it.toChatMessages() }
@@ -654,7 +655,12 @@ private fun DesktopChatApp() {
                     tags = listOf("summary"),
                     isSummaryTurn = true
                 )
-            }.getOrNull()
+            }
+                .onFailure {
+                    println("[AgentMemory] persistTurnAndFetch (summary) failed: ${it.message}")
+                    it.printStackTrace()
+                }
+                .getOrNull()
             if (entries != null) {
                 withContext(Dispatchers.Main) {
                     refreshMemory(entries)
@@ -686,6 +692,7 @@ private fun DesktopChatApp() {
     fun sendMessage() {
         val text = input.trim()
         if (text.isEmpty() || isSending) return
+        println("[AgentMemory] sendMessage: userText='${text.take(80)}'")
         val userMessage = ChatMessage(
             author = "USER",
             role = AuthorRole.USER,
@@ -725,6 +732,9 @@ private fun DesktopChatApp() {
                     )
                 }
             }
+            println(
+                "[AgentMemory] before persistTurnAndFetch: result=${result::class.simpleName}, agentText='${agentMessage.text.take(80)}'"
+            )
             withContext(Dispatchers.Main) {
                 appendMessage(agentMessage)
                 maybeCompressHistory()
@@ -738,7 +748,12 @@ private fun DesktopChatApp() {
                     tags = listOf("chat"),
                     isSummaryTurn = false
                 )
-            }.getOrNull()
+            }
+                .onFailure {
+                    println("[AgentMemory] persistTurnAndFetch failed: ${it.message}")
+                    it.printStackTrace()
+                }
+                .getOrNull()
             if (updatedEntries != null) {
                 withContext(Dispatchers.Main) {
                     refreshMemory(updatedEntries)
