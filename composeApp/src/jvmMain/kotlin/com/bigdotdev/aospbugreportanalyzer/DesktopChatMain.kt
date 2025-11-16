@@ -199,7 +199,7 @@ private val SUMMARY_SYSTEM_PROMPT = """
 
 data class AppSettings(
     val openRouterApiKey: String = System.getenv("OPENROUTER_API_KEY") ?: "",
-    val openRouterModel: String = "meta-llama/llama-4-maverick:free",
+    val openRouterModel: String = "tngtech/deepseek-r1t2-chimera:free",
     val strictJsonEnabled: Boolean = false,
     val useCompression: Boolean = false
 )
@@ -815,10 +815,6 @@ private fun DesktopChatApp() {
                             }
                         }
                     }
-                    MemoryPreviewCard(
-                        recentEntries = recentMemoryEntries,
-                        modifier = Modifier.fillMaxWidth()
-                    )
                     if (compressionStats.isNotEmpty()) {
                         CompressionStatsBlock(compressionStats)
                     }
@@ -876,6 +872,7 @@ private fun CompressionStatsBlock(stats: List<CompressionStats>) {
     }
 }
 
+@Suppress("unused")
 @Composable
 private fun MemoryPreviewCard(
     recentEntries: List<AgentMemoryEntry>,
