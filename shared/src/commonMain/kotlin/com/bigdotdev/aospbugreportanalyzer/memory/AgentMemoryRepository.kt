@@ -1,6 +1,5 @@
 package com.bigdotdev.aospbugreportanalyzer.memory
 
-import kotlinx.datetime.Clock
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlin.random.Random
@@ -24,7 +23,7 @@ class AgentMemoryRepository(
     ) {
         val entry = AgentMemoryEntry(
             id = generateId(),
-            createdAt = Clock.System.now().toString(),
+            createdAt = "",
             conversationId = conversationId,
             userMessage = userMessage,
             assistantMessage = assistantMessage,
