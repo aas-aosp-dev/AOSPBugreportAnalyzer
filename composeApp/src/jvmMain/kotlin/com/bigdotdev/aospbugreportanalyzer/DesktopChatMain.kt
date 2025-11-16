@@ -815,10 +815,6 @@ private fun DesktopChatApp() {
                             }
                         }
                     }
-                    MemoryPreviewCard(
-                        recentEntries = recentMemoryEntries,
-                        modifier = Modifier.fillMaxWidth()
-                    )
                     if (compressionStats.isNotEmpty()) {
                         CompressionStatsBlock(compressionStats)
                     }
@@ -876,6 +872,7 @@ private fun CompressionStatsBlock(stats: List<CompressionStats>) {
     }
 }
 
+@Suppress("unused")
 @Composable
 private fun MemoryPreviewCard(
     recentEntries: List<AgentMemoryEntry>,
