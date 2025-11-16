@@ -21,6 +21,8 @@ import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.Card
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Divider
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -71,6 +73,11 @@ import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.util.Locale
 import java.util.UUID
+import com.bigdotdev.aospbugreportanalyzer.memory.AgentMemoryEntry
+import com.bigdotdev.aospbugreportanalyzer.memory.AgentMemoryRepository
+import com.bigdotdev.aospbugreportanalyzer.memory.MessageStats
+import com.bigdotdev.aospbugreportanalyzer.memory.MemoryMeta
+import com.bigdotdev.aospbugreportanalyzer.memory.createAgentMemoryStore
 
 private enum class Screen { MAIN, SETTINGS }
 
@@ -150,6 +157,15 @@ private sealed class OpenRouterResult {
 private fun CallStats.toMsgMetrics(): MsgMetrics =
     MsgMetrics(promptTokens, completionTokens, totalTokens, elapsedMs, costUsd, error = null)
 
+private fun CallStats.toMessageStats(): MessageStats =
+    MessageStats(
+        promptTokens = promptTokens,
+        completionTokens = completionTokens,
+        totalTokens = totalTokens,
+        costUsd = costUsd,
+        durationMs = elapsedMs
+    )
+
 private object OpenRouterConfig {
     const val BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
     val apiKey: String? get() = System.getenv("OPENROUTER_API_KEY")
@@ -183,7 +199,7 @@ private val SUMMARY_SYSTEM_PROMPT = """
 
 data class AppSettings(
     val openRouterApiKey: String = System.getenv("OPENROUTER_API_KEY") ?: "",
-    val openRouterModel: String = "meta-llama/llama-4-maverick:free",
+    val openRouterModel: String = "tngtech/deepseek-r1t2-chimera:free",
     val strictJsonEnabled: Boolean = false,
     val useCompression: Boolean = false
 )
@@ -520,6 +536,15 @@ private fun trimRecentMessages(messages: List<ChatMessage>): List<ChatMessage> {
 @Composable
 private fun DesktopChatApp() {
     val scope = rememberCoroutineScope()
+    val memoryJson = remember {
+        Json {
+            prettyPrint = true
+            ignoreUnknownKeys = true
+        }
+    }
+    val memoryRepository = remember {
+        AgentMemoryRepository(createAgentMemoryStore(memoryJson))
+    }
     var settings by remember { mutableStateOf(AppSettings()) }
     var screen by remember { mutableStateOf(Screen.MAIN) }
     var input by remember { mutableStateOf("") }
@@ -528,6 +553,53 @@ private fun DesktopChatApp() {
     var compressionStats by remember { mutableStateOf(listOf<CompressionStats>()) }
     var summaryCounter by remember { mutableStateOf(0) }
     var isCompressionRunning by remember { mutableStateOf(false) }
+    var memoryCount by remember { mutableStateOf(0) }
+    var recentMemoryEntries by remember { mutableStateOf<List<AgentMemoryEntry>>(emptyList()) }
+
+    suspend fun persistTurnAndFetch(
+        userMessage: String,
+        assistantMessage: String,
+        stats: MessageStats?,
+        tags: List<String>,
+        isSummaryTurn: Boolean
+    ): List<AgentMemoryEntry> {
+        memoryRepository.rememberTurn(
+            conversationId = "default",
+            userMessage = userMessage,
+            assistantMessage = assistantMessage,
+            stats = stats,
+            tags = tags,
+            isSummaryTurn = isSummaryTurn
+        )
+        println(
+            "[AgentMemory] rememberTurn: user='${userMessage.take(60)}', assistant='${assistantMessage.take(60)}', isSummary=$isSummaryTurn"
+        )
+        return memoryRepository.getAllEntries()
+    }
+
+    fun refreshMemory(entries: List<AgentMemoryEntry>) {
+        memoryCount = entries.size
+        recentMemoryEntries = entries.takeLast(5)
+    }
+
+    fun clearExternalMemory() {
+        scope.launch(Dispatchers.IO) {
+            runCatching { memoryRepository.clearAll() }
+            withContext(Dispatchers.Main) {
+                memoryCount = 0
+                recentMemoryEntries = emptyList()
+            }
+        }
+    }
+
+    LaunchedEffect(memoryRepository) {
+        val entries = runCatching { memoryRepository.getAllEntries() }.getOrElse { emptyList() }
+        println("[AgentMemory] init: loaded ${entries.size} entries from repository")
+        refreshMemory(entries)
+        if (entries.isNotEmpty() && messages.isEmpty()) {
+            messages = entries.flatMap { it.toChatMessages() }
+        }
+    }
 
     fun appendMessage(message: ChatMessage) {
         messages = messages + message
@@ -574,6 +646,27 @@ private fun DesktopChatApp() {
             summaryCompletionTokens = result.completionTokens
         )
         compressionStats = compressionStats + stats
+        scope.launch(Dispatchers.IO) {
+            val entries = runCatching {
+                persistTurnAndFetch(
+                    userMessage = "[SUMMARY REQUEST]",
+                    assistantMessage = result.text,
+                    stats = result.toMessageStats(),
+                    tags = listOf("summary"),
+                    isSummaryTurn = true
+                )
+            }
+                .onFailure {
+                    println("[AgentMemory] persistTurnAndFetch (summary) failed: ${it.message}")
+                    it.printStackTrace()
+                }
+                .getOrNull()
+            if (entries != null) {
+                withContext(Dispatchers.Main) {
+                    refreshMemory(entries)
+                }
+            }
+        }
     }
 
     fun maybeCompressHistory() {
@@ -599,6 +692,7 @@ private fun DesktopChatApp() {
     fun sendMessage() {
         val text = input.trim()
         if (text.isEmpty() || isSending) return
+        println("[AgentMemory] sendMessage: userText='${text.take(80)}'")
         val userMessage = ChatMessage(
             author = "USER",
             role = AuthorRole.USER,
@@ -638,10 +732,32 @@ private fun DesktopChatApp() {
                     )
                 }
             }
+            println(
+                "[AgentMemory] before persistTurnAndFetch: result=${result::class.simpleName}, agentText='${agentMessage.text.take(80)}'"
+            )
             withContext(Dispatchers.Main) {
                 appendMessage(agentMessage)
                 maybeCompressHistory()
                 isSending = false
+            }
+            val updatedEntries = runCatching {
+                persistTurnAndFetch(
+                    userMessage = text,
+                    assistantMessage = agentMessage.text,
+                    stats = (result as? OpenRouterResult.Success)?.stats?.toMessageStats(),
+                    tags = listOf("chat"),
+                    isSummaryTurn = false
+                )
+            }
+                .onFailure {
+                    println("[AgentMemory] persistTurnAndFetch failed: ${it.message}")
+                    it.printStackTrace()
+                }
+                .getOrNull()
+            if (updatedEntries != null) {
+                withContext(Dispatchers.Main) {
+                    refreshMemory(updatedEntries)
+                }
             }
         }
     }
@@ -666,6 +782,11 @@ private fun DesktopChatApp() {
                             TopAppBar(
                                 title = { Text("AOSP Bugreport Analyzer — Чат") },
                                 actions = {
+                                    Text(
+                                        text = "Память: $memoryCount",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        modifier = Modifier.padding(end = 12.dp)
+                                    )
                                     TextButton(onClick = { screen = Screen.SETTINGS }) { Text("Настройки") }
                                 }
                             )
@@ -721,7 +842,9 @@ private fun DesktopChatApp() {
             SettingsScreen(
                 settings = settings,
                 onChange = { settings = it },
-                onClose = { screen = Screen.MAIN }
+                onClose = { screen = Screen.MAIN },
+                memoryCount = memoryCount,
+                onClearMemory = { clearExternalMemory() }
             )
         }
     }
@@ -745,6 +868,71 @@ private fun CompressionStatsBlock(stats: List<CompressionStats>) {
                 text = "Сводка #${entry.summaryGroupId}: ${entry.messagesCount} сообщений → ${entry.charsBefore}→${entry.charsAfter} символов (${entry.reductionPercent}% экономии). summary токены: prompt=${entry.summaryPromptTokens ?: "—"}, completion=${entry.summaryCompletionTokens ?: "—"}",
                 style = MaterialTheme.typography.labelSmall
             )
+        }
+    }
+}
+
+@Suppress("unused")
+@Composable
+private fun MemoryPreviewCard(
+    recentEntries: List<AgentMemoryEntry>,
+    modifier: Modifier = Modifier
+) {
+    if (recentEntries.isEmpty()) return
+
+    Card(
+        modifier = modifier.padding(8.dp),
+        shape = RoundedCornerShape(12.dp)
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Text(
+                text = "Последние записи внешней памяти",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.primary
+            )
+            val orderedEntries = recentEntries.asReversed()
+            orderedEntries.forEachIndexed { index, entry ->
+                Column(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    val label = if (entry.meta?.isSummaryTurn == true) "Сводка" else "Ход"
+                    Text(
+                        text = "${formatTimestamp(parseEntryTimestamp(entry.createdAt))} • $label",
+                        style = MaterialTheme.typography.labelSmall
+                    )
+                    if (entry.meta?.isSummaryTurn == true) {
+                        Text(
+                            text = entry.assistantMessage,
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    } else {
+                        Text(
+                            text = "П: ${entry.userMessage}",
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                        Text(
+                            text = "А: ${entry.assistantMessage}",
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                    if (entry.tags.isNotEmpty()) {
+                        Text(
+                            text = "Теги: ${entry.tags.joinToString()}",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+                if (index < orderedEntries.lastIndex) {
+                    Divider(modifier = Modifier.padding(top = 8.dp))
+                }
+            }
         }
     }
 }
@@ -887,7 +1075,9 @@ fun main() = application {
 private fun SettingsScreen(
     settings: AppSettings,
     onChange: (AppSettings) -> Unit,
-    onClose: () -> Unit
+    onClose: () -> Unit,
+    memoryCount: Int,
+    onClearMemory: () -> Unit
 ) {
     var draft by remember(settings) { mutableStateOf(settings) }
     var showApiKey by remember { mutableStateOf(false) }
@@ -951,6 +1141,21 @@ private fun SettingsScreen(
                 )
             }
             Spacer(modifier = Modifier.weight(1f))
+            Divider()
+            Text(
+                text = "Во внешней памяти: $memoryCount ходов",
+                style = MaterialTheme.typography.bodyMedium
+            )
+            Button(
+                onClick = onClearMemory,
+                modifier = Modifier.fillMaxWidth(),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = MaterialTheme.colorScheme.error,
+                    contentColor = MaterialTheme.colorScheme.onError
+                )
+            ) {
+                Text("Очистить внешнюю память")
+            }
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(12.dp, Alignment.End),
@@ -969,3 +1174,69 @@ private fun SettingsScreen(
         }
     }
 }
+
+private fun AgentMemoryEntry.toChatMessages(): List<ChatMessage> {
+    val timestamp = parseEntryTimestamp(createdAt)
+    if (meta?.isSummaryTurn == true) {
+        return listOf(
+            ChatMessage(
+                id = "memory-summary-$id",
+                author = "Summary",
+                role = AuthorRole.SUMMARY,
+                text = assistantMessage,
+                timestamp = timestamp,
+                metrics = null,
+                isSummary = true,
+                summaryGroupId = null
+            )
+        )
+    }
+    val entries = mutableListOf<ChatMessage>()
+    if (userMessage.isNotBlank()) {
+        entries += ChatMessage(
+            id = "memory-user-$id",
+            author = "USER",
+            role = AuthorRole.USER,
+            text = userMessage,
+            timestamp = timestamp,
+            metrics = MsgMetrics(null, null, null, null, null, error = null)
+        )
+    }
+    if (assistantMessage.isNotBlank()) {
+        entries += ChatMessage(
+            id = "memory-agent-$id",
+            author = "Agent",
+            role = AuthorRole.AGENT,
+            text = assistantMessage,
+            timestamp = timestamp + 1,
+            metrics = meta.toMsgMetrics()
+        )
+    }
+    return entries
+}
+
+private fun MemoryMeta?.toMsgMetrics(): MsgMetrics? {
+    val meta = this ?: return null
+    return MsgMetrics(
+        promptTokens = meta.promptTokens,
+        completionTokens = meta.completionTokens,
+        totalTokens = meta.totalTokens,
+        elapsedMs = meta.durationMs,
+        costUsd = meta.costUsd,
+        error = null
+    )
+}
+
+private fun SummaryResult.toMessageStats(): MessageStats =
+    MessageStats(
+        promptTokens = promptTokens,
+        completionTokens = completionTokens,
+        totalTokens = if (promptTokens != null && completionTokens != null) {
+            promptTokens + completionTokens
+        } else {
+            null
+        }
+    )
+
+private fun parseEntryTimestamp(value: String): Long =
+    runCatching { Instant.parse(value).toEpochMilli() }.getOrElse { System.currentTimeMillis() }
