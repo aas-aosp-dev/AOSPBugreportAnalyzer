@@ -13,20 +13,24 @@ class FileAgentMemoryStore(
 ) : AgentMemoryStore {
 
     override suspend fun loadAll(): List<AgentMemoryEntry> = withContext(Dispatchers.IO) {
-        val file = File(filePath)
+        val file = memoryFile()
         if (!file.exists()) {
+            println("[AgentMemory] loadAll: file does not exist")
             return@withContext emptyList()
         }
 
         val text = file.readText()
         if (text.isBlank()) {
+            println("[AgentMemory] loadAll: file is blank")
             return@withContext emptyList()
         }
 
         return@withContext try {
-            json.decodeFromString(text)
+            val entries = json.decodeFromString<List<AgentMemoryEntry>>(text)
+            println("[AgentMemory] loadAll: loaded ${'$'}{entries.size} entries")
+            entries
         } catch (e: Exception) {
-            println("Failed to read agent memory: ${'$'}{e.message}")
+            println("[AgentMemory] loadAll: failed to parse file: ${'$'}{e.message}")
             emptyList()
         }
     }
@@ -34,31 +38,21 @@ class FileAgentMemoryStore(
     override suspend fun append(entry: AgentMemoryEntry) = withContext(Dispatchers.IO) {
         val existing = loadAll()
         val updated = existing + entry
-        val jsonText = json.encodeToString(updated)
+        val text = json.encodeToString(updated)
 
-        val file = File(filePath)
+        val file = memoryFile()
         file.parentFile?.mkdirs()
-        file.writeText(jsonText)
+        file.writeText(text)
+        println("[AgentMemory] append: now ${'$'}{updated.size} entries in ${'$'}{file.absolutePath}")
     }
 
     override suspend fun clear() = withContext(Dispatchers.IO) {
-        val file = File(filePath)
+        val file = memoryFile()
         if (file.exists()) {
             file.delete()
+            println("[AgentMemory] clear: removed ${'$'}{file.absolutePath}")
         }
     }
-}
 
-private fun defaultMemoryFilePath(): String {
-    val userHome = System.getProperty("user.home") ?: "."
-    val dir = File(userHome, ".aosp_bugreport_analyzer")
-    dir.mkdirs()
-    return File(dir, "agent_memory.json").absolutePath
-}
-
-actual fun createAgentMemoryStore(json: Json): AgentMemoryStore {
-    return FileAgentMemoryStore(
-        filePath = defaultMemoryFilePath(),
-        json = json
-    )
+    private fun memoryFile(): File = File(filePath)
 }

@@ -571,6 +571,9 @@ private fun DesktopChatApp() {
             tags = tags,
             isSummaryTurn = isSummaryTurn
         )
+        println(
+            "[AgentMemory] rememberTurn: user='${userMessage.take(40)}', assistant='${assistantMessage.take(40)}'"
+        )
         return memoryRepository.getAllEntries()
     }
 
@@ -722,6 +725,11 @@ private fun DesktopChatApp() {
                     )
                 }
             }
+            withContext(Dispatchers.Main) {
+                appendMessage(agentMessage)
+                maybeCompressHistory()
+                isSending = false
+            }
             val updatedEntries = runCatching {
                 persistTurnAndFetch(
                     userMessage = text,
@@ -731,11 +739,8 @@ private fun DesktopChatApp() {
                     isSummaryTurn = false
                 )
             }.getOrNull()
-            withContext(Dispatchers.Main) {
-                appendMessage(agentMessage)
-                maybeCompressHistory()
-                isSending = false
-                if (updatedEntries != null) {
+            if (updatedEntries != null) {
+                withContext(Dispatchers.Main) {
                     refreshMemory(updatedEntries)
                 }
             }
