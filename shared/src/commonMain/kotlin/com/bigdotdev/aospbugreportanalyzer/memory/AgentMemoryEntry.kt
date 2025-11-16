@@ -1,5 +1,8 @@
 package com.bigdotdev.aospbugreportanalyzer.memory
 
+import kotlinx.serialization.Serializable
+
+@Serializable
 data class AgentMemoryEntry(
     val id: String,
     val createdAt: String,
@@ -10,6 +13,7 @@ data class AgentMemoryEntry(
     val meta: MemoryMeta? = null
 )
 
+@Serializable
 data class MemoryMeta(
     val promptTokens: Int? = null,
     val completionTokens: Int? = null,
