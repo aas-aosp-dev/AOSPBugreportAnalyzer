@@ -4,7 +4,6 @@ import java.io.File
 import kotlin.collections.buildMap
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
@@ -16,7 +15,8 @@ import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.doubleOrNull
 import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.longOrNull
-import kotlinx.serialization.json.parseToJsonElement
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.JsonElementSerializer
 
 class FileAgentMemoryStore(
     private val filePath: String,
@@ -35,7 +35,7 @@ class FileAgentMemoryStore(
         }
 
         return@withContext try {
-            val element = json.parseToJsonElement(text)
+            val element = json.decodeFromString(JsonElementSerializer, text)
             if (element !is JsonArray) {
                 emptyList()
             } else {
