@@ -3,6 +3,8 @@ package com.bigdotdev.aospbugreportanalyzer.mcp
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.decodeFromString
+import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
@@ -51,7 +53,6 @@ class McpConnection private constructor(
         }
 
         val payload = json.encodeToString(
-            JsonRpcRequest.serializer(),
             JsonRpcRequest(id = nextId, method = method, params = params)
         )
 
@@ -62,7 +63,7 @@ class McpConnection private constructor(
         val line = input.readLine()
             ?: throw IllegalStateException("MCP server process terminated unexpectedly")
 
-        return json.decodeFromString(JsonRpcResponse.serializer(), line)
+        return json.decodeFromString(line)
     }
 
     fun destroy() {

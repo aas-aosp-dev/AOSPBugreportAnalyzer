@@ -79,7 +79,7 @@ fun main() = runBlocking {
         handlePotentialError("github.get_pr_diff", diffResponse)
 
         println("Diff result:")
-        println(json.encodeToString(JsonElement.serializer(), diffResponse.result ?: JsonNull))
+        println(json.encodeToString(diffResponse.result ?: JsonNull))
     } finally {
         connection.destroy()
     }
