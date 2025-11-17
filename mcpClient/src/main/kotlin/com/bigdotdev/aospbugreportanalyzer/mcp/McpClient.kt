@@ -2,6 +2,7 @@ package com.bigdotdev.aospbugreportanalyzer.mcp
 
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.serialization.SerializationException
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
@@ -35,10 +36,15 @@ class McpConnection private constructor(
     companion object {
         fun start(config: McpServerConfig, json: Json): McpConnection {
             require(config.command.isNotEmpty()) { "MCP server command must not be empty" }
-            println("Starting MCP server process: ${config.command.joinToString(" ")}")
+            val command = config.command.first()
+            val args = config.command.drop(1)
+            val argsSuffix = if (args.isEmpty()) "" else " ${args.joinToString(" ")}" 
+            println("🔧 [MCP-CLIENT] Starting MCP server process: $command$argsSuffix")
             val process = ProcessBuilder(config.command)
                 .redirectError(ProcessBuilder.Redirect.INHERIT)
                 .start()
+
+            println("🔧 [MCP-CLIENT] MCP server PID: ${process.pid()}")
 
             val input = process.inputStream.bufferedReader()
             val output = process.outputStream.bufferedWriter()
@@ -47,7 +53,7 @@ class McpConnection private constructor(
         }
     }
 
-    suspend fun initialize() {
+    suspend fun initialize(): JsonRpcResponse {
         val params = buildJsonObject {
             put("protocolVersion", JsonPrimitive("2024-11-05"))
             putJsonObject("clientInfo") {
@@ -56,12 +62,7 @@ class McpConnection private constructor(
             }
         }
 
-        println("Sending MCP initialize...")
-        val response = sendRequest("initialize", params)
-        if (response.error != null) {
-            throw IllegalStateException("MCP initialize failed: ${response.error}")
-        }
-        println("MCP initialize OK")
+        return sendRequest("initialize", params)
     }
 
     suspend fun sendRequest(
@@ -72,22 +73,34 @@ class McpConnection private constructor(
             ++lastId
         }
 
-        val payload = json.encodeToString(
-            JsonRpcRequest(id = nextId, method = method, params = params)
-        )
+        val request = JsonRpcRequest(id = nextId, method = method, params = params)
+        val payload = json.encodeToString(request)
 
-        println(">>> JSON-RPC request: $payload")
+        println(">>> [MCP-CLIENT] JSON-RPC request: $payload")
 
         output.write(payload)
         output.newLine()
         output.flush()
 
         val line = input.readLine()
-            ?: throw IllegalStateException("MCP server process terminated unexpectedly")
+        if (line == null) {
+            System.err.println("❌ [MCP-CLIENT] No response from MCP server (EOF reached)")
+            if (!process.isAlive) {
+                System.err.println("❌ [MCP-CLIENT] MCP server process terminated with exitCode=${process.exitValue()}")
+            }
+            throw IllegalStateException("MCP server process terminated unexpectedly")
+        }
 
-        println("<<< JSON-RPC response: $line")
+        println("<<< [MCP-CLIENT] Raw JSON-RPC response: $line")
 
-        return json.decodeFromString(line)
+        return try {
+            val response = json.decodeFromString<JsonRpcResponse>(line)
+            println("✅ [MCP-CLIENT] Decoded JSON-RPC response for id=$nextId: $response")
+            response
+        } catch (e: SerializationException) {
+            System.err.println("❌ [MCP-CLIENT] Failed to decode response: ${e.message}")
+            throw e
+        }
     }
 
     fun close() {
