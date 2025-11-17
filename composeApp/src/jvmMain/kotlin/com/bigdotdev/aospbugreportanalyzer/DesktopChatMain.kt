@@ -81,11 +81,11 @@ import com.bigdotdev.aospbugreportanalyzer.memory.createAgentMemoryStore
 
 private enum class Screen { MAIN, SETTINGS }
 
-private enum class AuthorRole { USER, AGENT, SUMMARY }
+private enum class AuthorRole { USER, EXPERT, SUMMARY }
 
 private fun AuthorRole.displayName(): String = when (this) {
     AuthorRole.USER -> "Пользователь"
-    AuthorRole.AGENT -> "Эксперт"
+    AuthorRole.EXPERT -> "Эксперт"
     AuthorRole.SUMMARY -> "Сводка"
 }
 
@@ -469,7 +469,7 @@ private fun buildChatRequestMessages(
     history.forEach { message ->
         val role = when (message.role) {
             AuthorRole.USER -> "user"
-            AuthorRole.AGENT -> "assistant"
+            AuthorRole.EXPERT -> "assistant"
             AuthorRole.SUMMARY -> "system"
         }
         messages += ORMessage(role, message.text)
@@ -484,7 +484,7 @@ private fun buildSummaryRequestMessages(messages: List<ChatMessage>): List<ORMes
         messages.forEach { msg ->
             val roleLabel = when (msg.role) {
                 AuthorRole.USER -> "Пользователь"
-                AuthorRole.AGENT -> "Эксперт"
+                AuthorRole.EXPERT -> "Эксперт"
                 AuthorRole.SUMMARY -> "Система"
             }
             appendLine("$roleLabel: ${msg.text}")
@@ -718,7 +718,7 @@ private fun DesktopChatApp() {
             val agentMessage = when (result) {
                 is OpenRouterResult.Success -> ChatMessage(
                     author = "Эксперт",
-                    role = AuthorRole.AGENT,
+                    role = AuthorRole.EXPERT,
                     text = result.content,
                     metrics = result.stats.toMsgMetrics()
                 )
@@ -726,7 +726,7 @@ private fun DesktopChatApp() {
                     val errorMessage = result.error.toUserMessage()
                     ChatMessage(
                         author = "Эксперт",
-                        role = AuthorRole.AGENT,
+                        role = AuthorRole.EXPERT,
                         text = errorResponse(strictJson, errorMessage),
                         metrics = MsgMetrics(null, null, null, null, null, error = errorMessage)
                     )
@@ -767,7 +767,7 @@ private fun DesktopChatApp() {
             appendMessage(
                 ChatMessage(
                     author = "Эксперт",
-                    role = AuthorRole.AGENT,
+                    role = AuthorRole.EXPERT,
                     text = "Укажите OPENROUTER_API_KEY, чтобы Эксперт мог отвечать.",
                     metrics = MsgMetrics(null, null, null, null, null, error = null)
                 )
@@ -868,71 +868,6 @@ private fun CompressionStatsBlock(stats: List<CompressionStats>) {
                 text = "Сводка #${entry.summaryGroupId}: ${entry.messagesCount} сообщений → ${entry.charsBefore}→${entry.charsAfter} символов (${entry.reductionPercent}% экономии). summary токены: prompt=${entry.summaryPromptTokens ?: "—"}, completion=${entry.summaryCompletionTokens ?: "—"}",
                 style = MaterialTheme.typography.labelSmall
             )
-        }
-    }
-}
-
-@Suppress("unused")
-@Composable
-private fun MemoryPreviewCard(
-    recentEntries: List<AgentMemoryEntry>,
-    modifier: Modifier = Modifier
-) {
-    if (recentEntries.isEmpty()) return
-
-    Card(
-        modifier = modifier.padding(8.dp),
-        shape = RoundedCornerShape(12.dp)
-    ) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp)
-        ) {
-            Text(
-                text = "Последние записи внешней памяти",
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.primary
-            )
-            val orderedEntries = recentEntries.asReversed()
-            orderedEntries.forEachIndexed { index, entry ->
-                Column(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalArrangement = Arrangement.spacedBy(4.dp)
-                ) {
-                    val label = if (entry.meta?.isSummaryTurn == true) "Сводка" else "Ход"
-                    Text(
-                        text = "${formatTimestamp(parseEntryTimestamp(entry.createdAt))} • $label",
-                        style = MaterialTheme.typography.labelSmall
-                    )
-                    if (entry.meta?.isSummaryTurn == true) {
-                        Text(
-                            text = entry.assistantMessage,
-                            style = MaterialTheme.typography.bodySmall
-                        )
-                    } else {
-                        Text(
-                            text = "П: ${entry.userMessage}",
-                            style = MaterialTheme.typography.bodySmall
-                        )
-                        Text(
-                            text = "Эксперт: ${entry.assistantMessage}",
-                            style = MaterialTheme.typography.bodySmall
-                        )
-                    }
-                    if (entry.tags.isNotEmpty()) {
-                        Text(
-                            text = "Теги: ${entry.tags.joinToString()}",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
-                }
-                if (index < orderedEntries.lastIndex) {
-                    Divider(modifier = Modifier.padding(top = 8.dp))
-                }
-            }
         }
     }
 }
@@ -1204,9 +1139,9 @@ private fun AgentMemoryEntry.toChatMessages(): List<ChatMessage> {
     }
     if (assistantMessage.isNotBlank()) {
         entries += ChatMessage(
-            id = "memory-agent-$id",
+            id = "memory-expert-$id",
             author = "Эксперт",
-            role = AuthorRole.AGENT,
+            role = AuthorRole.EXPERT,
             text = assistantMessage,
             timestamp = timestamp + 1,
             metrics = meta.toMsgMetrics()
