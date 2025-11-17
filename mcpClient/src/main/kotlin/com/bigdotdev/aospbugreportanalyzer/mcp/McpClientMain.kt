@@ -19,6 +19,7 @@ fun main() = runBlocking {
     val json = Json {
         ignoreUnknownKeys = true
         prettyPrint = true
+        encodeDefaults = true
     }
 
     val config = McpServerConfig(
