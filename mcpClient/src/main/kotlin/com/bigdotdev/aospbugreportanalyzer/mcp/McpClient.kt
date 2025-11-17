@@ -10,6 +10,8 @@ import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
+import kotlinx.serialization.json.putJsonObject
 import java.io.BufferedReader
 import java.io.BufferedWriter
 
@@ -33,6 +35,7 @@ class McpConnection private constructor(
     companion object {
         fun start(config: McpServerConfig, json: Json): McpConnection {
             require(config.command.isNotEmpty()) { "MCP server command must not be empty" }
+            println("Starting MCP server process: ${config.command.joinToString(" ")}")
             val process = ProcessBuilder(config.command)
                 .redirectError(ProcessBuilder.Redirect.INHERIT)
                 .start()
@@ -42,6 +45,23 @@ class McpConnection private constructor(
 
             return McpConnection(process, input, output, json)
         }
+    }
+
+    suspend fun initialize() {
+        val params = buildJsonObject {
+            put("protocolVersion", JsonPrimitive("2024-11-05"))
+            putJsonObject("clientInfo") {
+                put("name", JsonPrimitive("AOSPBugreportAnalyzer-mcpClient"))
+                put("version", JsonPrimitive("0.1.0"))
+            }
+        }
+
+        println("Sending MCP initialize...")
+        val response = sendRequest("initialize", params)
+        if (response.error != null) {
+            throw IllegalStateException("MCP initialize failed: ${response.error}")
+        }
+        println("MCP initialize OK")
     }
 
     suspend fun sendRequest(
@@ -56,6 +76,8 @@ class McpConnection private constructor(
             JsonRpcRequest(id = nextId, method = method, params = params)
         )
 
+        println(">>> JSON-RPC request: $payload")
+
         output.write(payload)
         output.newLine()
         output.flush()
@@ -63,10 +85,12 @@ class McpConnection private constructor(
         val line = input.readLine()
             ?: throw IllegalStateException("MCP server process terminated unexpectedly")
 
+        println("<<< JSON-RPC response: $line")
+
         return json.decodeFromString(line)
     }
 
-    fun destroy() {
+    fun close() {
         try {
             output.close()
         } catch (_: Exception) {

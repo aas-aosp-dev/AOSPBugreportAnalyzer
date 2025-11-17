@@ -31,6 +31,8 @@ fun main() = runBlocking {
 
     val connection = McpConnection.start(config, json)
     try {
+        connection.initialize()
+
         println("Requesting tools.list via MCP...")
         val toolsResponse = connection.sendRequest(
             method = "tools/list",
@@ -81,7 +83,7 @@ fun main() = runBlocking {
         println("Diff result:")
         println(json.encodeToString(diffResponse.result ?: JsonNull))
     } finally {
-        connection.destroy()
+        connection.close()
     }
 }
 
