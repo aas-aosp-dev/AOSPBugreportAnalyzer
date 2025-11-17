@@ -85,7 +85,7 @@ private enum class AuthorRole { USER, AGENT, SUMMARY }
 
 private fun AuthorRole.displayName(): String = when (this) {
     AuthorRole.USER -> "Пользователь"
-    AuthorRole.AGENT -> "Агент"
+    AuthorRole.AGENT -> "Эксперт"
     AuthorRole.SUMMARY -> "Сводка"
 }
 
@@ -183,11 +183,11 @@ private data class ORRequest(
 )
 
 private val SYSTEM_TEXT = """
-You are a concise teammate. Keep answers short, actionable, and plain text without extra formatting.
+You are an AOSP bugreport Expert. Keep answers short, actionable, and plain text without extra formatting.
 """.trimIndent()
 
 private val SYSTEM_JSON = """
-You are a concise teammate. Keep answers short and actionable.
+You are an AOSP bugreport Expert. Keep answers short and actionable.
 Return ONLY valid JSON (UTF-8) with keys: version, ok, generated_at, items, error.
 """.trimIndent()
 
@@ -717,7 +717,7 @@ private fun DesktopChatApp() {
             )
             val agentMessage = when (result) {
                 is OpenRouterResult.Success -> ChatMessage(
-                    author = "Agent",
+                    author = "Эксперт",
                     role = AuthorRole.AGENT,
                     text = result.content,
                     metrics = result.stats.toMsgMetrics()
@@ -725,7 +725,7 @@ private fun DesktopChatApp() {
                 is OpenRouterResult.Failure -> {
                     val errorMessage = result.error.toUserMessage()
                     ChatMessage(
-                        author = "Agent",
+                        author = "Эксперт",
                         role = AuthorRole.AGENT,
                         text = errorResponse(strictJson, errorMessage),
                         metrics = MsgMetrics(null, null, null, null, null, error = errorMessage)
@@ -766,9 +766,9 @@ private fun DesktopChatApp() {
         if ((settings.openRouterApiKey.takeIf { it.isNotBlank() } ?: OpenRouterConfig.apiKey).isNullOrBlank()) {
             appendMessage(
                 ChatMessage(
-                    author = "Agent",
+                    author = "Эксперт",
                     role = AuthorRole.AGENT,
-                    text = "Укажите OPENROUTER_API_KEY, чтобы агент мог отвечать.",
+                    text = "Укажите OPENROUTER_API_KEY, чтобы Эксперт мог отвечать.",
                     metrics = MsgMetrics(null, null, null, null, null, error = null)
                 )
             )
@@ -917,7 +917,7 @@ private fun MemoryPreviewCard(
                             style = MaterialTheme.typography.bodySmall
                         )
                         Text(
-                            text = "А: ${entry.assistantMessage}",
+                            text = "Эксперт: ${entry.assistantMessage}",
                             style = MaterialTheme.typography.bodySmall
                         )
                     }
@@ -1205,7 +1205,7 @@ private fun AgentMemoryEntry.toChatMessages(): List<ChatMessage> {
     if (assistantMessage.isNotBlank()) {
         entries += ChatMessage(
             id = "memory-agent-$id",
-            author = "Agent",
+            author = "Эксперт",
             role = AuthorRole.AGENT,
             text = assistantMessage,
             timestamp = timestamp + 1,

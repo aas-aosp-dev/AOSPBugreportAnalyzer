@@ -104,7 +104,7 @@ fun App() {
             OutlinedTextField(
                 value = assistantMessage,
                 onValueChange = { assistantMessage = it },
-                label = { Text("Ответ ассистента") },
+                label = { Text("Ответ Эксперта") },
                 modifier = Modifier.fillMaxWidth()
             )
 
@@ -122,7 +122,7 @@ fun App() {
                 Button(
                     onClick = {
                         if (userMessage.isBlank() || assistantMessage.isBlank()) {
-                            statusMessage = "Введите сообщения пользователя и ассистента"
+                            statusMessage = "Введите сообщения пользователя и Эксперта"
                             return@Button
                         }
                         scope.launch {
@@ -186,7 +186,7 @@ fun App() {
                                 style = MaterialTheme.typography.bodyMedium
                             )
                             Text(
-                                text = "Assistant: ${entry.assistantMessage}",
+                                text = "Эксперт: ${entry.assistantMessage}",
                                 style = MaterialTheme.typography.bodyMedium
                             )
                             if (entry.tags.isNotEmpty()) {
