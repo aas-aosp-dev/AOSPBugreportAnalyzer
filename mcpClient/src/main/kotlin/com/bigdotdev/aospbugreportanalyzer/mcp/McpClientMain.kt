@@ -1,7 +1,6 @@
 package com.bigdotdev.aospbugreportanalyzer.mcp
 
 import kotlinx.coroutines.runBlocking
-import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
@@ -14,44 +13,59 @@ import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
+import kotlinx.serialization.encodeToString
 
 fun main() = runBlocking {
     val json = Json {
         ignoreUnknownKeys = true
-        prettyPrint = true
+        prettyPrint = false
         encodeDefaults = true
     }
 
     val config = McpServerConfig(
         command = listOf(
-            // TODO: Replace with the actual command that launches your MCP GitHub server.
-            "node",
-            "/ABSOLUTE/PATH/TO/github-mcp-server.js"
+            "npx", "tsx",
+            "/Users/artem/work/projects/kmp/AOSPBugreportAnalyzerMCPServer/src/server.ts"
         )
     )
 
     val connection = McpConnection.start(config, json)
     try {
-        connection.initialize()
+        println("📡 [MCP-CLIENT] Sending initialize...")
+        val initializeResponse = connection.initialize()
+        if (initializeResponse.error != null) {
+            System.err.println("❌ [MCP-CLIENT] initialize failed: ${formatError(initializeResponse.error)}")
+            return@runBlocking
+        }
+        val initResult = json.encodeToString(initializeResponse.result ?: JsonNull)
+        println("✅ [MCP-CLIENT] Initialize completed: $initResult")
 
-        println("Requesting tools.list via MCP...")
-        val toolsResponse = connection.sendRequest(
-            method = "tools/list",
-            params = buildJsonObject { }
-        )
+        println("📡 [MCP-CLIENT] Requesting tools.list...")
+        val toolsResponse = try {
+            connection.sendRequest(
+                method = "tools/list",
+                params = buildJsonObject { }
+            )
+        } catch (e: Exception) {
+            System.err.println("❌ [MCP-CLIENT] tools.list failed: ${e.message}")
+            return@runBlocking
+        }
 
-        handlePotentialError("tools/list", toolsResponse)
+        if (toolsResponse.error != null) {
+            System.err.println("❌ [MCP-CLIENT] tools.list failed: ${formatError(toolsResponse.error)}")
+            return@runBlocking
+        }
 
         val toolsArray = extractToolsArray(toolsResponse.result)
-        println("Available MCP tools:")
+        println("✅ [MCP-CLIENT] tools.list response:")
         toolsArray.forEach { tool ->
             val obj = tool.jsonObject
             val name = obj["name"]?.jsonPrimitive?.content ?: "<no-name>"
             val desc = obj["description"]?.jsonPrimitive?.contentOrNull ?: ""
             if (desc.isBlank()) {
-                println("- $name")
+                println("   • $name")
             } else {
-                println("- $name — $desc")
+                println("   • $name — $desc")
             }
         }
 
@@ -64,35 +78,36 @@ fun main() = runBlocking {
             return@runBlocking
         }
 
-        println("Requesting github.get_pr_diff for PR #40...")
+        println("📡 [MCP-CLIENT] Requesting github.get_pr_diff for PR #40...")
         val prParams = buildJsonObject {
             put("owner", JsonPrimitive("aas-aosp-dev"))
             put("repo", JsonPrimitive("AOSPBugreportAnalyzer"))
             put("number", JsonPrimitive(40))
         }
 
-        val diffResponse = connection.sendRequest(
-            method = "tools/call",
-            params = buildJsonObject {
-                put("name", JsonPrimitive("github.get_pr_diff"))
-                put("arguments", prParams)
-            }
-        )
+        val diffResponse = try {
+            connection.sendRequest(
+                method = "tools/call",
+                params = buildJsonObject {
+                    put("name", JsonPrimitive("github.get_pr_diff"))
+                    put("arguments", prParams)
+                }
+            )
+        } catch (e: Exception) {
+            System.err.println("❌ [MCP-CLIENT] github.get_pr_diff failed: ${e.message}")
+            return@runBlocking
+        }
 
-        handlePotentialError("github.get_pr_diff", diffResponse)
+        if (diffResponse.error != null) {
+            System.err.println("❌ [MCP-CLIENT] github.get_pr_diff failed: ${formatError(diffResponse.error)}")
+            return@runBlocking
+        }
 
-        println("Diff result:")
+        println("✅ [MCP-CLIENT] github.get_pr_diff response:")
         println(json.encodeToString(diffResponse.result ?: JsonNull))
     } finally {
+        println("🏁 [MCP-CLIENT] Done. MCP server will be terminated.")
         connection.close()
-    }
-}
-
-private fun handlePotentialError(operation: String, response: JsonRpcResponse) {
-    response.error?.let { error ->
-        error(
-            "$operation error: code=${error.code}, message=${error.message}, data=${error.data}"
-        )
     }
 }
 
@@ -101,4 +116,9 @@ private fun extractToolsArray(result: JsonElement?): JsonArray {
         ?: return JsonArray(emptyList())
     val tools = obj["tools"]?.jsonArray
     return tools ?: JsonArray(emptyList())
+}
+
+private fun formatError(error: JsonRpcError): String {
+    val data = error.data?.toString() ?: "<no-data>"
+    return "code=${error.code}, message=${error.message}, data=$data"
 }
