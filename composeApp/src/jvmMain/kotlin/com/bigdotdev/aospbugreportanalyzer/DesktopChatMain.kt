@@ -800,7 +800,7 @@ private fun DesktopChatApp() {
         }
         val diffPrefix = "/mcp diff"
         if (trimmed.startsWith(diffPrefix, ignoreCase = true)) {
-            val numberPart = trimmed.removePrefix(diffPrefix).trim()
+            val numberPart = trimmed.substring(diffPrefix.length).trim()
             val number = numberPart.toIntOrNull()
             if (number == null) {
                 addSystemMessage("Неверный номер PR. Используйте: /mcp diff <number>")
