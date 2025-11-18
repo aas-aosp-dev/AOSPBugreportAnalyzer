@@ -73,6 +73,8 @@ import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.util.Locale
 import java.util.UUID
+import com.bigdotdev.aospbugreportanalyzer.mcp.McpGithubClientException
+import com.bigdotdev.aospbugreportanalyzer.mcp.withMcpGithubClient
 import com.bigdotdev.aospbugreportanalyzer.memory.AgentMemoryEntry
 import com.bigdotdev.aospbugreportanalyzer.memory.AgentMemoryRepository
 import com.bigdotdev.aospbugreportanalyzer.memory.MessageStats
@@ -605,6 +607,28 @@ private fun DesktopChatApp() {
         messages = messages + message
     }
 
+    fun addAssistantMessage(text: String) {
+        appendMessage(
+            ChatMessage(
+                author = "Эксперт",
+                role = AuthorRole.EXPERT,
+                text = text,
+                metrics = null
+            )
+        )
+    }
+
+    fun addSystemMessage(text: String) {
+        appendMessage(
+            ChatMessage(
+                author = "System",
+                role = AuthorRole.EXPERT,
+                text = text,
+                metrics = null
+            )
+        )
+    }
+
     fun applySummary(toCompress: List<ChatMessage>, result: SummaryResult) {
         summaryCounter += 1
         val groupId = summaryCounter
@@ -692,6 +716,12 @@ private fun DesktopChatApp() {
     fun sendMessage() {
         val text = input.trim()
         if (text.isEmpty() || isSending) return
+
+        if (handleMcpCommand(text)) {
+            input = ""
+            return
+        }
+
         println("[AgentMemory] sendMessage: userText='${text.take(80)}'")
         val userMessage = ChatMessage(
             author = "USER",
@@ -761,6 +791,94 @@ private fun DesktopChatApp() {
             }
         }
     }
+
+    fun handleMcpCommand(text: String): Boolean {
+        if (text.equals("/mcp prs", ignoreCase = true)) {
+            handleMcpListPullRequests()
+            return true
+        }
+        val diffPrefix = "/mcp diff"
+        if (text.startsWith(diffPrefix, ignoreCase = true)) {
+            val numberPart = text.substring(diffPrefix.length).trim()
+            val number = numberPart.toIntOrNull()
+            if (number == null) {
+                addSystemMessage("Неверный номер PR. Используйте: /mcp diff <number>")
+            } else {
+                handleMcpGetPrDiff(number)
+            }
+            return true
+        }
+        return false
+    }
+
+    fun handleMcpListPullRequests() {
+        scope.launch {
+            isSending = true
+            try {
+                addAssistantMessage("MCP: запрашиваю список PR через GitHub MCP сервер...")
+                val prs = withContext(Dispatchers.IO) {
+                    withMcpGithubClient { client ->
+                        client.listPullRequests()
+                    }
+                }
+                if (prs.isEmpty()) {
+                    addAssistantMessage("MCP: открытых PR не найдено.")
+                } else {
+                    val text = buildString {
+                        appendLine("MCP: найдено ${prs.size} PR:")
+                        prs.forEach { pr ->
+                            appendLine("- #${pr.number} [${pr.state}] ${pr.title} (${pr.url})")
+                        }
+                    }.trimEnd()
+                    addAssistantMessage(text)
+                }
+            } catch (t: Throwable) {
+                addAssistantMessage(formatMcpError(t, "MCP ошибка при получении PR"))
+            } finally {
+                isSending = false
+            }
+        }
+    }
+
+    fun handleMcpGetPrDiff(number: Int) {
+        scope.launch {
+            isSending = true
+            try {
+                addAssistantMessage("MCP: запрашиваю diff для PR #$number...")
+                val diff = withContext(Dispatchers.IO) {
+                    withMcpGithubClient { client ->
+                        client.getPrDiff(number = number)
+                    }
+                }
+                val maxChars = 4000
+                val shownDiff = if (diff.length > maxChars) {
+                    diff.take(maxChars) + "\n\n... [обрезано]"
+                } else {
+                    diff
+                }
+                val message = buildString {
+                    appendLine("MCP: unified diff для PR #$number:")
+                    appendLine("```diff")
+                    appendLine(shownDiff)
+                    append("```")
+                }
+                addAssistantMessage(message)
+            } catch (t: Throwable) {
+                addAssistantMessage(formatMcpError(t, "MCP ошибка при получении diff для PR #$number"))
+            } finally {
+                isSending = false
+            }
+        }
+    }
+
+    fun formatMcpError(t: Throwable, defaultMessage: String): String {
+        return if (t is McpGithubClientException && t.isConnectionError) {
+            "MCP: не удалось подключиться к GitHub серверу. Проверьте GITHUB_TOKEN и путь к серверу. Детали: ${t.message}"
+        } else {
+            "$defaultMessage: ${t.message}"
+        }
+    }
+
 
     LaunchedEffect(Unit) {
         if ((settings.openRouterApiKey.takeIf { it.isNotBlank() } ?: OpenRouterConfig.apiKey).isNullOrBlank()) {
