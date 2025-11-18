@@ -691,6 +691,116 @@ private fun DesktopChatApp() {
         }
     }
 
+    fun addAssistantMessage(text: String) {
+        appendMessage(
+            ChatMessage(
+                author = "Эксперт",
+                role = AuthorRole.EXPERT,
+                text = text,
+                metrics = null
+            )
+        )
+    }
+
+    fun addSystemMessage(text: String) {
+        appendMessage(
+            ChatMessage(
+                author = "System",
+                role = AuthorRole.EXPERT,
+                text = text,
+                metrics = null
+            )
+        )
+    }
+
+    fun formatMcpError(t: Throwable, defaultMessage: String): String {
+        return if (t is McpGithubClientException && t.isConnectionError) {
+            "MCP: не удалось подключиться к GitHub серверу. Проверьте GITHUB_TOKEN и путь к серверу. Детали: ${t.message}"
+        } else {
+            "$defaultMessage: ${t.message}"
+        }
+    }
+
+    fun handleMcpGetPrDiff(number: Int) {
+        scope.launch {
+            isSending = true
+            try {
+                addAssistantMessage("MCP: запрашиваю diff для PR #$number...")
+                val diff = withContext(Dispatchers.IO) {
+                    withMcpGithubClient { client ->
+                        client.getPrDiff(number = number)
+                    }
+                }
+                val maxChars = 4000
+                val shownDiff = if (diff.length > maxChars) {
+                    diff.take(maxChars) + "\n\n... [обрезано]"
+                } else {
+                    diff
+                }
+                val message = buildString {
+                    appendLine("MCP: unified diff для PR #$number:")
+                    appendLine("```diff")
+                    appendLine(shownDiff)
+                    append("```")
+                }
+                addAssistantMessage(message)
+            } catch (t: Throwable) {
+                addAssistantMessage(formatMcpError(t, "MCP ошибка при получении diff для PR #$number"))
+            } finally {
+                isSending = false
+            }
+        }
+    }
+
+    fun handleMcpListPullRequests() {
+        scope.launch {
+            isSending = true
+            try {
+                addAssistantMessage("MCP: запрашиваю список PR через GitHub MCP сервер...")
+                val prs = withContext(Dispatchers.IO) {
+                    withMcpGithubClient { client ->
+                        client.listPullRequests()
+                    }
+                }
+                if (prs.isEmpty()) {
+                    addAssistantMessage("MCP: открытых PR не найдено.")
+                } else {
+                    val text = buildString {
+                        appendLine("MCP: найдено ${prs.size} PR:")
+                        prs.forEach { pr ->
+                            appendLine("- #${pr.number} [${pr.state}] ${pr.title} (${pr.url})")
+                        }
+                    }.trimEnd()
+                    addAssistantMessage(text)
+                }
+            } catch (t: Throwable) {
+                addAssistantMessage(formatMcpError(t, "MCP ошибка при получении PR"))
+            } finally {
+                isSending = false
+            }
+        }
+    }
+
+    fun handleMcpCommand(text: String): Boolean {
+        val trimmed = text.trim()
+        if (trimmed.equals("/mcp prs", ignoreCase = true)) {
+            handleMcpListPullRequests()
+            return true
+        }
+        val diffPrefix = "/mcp diff"
+        if (trimmed.startsWith(diffPrefix, ignoreCase = true)) {
+            val numberPart = trimmed.substring(diffPrefix.length).trim()
+            val number = numberPart.toIntOrNull()
+            if (number == null) {
+                addSystemMessage("Неверный номер PR. Используйте: /mcp diff <number>")
+            } else {
+                handleMcpGetPrDiff(number)
+            }
+            return true
+        }
+        return false
+    }
+
     fun sendMessage() {
         val text = input.trim()
         if (text.isEmpty() || isSending) return
@@ -767,116 +877,6 @@ private fun DesktopChatApp() {
                     refreshMemory(updatedEntries)
                 }
             }
-        }
-    }
-
-    fun addAssistantMessage(text: String) {
-        appendMessage(
-            ChatMessage(
-                author = "Эксперт",
-                role = AuthorRole.EXPERT,
-                text = text,
-                metrics = null
-            )
-        )
-    }
-
-    fun addSystemMessage(text: String) {
-        appendMessage(
-            ChatMessage(
-                author = "System",
-                role = AuthorRole.EXPERT,
-                text = text,
-                metrics = null
-            )
-        )
-    }
-
-    fun handleMcpCommand(text: String): Boolean {
-        val trimmed = text.trim()
-        if (trimmed.equals("/mcp prs", ignoreCase = true)) {
-            handleMcpListPullRequests()
-            return true
-        }
-        val diffPrefix = "/mcp diff"
-        if (trimmed.startsWith(diffPrefix, ignoreCase = true)) {
-            val numberPart = trimmed.substring(diffPrefix.length).trim()
-            val number = numberPart.toIntOrNull()
-            if (number == null) {
-                addSystemMessage("Неверный номер PR. Используйте: /mcp diff <number>")
-            } else {
-                handleMcpGetPrDiff(number)
-            }
-            return true
-        }
-        return false
-    }
-
-    fun handleMcpListPullRequests() {
-        scope.launch {
-            isSending = true
-            try {
-                addAssistantMessage("MCP: запрашиваю список PR через GitHub MCP сервер...")
-                val prs = withContext(Dispatchers.IO) {
-                    withMcpGithubClient { client ->
-                        client.listPullRequests()
-                    }
-                }
-                if (prs.isEmpty()) {
-                    addAssistantMessage("MCP: открытых PR не найдено.")
-                } else {
-                    val text = buildString {
-                        appendLine("MCP: найдено ${prs.size} PR:")
-                        prs.forEach { pr ->
-                            appendLine("- #${pr.number} [${pr.state}] ${pr.title} (${pr.url})")
-                        }
-                    }.trimEnd()
-                    addAssistantMessage(text)
-                }
-            } catch (t: Throwable) {
-                addAssistantMessage(formatMcpError(t, "MCP ошибка при получении PR"))
-            } finally {
-                isSending = false
-            }
-        }
-    }
-
-    fun handleMcpGetPrDiff(number: Int) {
-        scope.launch {
-            isSending = true
-            try {
-                addAssistantMessage("MCP: запрашиваю diff для PR #$number...")
-                val diff = withContext(Dispatchers.IO) {
-                    withMcpGithubClient { client ->
-                        client.getPrDiff(number = number)
-                    }
-                }
-                val maxChars = 4000
-                val shownDiff = if (diff.length > maxChars) {
-                    diff.take(maxChars) + "\n\n... [обрезано]"
-                } else {
-                    diff
-                }
-                val message = buildString {
-                    appendLine("MCP: unified diff для PR #$number:")
-                    appendLine("```diff")
-                    appendLine(shownDiff)
-                    append("```")
-                }
-                addAssistantMessage(message)
-            } catch (t: Throwable) {
-                addAssistantMessage(formatMcpError(t, "MCP ошибка при получении diff для PR #$number"))
-            } finally {
-                isSending = false
-            }
-        }
-    }
-
-    fun formatMcpError(t: Throwable, defaultMessage: String): String {
-        return if (t is McpGithubClientException && t.isConnectionError) {
-            "MCP: не удалось подключиться к GitHub серверу. Проверьте GITHUB_TOKEN и путь к серверу. Детали: ${t.message}"
-        } else {
-            "$defaultMessage: ${t.message}"
         }
     }
 
