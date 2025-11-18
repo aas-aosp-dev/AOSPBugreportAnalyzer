@@ -793,13 +793,14 @@ private fun DesktopChatApp() {
     }
 
     fun handleMcpCommand(text: String): Boolean {
-        if (text.equals("/mcp prs", ignoreCase = true)) {
+        val trimmed = text.trim()
+        if (trimmed.equals("/mcp prs", ignoreCase = true)) {
             handleMcpListPullRequests()
             return true
         }
         val diffPrefix = "/mcp diff"
-        if (text.startsWith(diffPrefix, ignoreCase = true)) {
-            val numberPart = text.substring(diffPrefix.length).trim()
+        if (trimmed.startsWith(diffPrefix, ignoreCase = true)) {
+            val numberPart = trimmed.removePrefix(diffPrefix).trim()
             val number = numberPart.toIntOrNull()
             if (number == null) {
                 addSystemMessage("Неверный номер PR. Используйте: /mcp diff <number>")
