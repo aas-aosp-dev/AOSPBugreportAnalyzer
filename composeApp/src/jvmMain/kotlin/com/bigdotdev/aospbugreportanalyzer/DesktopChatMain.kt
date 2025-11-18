@@ -607,28 +607,6 @@ private fun DesktopChatApp() {
         messages = messages + message
     }
 
-    fun addAssistantMessage(text: String) {
-        appendMessage(
-            ChatMessage(
-                author = "Эксперт",
-                role = AuthorRole.EXPERT,
-                text = text,
-                metrics = null
-            )
-        )
-    }
-
-    fun addSystemMessage(text: String) {
-        appendMessage(
-            ChatMessage(
-                author = "System",
-                role = AuthorRole.EXPERT,
-                text = text,
-                metrics = null
-            )
-        )
-    }
-
     fun applySummary(toCompress: List<ChatMessage>, result: SummaryResult) {
         summaryCounter += 1
         val groupId = summaryCounter
@@ -790,6 +768,28 @@ private fun DesktopChatApp() {
                 }
             }
         }
+    }
+
+    fun addAssistantMessage(text: String) {
+        appendMessage(
+            ChatMessage(
+                author = "Эксперт",
+                role = AuthorRole.EXPERT,
+                text = text,
+                metrics = null
+            )
+        )
+    }
+
+    fun addSystemMessage(text: String) {
+        appendMessage(
+            ChatMessage(
+                author = "System",
+                role = AuthorRole.EXPERT,
+                text = text,
+                metrics = null
+            )
+        )
     }
 
     fun handleMcpCommand(text: String): Boolean {
