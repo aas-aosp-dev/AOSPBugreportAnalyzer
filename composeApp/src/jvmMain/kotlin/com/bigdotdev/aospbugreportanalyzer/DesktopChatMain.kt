@@ -23,6 +23,7 @@ import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Divider
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -47,12 +48,14 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Window
 import androidx.compose.ui.window.application
+import com.bigdotdev.aospbugreportanalyzer.mcp.McpPullRequest
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -80,6 +83,7 @@ import com.bigdotdev.aospbugreportanalyzer.memory.AgentMemoryRepository
 import com.bigdotdev.aospbugreportanalyzer.memory.MessageStats
 import com.bigdotdev.aospbugreportanalyzer.memory.MemoryMeta
 import com.bigdotdev.aospbugreportanalyzer.memory.createAgentMemoryStore
+import com.bigdotdev.aospbugreportanalyzer.reminder.GithubReminderStorage
 
 private enum class Screen { MAIN, SETTINGS }
 
@@ -557,6 +561,10 @@ private fun DesktopChatApp() {
     var isCompressionRunning by remember { mutableStateOf(false) }
     var memoryCount by remember { mutableStateOf(0) }
     var recentMemoryEntries by remember { mutableStateOf<List<AgentMemoryEntry>>(emptyList()) }
+    var reminderConfig by remember { mutableStateOf(GithubReminderStorage.load()) }
+
+    val reminderEnabled = reminderConfig.enabled
+    val reminderIntervalMinutes = reminderConfig.intervalMinutes
 
     suspend fun persistTurnAndFetch(
         userMessage: String,
@@ -713,6 +721,80 @@ private fun DesktopChatApp() {
                 metrics = null
             )
         )
+    }
+
+    suspend fun requestGithubPrSummaryFromLlm(prs: List<McpPullRequest>): String {
+        if (prs.isEmpty()) {
+            return "Сейчас нет открытых PR — все задачи закрыты 👍"
+        }
+        val apiKey = settings.openRouterApiKey.takeIf { it.isNotBlank() } ?: OpenRouterConfig.apiKey
+        if (apiKey.isNullOrBlank()) {
+            return "Не удалось получить summary от LLM: отсутствует OPENROUTER_API_KEY."
+        }
+        val listText = buildString {
+            appendLine("Вот список PR:")
+            prs.forEachIndexed { index, pr ->
+                appendLine("${index + 1}) #${pr.number} [${pr.state}] ${pr.title} (${pr.url})")
+            }
+            appendLine()
+            append("Сделай короткий отчёт в 3–5 пунктах.")
+        }
+        val messages = listOf(
+            ORMessage(
+                "system",
+                "Ты ассистент, который готовит краткий отчёт о состоянии open PR в GitHub. Пиши по-русски. Дай краткое summary: сколько PR, какие ключевые, что стоит сделать."
+            ),
+            ORMessage("user", listText)
+        )
+        val result = withContext(Dispatchers.IO) {
+            callOpenRouter(
+                model = settings.openRouterModel,
+                messages = messages,
+                forceJson = false,
+                apiKeyOverride = apiKey,
+                temperature = 0.2
+            )
+        }
+        return when (result) {
+            is OpenRouterResult.Success -> result.content.ifBlank {
+                "LLM вернул пустой ответ на запрос summary."
+            }
+            is OpenRouterResult.Failure -> {
+                val message = result.error.message ?: result.error.rawBody ?: "неизвестная ошибка"
+                "Не удалось получить summary от LLM (ошибка: $message). Попробуйте позже."
+            }
+        }
+    }
+
+    suspend fun runGithubReminderIfDue() {
+        val currentConfig = reminderConfig
+        if (!currentConfig.enabled) return
+        val now = System.currentTimeMillis()
+        val intervalMillis = currentConfig.intervalMinutes.coerceAtLeast(1L) * 60_000L
+        val lastRun = currentConfig.lastRunAtEpochMillis
+        if (lastRun != null && now - lastRun < intervalMillis) {
+            return
+        }
+
+        val prs = try {
+            withContext(Dispatchers.IO) {
+                withMcpGithubClient { client ->
+                    client.listPullRequests(state = "open")
+                }
+            }
+        } catch (t: Throwable) {
+            addSystemMessage("Reminder (MCP): ошибка при получении PR: ${t.message}")
+            val updatedConfig = currentConfig.copy(lastRunAtEpochMillis = now)
+            reminderConfig = updatedConfig
+            GithubReminderStorage.save(updatedConfig)
+            return
+        }
+
+        val summaryText = requestGithubPrSummaryFromLlm(prs)
+        addAssistantMessage("⏰ Автоматический GitHub summary:\n$summaryText")
+        val updatedConfig = currentConfig.copy(lastRunAtEpochMillis = now)
+        reminderConfig = updatedConfig
+        GithubReminderStorage.save(updatedConfig)
     }
 
     fun formatMcpError(message: String, throwable: Throwable? = null): String {
@@ -931,6 +1013,15 @@ private fun DesktopChatApp() {
         }
     }
 
+    LaunchedEffect(reminderEnabled, reminderIntervalMinutes) {
+        if (!reminderEnabled) return@LaunchedEffect
+        while (true) {
+            runGithubReminderIfDue()
+            val intervalMs = reminderIntervalMinutes.coerceAtLeast(1L) * 60_000L
+            delay(intervalMs)
+        }
+    }
+
     when (screen) {
         Screen.MAIN -> {
             Scaffold(
@@ -974,6 +1065,14 @@ private fun DesktopChatApp() {
                     if (compressionStats.isNotEmpty()) {
                         CompressionStatsBlock(compressionStats)
                     }
+                    GithubReminderSection(
+                        enabled = reminderEnabled,
+                        onToggle = { checked ->
+                            val updated = reminderConfig.copy(enabled = checked)
+                            reminderConfig = updated
+                            GithubReminderStorage.save(updated)
+                        }
+                    )
                     OutlinedTextField(
                         value = input,
                         onValueChange = { input = it },
@@ -1002,6 +1101,33 @@ private fun DesktopChatApp() {
                 memoryCount = memoryCount,
                 onClearMemory = { clearExternalMemory() }
             )
+        }
+    }
+}
+
+@Composable
+private fun GithubReminderSection(
+    enabled: Boolean,
+    onToggle: (Boolean) -> Unit
+) {
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        Text(
+            text = "GitHub PR reminder (MCP)",
+            style = MaterialTheme.typography.bodyMedium,
+            fontWeight = FontWeight.SemiBold
+        )
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Checkbox(
+                checked = enabled,
+                onCheckedChange = onToggle
+            )
+            Text("Включить summary по открытым PR (каждые 60 минут)")
         }
     }
 }
