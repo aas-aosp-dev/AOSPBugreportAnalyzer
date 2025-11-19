@@ -1,13 +1,12 @@
 package com.bigdotdev.aospbugreportanalyzer.reminder
 
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.doubleOrNull
 import kotlinx.serialization.json.intOrNull
-import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.longOrNull
-import kotlinx.serialization.json.parseToJsonElement
 import java.io.File
 
 
@@ -19,7 +18,7 @@ data class GithubReminderConfig(
 
 private val defaultConfig = GithubReminderConfig(
     enabled = false,
-    intervalMinutes = 60,
+    intervalMinutes = 1,
     lastRunAtEpochMillis = null
 )
 
@@ -53,7 +52,7 @@ object GithubReminderStorage {
             return defaultConfig
         }
         return runCatching {
-            val element = json.parseToJsonElement(text).jsonObject
+            val element: JsonObject = json.decodeFromString(text)
             val enabled = element["enabled"]?.jsonPrimitive?.booleanOrNull ?: defaultConfig.enabled
             val interval = element["intervalMinutes"]?.jsonPrimitive?.longOrNull
                 ?: element["intervalMinutes"]?.jsonPrimitive?.intOrNull?.toLong()

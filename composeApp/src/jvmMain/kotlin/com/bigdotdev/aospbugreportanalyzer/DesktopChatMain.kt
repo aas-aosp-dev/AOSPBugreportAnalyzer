@@ -1127,7 +1127,7 @@ private fun GithubReminderSection(
                 checked = enabled,
                 onCheckedChange = onToggle
             )
-            Text("Включить summary по открытым PR (каждые 60 минут)")
+            Text("Включить summary по открытым PR")
         }
     }
 }
