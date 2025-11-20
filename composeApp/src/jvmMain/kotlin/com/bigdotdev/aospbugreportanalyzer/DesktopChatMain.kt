@@ -903,6 +903,8 @@ private fun DesktopChatApp() {
             try {
                 runPrSummaryPipeline(mode)
             } catch (t: Throwable) {
+                println("[Pipeline] MCP/LLM error: ${t.message}")
+                t.printStackTrace()
                 addSystemMessage("Pipeline: ошибка: ${t.message ?: t.toString()}")
             } finally {
                 isSending = false
@@ -915,33 +917,41 @@ private fun DesktopChatApp() {
     suspend fun runPrSummaryPipeline(mode: PipelineMode) {
         val maxPrs = 5
         val shouldLoadDiff = mode is PipelineMode.SinglePr
-        val prData = withContext(Dispatchers.IO) {
-            withMcpGithubClient { client ->
-                val pullRequests = when (mode) {
-                    PipelineMode.AllOpenPrs -> client.listPullRequests(state = "open").take(maxPrs)
-                    is PipelineMode.SinglePr -> {
-                        val prs = client.listPullRequests(state = "open")
-                        prs.filter { it.number == mode.number }
+        val prData = try {
+            withContext(Dispatchers.IO) {
+                withMcpGithubClient { client ->
+                    val pullRequests = when (mode) {
+                        PipelineMode.AllOpenPrs -> client.listPullRequests(state = "open").take(maxPrs)
+                        is PipelineMode.SinglePr -> {
+                            val prs = client.listPullRequests(state = "open")
+                            prs.filter { it.number == mode.number }
+                        }
                     }
-                }
 
-                if (mode is PipelineMode.SinglePr && pullRequests.isEmpty()) {
-                    throw IllegalStateException("PR #${mode.number} не найден среди открытых PR.")
-                }
-
-                pullRequests.map { pr ->
-                    val diff = if (shouldLoadDiff) {
-                        runCatching { client.getPrDiff(number = pr.number) }
-                            .onFailure {
-                                println("[Pipeline] Failed to load diff for PR #${pr.number}: ${it.message}")
-                            }
-                            .getOrNull()
-                    } else {
-                        null
+                    if (mode is PipelineMode.SinglePr && pullRequests.isEmpty()) {
+                        throw IllegalStateException("PR #${mode.number} не найден среди открытых PR.")
                     }
-                    pr to diff
+
+                    pullRequests.map { pr ->
+                        val diff = if (shouldLoadDiff) {
+                            runCatching { client.getPrDiff(number = pr.number) }
+                                .onFailure {
+                                    println("[Pipeline] Failed to load diff for PR #${pr.number}: ${it.message}")
+                                    it.printStackTrace()
+                                }
+                                .getOrNull()
+                        } else {
+                            null
+                        }
+                        pr to diff
+                    }
                 }
             }
+        } catch (e: McpGithubClientException) {
+            println("[Pipeline] MCP error while loading PR data: ${e.message}")
+            e.printStackTrace()
+            addSystemMessage("Pipeline: ошибка получения данных из MCP GitHub: ${e.message}")
+            return
         }
 
         if (prData.isEmpty()) {
@@ -991,13 +1001,20 @@ private fun DesktopChatApp() {
             is PipelineMode.SinglePr -> "pr-${mode.number}-summary.md"
         }
 
-        val saveResult = withContext(Dispatchers.IO) {
-            withMcpFsClient { conn ->
-                conn.callSaveSummary(
-                    fileName = fileName,
-                    content = summaryText
-                )
+        val saveResult = try {
+            withContext(Dispatchers.IO) {
+                withMcpFsClient { conn ->
+                    conn.callSaveSummary(
+                        fileName = fileName,
+                        content = summaryText
+                    )
+                }
             }
+        } catch (t: Throwable) {
+            println("[Pipeline] Failed to save summary via MCP fs.save_summary: ${t.message}")
+            t.printStackTrace()
+            addSystemMessage("Pipeline: не удалось сохранить summary через MCP: ${t.message}")
+            return
         }
 
         println("[Pipeline] Summary saved to ${saveResult.filePath}")
@@ -1096,6 +1113,7 @@ private fun DesktopChatApp() {
 
     fun mapUserTextToPipelineCommand(input: String): String? {
         val text = input.lowercase().trim()
+        println("[Pipeline-NL] raw='$input', normalized='$text'")
 
         val triggersAll = listOf(
             "обзор pr",
@@ -1108,7 +1126,9 @@ private fun DesktopChatApp() {
         )
 
         if (triggersAll.any { text.contains(it) } && !text.contains("pr ")) {
-            return "/pipeline prs"
+            val cmd = "/pipeline prs"
+            println("[Pipeline-NL] matched 'all PRs' trigger => $cmd")
+            return cmd
         }
 
         val prRegex = Regex("""pr\s*(\d+)""")
@@ -1118,10 +1138,13 @@ private fun DesktopChatApp() {
             val summaryTriggers = listOf("обзор", "summary", "сводк", "отчёт")
             val mentionsDiff = text.contains("diff") || text.contains("дифф")
             if (!mentionsDiff && summaryTriggers.any { text.contains(it) }) {
-                return "/pipeline pr $number"
+                val cmd = "/pipeline pr $number"
+                println("[Pipeline-NL] matched 'single PR' trigger => $cmd")
+                return cmd
             }
         }
 
+        println("[Pipeline-NL] no pipeline match")
         return null
     }
 
@@ -1131,16 +1154,19 @@ private fun DesktopChatApp() {
 
         val pipelineCommand = mapUserTextToPipelineCommand(text)
         if (pipelineCommand != null && handlePipelineCommand(pipelineCommand)) {
+            println("[Pipeline] handled via NLP trigger: '$text' -> '$pipelineCommand'")
             input = ""
             return
         }
 
         if (handlePipelineCommand(text)) {
+            println("[Pipeline] handled via explicit command: '$text'")
             input = ""
             return
         }
 
         if (handleMcpCommand(text)) {
+            println("[MCP] handled via explicit MCP command: '$text'")
             input = ""
             return
         }
