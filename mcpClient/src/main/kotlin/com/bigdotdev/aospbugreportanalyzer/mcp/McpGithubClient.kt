@@ -219,7 +219,7 @@ private class McpGithubClientImpl(
         fileName: String,
         content: String
     ): SaveSummaryResult {
-        println("📁 [MCP-CLIENT] Calling fs.save_summary with fileName=$fileName")
+        println("[MCP-CLIENT] Calling fs.save_summary with fileName=$fileName")
         val response = connection.sendRequest(
             method = "tools/call",
             params = buildJsonObject {
@@ -264,7 +264,7 @@ private class McpGithubClientImpl(
                 "Unexpected MCP result for fs.save_summary: structuredContent.filePath is missing"
             )
         }
-        println("📁 [MCP-CLIENT] fs.save_summary -> filePath=$filePath")
+        println("[MCP-CLIENT] fs.save_summary -> filePath=$filePath")
         return SaveSummaryResult(filePath)
     }
 
