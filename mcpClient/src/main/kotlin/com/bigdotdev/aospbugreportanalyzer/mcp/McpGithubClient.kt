@@ -4,7 +4,9 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonObjectBuilder
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
@@ -16,6 +18,10 @@ data class McpPullRequest(
     val title: String,
     val url: String,
     val state: String
+)
+
+data class SaveSummaryResult(
+    val filePath: String
 )
 
 interface McpGithubClient {
@@ -30,6 +36,11 @@ interface McpGithubClient {
         repo: String? = null,
         number: Int
     ): String
+
+    suspend fun saveSummaryToFile(
+        fileName: String,
+        content: String
+    ): SaveSummaryResult
 }
 
 class McpGithubClientException(
@@ -94,7 +105,11 @@ suspend fun <T> withMcpGithubClient(
             ?.toSet()
             ?: emptySet()
 
-        val requiredTools = setOf("github.list_pull_requests", "github.get_pr_diff")
+        val requiredTools = setOf(
+            "github.list_pull_requests",
+            "github.get_pr_diff",
+            "fs.save_summary"
+        )
         val missingTools = requiredTools - availableTools
         if (missingTools.isNotEmpty()) {
             throw McpGithubClientException(
@@ -198,6 +213,59 @@ private class McpGithubClientImpl(
                 message = "Unexpected MCP result for github.get_pr_diff: $result",
                 isConnectionError = false
             )
+    }
+
+    override suspend fun saveSummaryToFile(
+        fileName: String,
+        content: String
+    ): SaveSummaryResult {
+        println("[MCP-CLIENT] Calling fs.save_summary with fileName=$fileName")
+        val response = connection.sendRequest(
+            method = "tools/call",
+            params = buildJsonObject {
+                put("name", JsonPrimitive("fs.save_summary"))
+                put(
+                    "arguments",
+                    buildJsonObject {
+                        put("fileName", JsonPrimitive(fileName))
+                        put("content", JsonPrimitive(content))
+                    }
+                )
+            }
+        )
+        response.error?.let { error ->
+            throw McpGithubClientException(
+                message = "MCP error for fs.save_summary: ${error.message}",
+                isConnectionError = false
+            )
+        }
+        val result = response.result?.jsonObject
+        val isError = result?.get("isError")?.jsonPrimitive?.booleanOrNull == true
+        if (isError) {
+            val contentText = result["content"]
+                ?.jsonArray
+                ?.firstOrNull()
+                ?.jsonObject
+                ?.get("text")
+                ?.jsonPrimitive
+                ?.contentOrNull
+            throw McpGithubClientException(
+                message = "MCP tool fs.save_summary returned error: ${contentText ?: "unknown error"}",
+                isConnectionError = false
+            )
+        }
+        val structured = result?.unwrapStructuredContent()
+        val filePath = structured?.get("filePath")?.jsonPrimitive?.contentOrNull
+            ?: throw McpGithubClientException(
+                "Unexpected MCP result for fs.save_summary: structuredContent.filePath is missing"
+            )
+        if (filePath.isBlank()) {
+            throw McpGithubClientException(
+                "Unexpected MCP result for fs.save_summary: structuredContent.filePath is missing"
+            )
+        }
+        println("[MCP-CLIENT] fs.save_summary -> filePath=$filePath")
+        return SaveSummaryResult(filePath)
     }
 
     private fun buildArguments(
