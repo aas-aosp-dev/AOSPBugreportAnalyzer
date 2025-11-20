@@ -915,6 +915,7 @@ private fun DesktopChatApp() {
     }
 
     suspend fun runPrSummaryPipeline(mode: PipelineMode) {
+        println("[Pipeline] starting summary pipeline: mode=$mode")
         val maxPrs = 5
         val shouldLoadDiff = mode is PipelineMode.SinglePr
         val prData = try {
@@ -938,6 +939,7 @@ private fun DesktopChatApp() {
                                 .onFailure {
                                     println("[Pipeline] Failed to load diff for PR #${pr.number}: ${it.message}")
                                     it.printStackTrace()
+                                    addSystemMessage("Pipeline: не удалось получить diff для PR #${pr.number}: ${it.message}")
                                 }
                                 .getOrNull()
                         } else {
@@ -959,6 +961,7 @@ private fun DesktopChatApp() {
             return
         }
 
+        println("[Pipeline] loaded ${prData.size} PR(s) from MCP")
         addSystemMessage("Pipeline: получено ${prData.size} PR через MCP GitHub.")
 
         val maxDiffChars = 4000
@@ -984,10 +987,12 @@ private fun DesktopChatApp() {
             }
         }
 
+        println("[Pipeline] sending PR list to LLM for summary")
         val summaryText = try {
             requestPipelinePrSummaryFromLlm(context)
         } catch (t: Throwable) {
             println("[Pipeline] Failed to get summary from LLM: ${t.message}")
+            t.printStackTrace()
             addSystemMessage("Pipeline: не удалось получить summary от LLM: ${t.message}")
             return
         }
@@ -1122,10 +1127,14 @@ private fun DesktopChatApp() {
             "summary по pr",
             "сводка по открытым pr",
             "обзор открытых pr",
-            "отчёт по pr"
+            "отчёт по pr",
+            "сделай сводку по открытым pr"
         )
 
-        if (triggersAll.any { text.contains(it) } && !text.contains("pr ")) {
+        if (
+            triggersAll.any { text.contains(it) } &&
+            !Regex("""pr\s*\d+""").containsMatchIn(text)
+        ) {
             val cmd = "/pipeline prs"
             println("[Pipeline-NL] matched 'all PRs' trigger => $cmd")
             return cmd
@@ -1152,6 +1161,9 @@ private fun DesktopChatApp() {
         val text = input.trim()
         if (text.isEmpty() || isSending) return
 
+        val normalized = text.lowercase().trim()
+        println("[Pipeline-NL] raw='$text', normalized='$normalized'")
+
         val pipelineCommand = mapUserTextToPipelineCommand(text)
         if (pipelineCommand != null && handlePipelineCommand(pipelineCommand)) {
             println("[Pipeline] handled via NLP trigger: '$text' -> '$pipelineCommand'")
@@ -1164,6 +1176,8 @@ private fun DesktopChatApp() {
             input = ""
             return
         }
+
+        println("[Pipeline-NL] no pipeline match")
 
         if (handleMcpCommand(text)) {
             println("[MCP] handled via explicit MCP command: '$text'")
