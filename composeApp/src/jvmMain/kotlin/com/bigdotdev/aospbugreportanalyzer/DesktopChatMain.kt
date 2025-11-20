@@ -210,7 +210,7 @@ private val SUMMARY_SYSTEM_PROMPT = """
 
 data class AppSettings(
     val openRouterApiKey: String = System.getenv("OPENROUTER_API_KEY") ?: "",
-    val openRouterModel: String = "tngtech/deepseek-r1t2-chimera:free",
+    val openRouterModel: String = "x-ai/grok-4.1-fast:free",
     val strictJsonEnabled: Boolean = false,
     val useCompression: Boolean = false
 )
@@ -728,7 +728,7 @@ private fun DesktopChatApp() {
         )
     }
 
-    private suspend fun runPrSummaryPipeline(
+    suspend fun runPrSummaryPipeline(
         mode: PipelineMode,
         onMessage: (String) -> Unit
     ) {
@@ -761,7 +761,7 @@ private fun DesktopChatApp() {
                         withContext(Dispatchers.IO) {
                             withMcpGithubClient { client ->
                                 limitedPrList.associate { pr ->
-                                    pr.number to client.getPrDiff(pr.number)
+                                    pr.number to client.getPrDiff(number = pr.number)
                                 }
                             }
                         }
@@ -783,7 +783,7 @@ private fun DesktopChatApp() {
                     }
                     val diff = withContext(Dispatchers.IO) {
                         withMcpGithubClient { client ->
-                            client.getPrDiff(prNumber)
+                            client.getPrDiff(number = prNumber)
                         }
                     }
                     prListForSummary = listOf(pr)
