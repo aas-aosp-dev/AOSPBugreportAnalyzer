@@ -1094,9 +1094,46 @@ private fun DesktopChatApp() {
         return false
     }
 
+    private fun mapUserTextToPipelineCommand(input: String): String? {
+        val text = input.lowercase().trim()
+
+        val triggersAll = listOf(
+            "обзор pr",
+            "обзор по pr",
+            "сводку по pr",
+            "summary по pr",
+            "сводка по открытым pr",
+            "обзор открытых pr",
+            "отчёт по pr"
+        )
+
+        if (triggersAll.any { text.contains(it) } && !text.contains("pr ")) {
+            return "/pipeline prs"
+        }
+
+        val prRegex = Regex("""pr\s*(\d+)""")
+        val match = prRegex.find(text)
+        if (match != null) {
+            val number = match.groupValues[1]
+            val summaryTriggers = listOf("обзор", "summary", "сводк", "отчёт")
+            val mentionsDiff = text.contains("diff") || text.contains("дифф")
+            if (!mentionsDiff && summaryTriggers.any { text.contains(it) }) {
+                return "/pipeline pr $number"
+            }
+        }
+
+        return null
+    }
+
     fun sendMessage() {
         val text = input.trim()
         if (text.isEmpty() || isSending) return
+
+        val pipelineCommand = mapUserTextToPipelineCommand(text)
+        if (pipelineCommand != null && handlePipelineCommand(pipelineCommand)) {
+            input = ""
+            return
+        }
 
         if (handlePipelineCommand(text)) {
             input = ""
