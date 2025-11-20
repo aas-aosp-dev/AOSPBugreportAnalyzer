@@ -95,6 +95,11 @@ private fun AuthorRole.displayName(): String = when (this) {
     AuthorRole.SUMMARY -> "Сводка"
 }
 
+sealed class PipelineMode {
+    object AllOpenPrs : PipelineMode()
+    data class SinglePr(val number: Int) : PipelineMode()
+}
+
 private const val MESSAGES_PER_SUMMARY = 10
 private const val MAX_RECENT_MESSAGES = 8
 
@@ -723,6 +728,191 @@ private fun DesktopChatApp() {
         )
     }
 
+    private suspend fun runPrSummaryPipeline(
+        mode: PipelineMode,
+        onMessage: (String) -> Unit
+    ) {
+        try {
+            onMessage(
+                when (mode) {
+                    PipelineMode.AllOpenPrs -> "[Pipeline] Запускаю пайплайн summary по всем открытым PR..."
+                    is PipelineMode.SinglePr -> "[Pipeline] Запускаю пайплайн summary по PR #${mode.number}..."
+                }
+            )
+            println("[Pipeline] Starting pipeline: mode=$mode")
+
+            val prListForSummary: List<McpPullRequest>
+            val diffByPrNumber: Map<Int, String>
+
+            when (mode) {
+                PipelineMode.AllOpenPrs -> {
+                    val prList = withContext(Dispatchers.IO) {
+                        withMcpGithubClient { client ->
+                            client.listPullRequests(state = "open")
+                        }
+                    }
+                    val limitedPrList = prList.take(5)
+                    println("[Pipeline] MCP returned ${prList.size} open PR(s), using ${limitedPrList.size} for summary")
+                    onMessage("[Pipeline] Получил ${limitedPrList.size} открытых PR через MCP.")
+                    prListForSummary = limitedPrList
+                    diffByPrNumber = if (limitedPrList.isEmpty()) {
+                        emptyMap()
+                    } else {
+                        withContext(Dispatchers.IO) {
+                            withMcpGithubClient { client ->
+                                limitedPrList.associate { pr ->
+                                    pr.number to client.getPrDiff(pr.number)
+                                }
+                            }
+                        }
+                    }
+                }
+
+                is PipelineMode.SinglePr -> {
+                    val prNumber = mode.number
+                    val pr = withContext(Dispatchers.IO) {
+                        withMcpGithubClient { client ->
+                            client.listPullRequests(state = "open")
+                                .find { it.number == prNumber }
+                        }
+                    }
+                    if (pr == null) {
+                        onMessage("[Pipeline] PR #$prNumber не найден среди открытых.")
+                        println("[Pipeline] PR #$prNumber not found")
+                        return
+                    }
+                    val diff = withContext(Dispatchers.IO) {
+                        withMcpGithubClient { client ->
+                            client.getPrDiff(prNumber)
+                        }
+                    }
+                    prListForSummary = listOf(pr)
+                    diffByPrNumber = mapOf(pr.number to diff)
+                    onMessage("[Pipeline] Нашёл PR #$prNumber и получил его diff через MCP.")
+                    println("[Pipeline] Got diff for PR #$prNumber")
+                }
+            }
+
+            if (prListForSummary.isEmpty()) {
+                onMessage("[Pipeline] Открытых PR не найдено.")
+                return
+            }
+
+            val maxDiffChars = 6000
+            fun limitDiff(text: String): String {
+                return if (text.length > maxDiffChars) {
+                    text.take(maxDiffChars) + "\n\n... [обрезано]"
+                } else {
+                    text
+                }
+            }
+
+            val llmInput = buildString {
+                appendLine("Ты — ассистент, который делает техническое summary pull request-ов в GitHub репозитории AOSPBugreportAnalyzer.")
+                appendLine("Сделай краткое, структурированное summary в формате Markdown.")
+                appendLine("Обязательно выдели:")
+                appendLine("- краткое описание изменений;")
+                appendLine("- возможные риски;")
+                appendLine("- что особенно стоит проверить при ревью.")
+                appendLine()
+                when (mode) {
+                    PipelineMode.AllOpenPrs -> {
+                        appendLine("Вот список открытых PR:")
+                        prListForSummary.forEach { pr ->
+                            appendLine("- #${pr.number} [${pr.state}] ${pr.title} (${pr.url})")
+                            diffByPrNumber[pr.number]?.takeIf { it.isNotBlank() }?.let { diff ->
+                                appendLine()
+                                appendLine("Diff для #${pr.number}:")
+                                appendLine(limitDiff(diff))
+                                appendLine()
+                            }
+                        }
+                    }
+
+                    is PipelineMode.SinglePr -> {
+                        val pr = prListForSummary.first()
+                        appendLine("Вот данные по PR #${pr.number}:")
+                        appendLine("${pr.title} (${pr.url})")
+                        diffByPrNumber[pr.number]?.takeIf { it.isNotBlank() }?.let { diff ->
+                            appendLine()
+                            appendLine("Diff:")
+                            appendLine(limitDiff(diff))
+                        }
+                    }
+                }
+            }
+
+            val apiKey = settings.openRouterApiKey.takeIf { it.isNotBlank() } ?: OpenRouterConfig.apiKey
+            if (apiKey.isNullOrBlank()) {
+                onMessage("[Pipeline] Ошибка: отсутствует OPENROUTER_API_KEY для вызова LLM.")
+                return
+            }
+
+            println("[Pipeline] Calling LLM to generate summary...")
+            val llmResult = withContext(Dispatchers.IO) {
+                callOpenRouter(
+                    model = settings.openRouterModel,
+                    messages = listOf(
+                        ORMessage(
+                            "system",
+                            "Ты ассистент, который делает краткое, структурированное summary PR в формате Markdown."
+                        ),
+                        ORMessage("user", llmInput)
+                    ),
+                    forceJson = false,
+                    apiKeyOverride = apiKey,
+                    temperature = 0.2
+                )
+            }
+            val summaryText = when (llmResult) {
+                is OpenRouterResult.Success -> llmResult.content
+                is OpenRouterResult.Failure -> {
+                    val message = llmResult.error.message ?: llmResult.error.rawBody ?: "неизвестная ошибка"
+                    onMessage("[Pipeline] Ошибка при вызове LLM: $message")
+                    return
+                }
+            }
+            println("[Pipeline] LLM summary generated, length=${summaryText.length}")
+            onMessage("[Pipeline] LLM сгенерировал summary, сохраняю в файл через MCP...")
+
+            val timestamp = DateTimeFormatter.ofPattern("yyyyMMdd-HHmm").withZone(ZoneId.systemDefault())
+                .format(Instant.now())
+            val fileName = when (mode) {
+                is PipelineMode.SinglePr -> "pr-${mode.number}-summary.md"
+                PipelineMode.AllOpenPrs -> "prs-open-summary-$timestamp.md"
+            }
+            val saveResult = withContext(Dispatchers.IO) {
+                withMcpGithubClient { client ->
+                    client.saveSummaryToFile(
+                        fileName = fileName,
+                        content = summaryText
+                    )
+                }
+            }
+            val filePath = saveResult.filePath
+            println("[Pipeline] Summary saved via MCP to: $filePath")
+            onMessage(
+                buildString {
+                    appendLine("Готово! Я сделал summary по PR и сохранил файл через MCP.")
+                    appendLine()
+                    appendLine("Путь к файлу:")
+                    appendLine(filePath)
+                }
+            )
+            addAssistantMessage(
+                buildString {
+                    appendLine("Краткое summary (Markdown):")
+                    appendLine()
+                    append(summaryText)
+                }
+            )
+        } catch (e: Throwable) {
+            println("[Pipeline] Error during pipeline: ${e.message}")
+            e.printStackTrace()
+            onMessage("[Pipeline] Ошибка при выполнении пайплайна: ${e.message ?: "см. логи"}")
+        }
+    }
+
     suspend fun requestGithubPrSummaryFromLlm(prs: List<McpPullRequest>): String {
         if (prs.isEmpty()) {
             return "Сейчас нет открытых PR — все задачи закрыты 👍"
@@ -871,6 +1061,39 @@ private fun DesktopChatApp() {
         }
     }
 
+    fun handlePipelineCommand(text: String): Boolean {
+        val trimmed = text.trim()
+        if (!trimmed.startsWith("/pipeline")) return false
+
+        val payload = trimmed.removePrefix("/pipeline").trim()
+        val mode = when {
+            payload.equals("prs", ignoreCase = true) -> PipelineMode.AllOpenPrs
+            payload.startsWith("pr", ignoreCase = true) -> {
+                val number = payload.removePrefix("pr").trim().toIntOrNull()
+                number?.let { PipelineMode.SinglePr(it) }
+            }
+
+            else -> null
+        }
+
+        if (mode == null) {
+            addSystemMessage("Некорректный формат команды /pipeline. Используй /pipeline prs или /pipeline pr <номер>.")
+            return true
+        }
+
+        scope.launch {
+            isSending = true
+            try {
+                runPrSummaryPipeline(mode) { message ->
+                    addSystemMessage(message)
+                }
+            } finally {
+                isSending = false
+            }
+        }
+        return true
+    }
+
     fun handleMcpCommand(text: String): Boolean {
         val trimmed = text.trim()
         val lower = trimmed.lowercase()
@@ -924,6 +1147,11 @@ private fun DesktopChatApp() {
     fun sendMessage() {
         val text = input.trim()
         if (text.isEmpty() || isSending) return
+
+        if (handlePipelineCommand(text)) {
+            input = ""
+            return
+        }
 
         if (handleMcpCommand(text)) {
             input = ""
