@@ -13,6 +13,8 @@ import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonObject
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import java.io.BufferedReader
 import java.io.BufferedWriter
 
@@ -21,6 +23,10 @@ import java.io.BufferedWriter
  */
 data class McpServerConfig(
     val command: List<String>,
+)
+
+data class SaveSummaryResult(
+    val filePath: String
 )
 
 class McpConnection private constructor(
@@ -109,6 +115,51 @@ class McpConnection private constructor(
             System.err.println("❌ [MCP-CLIENT] Failed to decode response: ${e.message}")
             throw e
         }
+    }
+
+    suspend fun callSaveSummary(
+        fileName: String,
+        content: String
+    ): SaveSummaryResult {
+        println("📁 [MCP-CLIENT] Calling fs.save_summary with fileName=$fileName")
+        val response = sendRequest(
+            method = "tools/call",
+            params = buildJsonObject {
+                put("name", JsonPrimitive("fs.save_summary"))
+                putJsonObject("arguments") {
+                    put("fileName", JsonPrimitive(fileName))
+                    put("content", JsonPrimitive(content))
+                }
+            }
+        )
+
+        response.error?.let { error ->
+            throw McpGithubClientException(
+                message = "MCP error for fs.save_summary: ${error.message}",
+                isConnectionError = false
+            )
+        }
+
+        val structuredContent = response.result
+            ?.jsonObject
+            ?.get("structuredContent")
+            ?.jsonObject
+            ?: response.result?.jsonObject
+
+        val filePath = structuredContent
+            ?.get("filePath")
+            ?.jsonPrimitive
+            ?.content
+
+        if (filePath == null) {
+            throw McpGithubClientException(
+                message = "Unexpected MCP result for fs.save_summary: structuredContent.filePath is missing",
+                isConnectionError = false
+            )
+        }
+
+        println("📁 [MCP-CLIENT] fs.save_summary -> filePath=$filePath")
+        return SaveSummaryResult(filePath)
     }
 
     fun close() {
