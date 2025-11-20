@@ -56,6 +56,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Window
 import androidx.compose.ui.window.application
 import com.bigdotdev.aospbugreportanalyzer.mcp.McpPullRequest
+import com.bigdotdev.aospbugreportanalyzer.mcp.withMcpFsClient
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -75,6 +76,8 @@ import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.util.Locale
+import java.text.SimpleDateFormat
+import java.util.Date
 import java.util.UUID
 import com.bigdotdev.aospbugreportanalyzer.mcp.McpGithubClientException
 import com.bigdotdev.aospbugreportanalyzer.mcp.withMcpGithubClient
@@ -158,6 +161,11 @@ private sealed class OpenRouterResult {
     data class Failure(
         val error: OpenRouterError
     ) : OpenRouterResult()
+}
+
+private sealed class PipelineMode {
+    object AllOpenPrs : PipelineMode()
+    data class SinglePr(val number: Int) : PipelineMode()
 }
 
 private fun CallStats.toMsgMetrics(): MsgMetrics =
@@ -871,6 +879,193 @@ private fun DesktopChatApp() {
         }
     }
 
+    fun handlePipelineCommand(raw: String): Boolean {
+        val trimmed = raw.trim()
+        if (!trimmed.startsWith("/pipeline")) return false
+
+        val tokens = trimmed.split("\\s+".toRegex()).filter { it.isNotBlank() }
+        val mode = when {
+            tokens.size == 2 && tokens[1].equals("prs", ignoreCase = true) -> PipelineMode.AllOpenPrs
+            tokens.size == 3 && tokens[1].equals("pr", ignoreCase = true) -> tokens[2].toIntOrNull()
+                ?.let { PipelineMode.SinglePr(it) }
+
+            else -> null
+        }
+
+        if (mode == null) {
+            addSystemMessage("Неверный формат команды. Используйте:\n/pipeline prs\n/pipeline pr <номер>")
+            return true
+        }
+
+        scope.launch {
+            isSending = true
+            addSystemMessage("Запускаю пайплайн summary по PR через MCP и LLM (режим: $mode)...")
+            try {
+                runPrSummaryPipeline(mode)
+            } catch (t: Throwable) {
+                println("[Pipeline] MCP/LLM error: ${t.message}")
+                t.printStackTrace()
+                addSystemMessage("Pipeline: ошибка: ${t.message ?: t.toString()}")
+            } finally {
+                isSending = false
+            }
+        }
+
+        return true
+    }
+
+    suspend fun runPrSummaryPipeline(mode: PipelineMode) {
+        println("[Pipeline] starting summary pipeline: mode=$mode")
+        val maxPrs = 5
+        val shouldLoadDiff = mode is PipelineMode.SinglePr
+        val prData = try {
+            withContext(Dispatchers.IO) {
+                withMcpGithubClient { client ->
+                    val pullRequests = when (mode) {
+                        PipelineMode.AllOpenPrs -> client.listPullRequests(state = "open").take(maxPrs)
+                        is PipelineMode.SinglePr -> {
+                            val prs = client.listPullRequests(state = "open")
+                            prs.filter { it.number == mode.number }
+                        }
+                    }
+
+                    if (mode is PipelineMode.SinglePr && pullRequests.isEmpty()) {
+                        throw IllegalStateException("PR #${mode.number} не найден среди открытых PR.")
+                    }
+
+                    pullRequests.map { pr ->
+                        val diff = if (shouldLoadDiff) {
+                            runCatching { client.getPrDiff(number = pr.number) }
+                                .onFailure {
+                                    println("[Pipeline] Failed to load diff for PR #${pr.number}: ${it.message}")
+                                    it.printStackTrace()
+                                    addSystemMessage("Pipeline: не удалось получить diff для PR #${pr.number}: ${it.message}")
+                                }
+                                .getOrNull()
+                        } else {
+                            null
+                        }
+                        pr to diff
+                    }
+                }
+            }
+        } catch (e: McpGithubClientException) {
+            println("[Pipeline] MCP error while loading PR data: ${e.message}")
+            e.printStackTrace()
+            addSystemMessage("Pipeline: ошибка получения данных из MCP GitHub: ${e.message}")
+            return
+        }
+
+        if (prData.isEmpty()) {
+            addSystemMessage("Pipeline: открытых PR не найдено.")
+            return
+        }
+
+        println("[Pipeline] loaded ${prData.size} PR(s) from MCP")
+        addSystemMessage("Pipeline: получено ${prData.size} PR через MCP GitHub.")
+
+        val maxDiffChars = 4000
+        val context = buildString {
+            appendLine("Вот список PR в репозитории aas-aosp-dev/AOSPBugreportAnalyzer.")
+            appendLine("Всего PR: ${prData.size}")
+            prData.forEach { (pr, diff) ->
+                appendLine()
+                appendLine("PR #${pr.number} — \"${pr.title}\"")
+                appendLine("URL: ${pr.url}")
+                appendLine("Состояние: ${pr.state}")
+                if (!diff.isNullOrBlank()) {
+                    val trimmedDiff = if (diff.length > maxDiffChars) {
+                        diff.take(maxDiffChars) + "\n\n... [обрезано]"
+                    } else {
+                        diff
+                    }
+                    appendLine("DIFF:")
+                    appendLine("```diff")
+                    appendLine(trimmedDiff)
+                    appendLine("```")
+                }
+            }
+        }
+
+        println("[Pipeline] sending PR list to LLM for summary")
+        val summaryText = try {
+            requestPipelinePrSummaryFromLlm(context)
+        } catch (t: Throwable) {
+            println("[Pipeline] Failed to get summary from LLM: ${t.message}")
+            t.printStackTrace()
+            addSystemMessage("Pipeline: не удалось получить summary от LLM: ${t.message}")
+            return
+        }
+
+        val fileName = when (mode) {
+            PipelineMode.AllOpenPrs -> {
+                val timestamp = SimpleDateFormat("yyyyMMdd-HHmmss").format(Date())
+                "prs-open-summary-$timestamp.md"
+            }
+
+            is PipelineMode.SinglePr -> "pr-${mode.number}-summary.md"
+        }
+
+        val saveResult = try {
+            withContext(Dispatchers.IO) {
+                withMcpFsClient { conn ->
+                    conn.callSaveSummary(
+                        fileName = fileName,
+                        content = summaryText
+                    )
+                }
+            }
+        } catch (t: Throwable) {
+            println("[Pipeline] Failed to save summary via MCP fs.save_summary: ${t.message}")
+            t.printStackTrace()
+            addSystemMessage("Pipeline: не удалось сохранить summary через MCP: ${t.message}")
+            return
+        }
+
+        println("[Pipeline] Summary saved to ${saveResult.filePath}")
+        addAssistantMessage(
+            "Готово! Я сделал summary по PR и сохранил файл.\n\n" +
+                "Путь к файлу:\n`${saveResult.filePath}`\n\n" +
+                "Краткое summary:\n$summaryText"
+        )
+    }
+
+    suspend fun requestPipelinePrSummaryFromLlm(context: String): String {
+        val apiKey = settings.openRouterApiKey.takeIf { it.isNotBlank() } ?: OpenRouterConfig.apiKey
+        val messages = listOf(
+            ORMessage(
+                "system",
+                "Ты помощник-разработчика. Твоя задача — по данным о pull request'ах в GitHub подготовить короткий, структурированный отчёт в формате Markdown.\n\n" +
+                        "Обязательно:\n" +
+                        "- укажи сколько PR;\n" +
+                        "- для каждого — кратко суть изменений;\n" +
+                        "- отметь возможные риски или TODO для ревью;\n" +
+                        "- пиши на русском."
+            ),
+            ORMessage("user", context)
+        )
+        val result = withContext(Dispatchers.IO) {
+            callOpenRouter(
+                model = settings.openRouterModel,
+                messages = messages,
+                forceJson = false,
+                apiKeyOverride = apiKey,
+                temperature = 0.2
+            )
+        }
+
+        return when (result) {
+            is OpenRouterResult.Success -> result.content.ifBlank {
+                throw IllegalStateException("LLM вернул пустой ответ на запрос summary.")
+            }
+
+            is OpenRouterResult.Failure -> {
+                val message = result.error.message ?: result.error.rawBody ?: "неизвестная ошибка"
+                throw IllegalStateException(message)
+            }
+        }
+    }
+
     fun handleMcpCommand(text: String): Boolean {
         val trimmed = text.trim()
         val lower = trimmed.lowercase()
@@ -921,11 +1116,71 @@ private fun DesktopChatApp() {
         return false
     }
 
+    fun mapUserTextToPipelineCommand(input: String): String? {
+        val text = input.lowercase().trim()
+        println("[Pipeline-NL] raw='$input', normalized='$text'")
+
+        val triggersAll = listOf(
+            "обзор pr",
+            "обзор по pr",
+            "сводку по pr",
+            "summary по pr",
+            "сводка по открытым pr",
+            "обзор открытых pr",
+            "отчёт по pr",
+            "сделай сводку по открытым pr"
+        )
+
+        if (
+            triggersAll.any { text.contains(it) } &&
+            !Regex("""pr\s*\d+""").containsMatchIn(text)
+        ) {
+            val cmd = "/pipeline prs"
+            println("[Pipeline-NL] matched 'all PRs' trigger => $cmd")
+            return cmd
+        }
+
+        val prRegex = Regex("""pr\s*(\d+)""")
+        val match = prRegex.find(text)
+        if (match != null) {
+            val number = match.groupValues[1]
+            val summaryTriggers = listOf("обзор", "summary", "сводк", "отчёт")
+            val mentionsDiff = text.contains("diff") || text.contains("дифф")
+            if (!mentionsDiff && summaryTriggers.any { text.contains(it) }) {
+                val cmd = "/pipeline pr $number"
+                println("[Pipeline-NL] matched 'single PR' trigger => $cmd")
+                return cmd
+            }
+        }
+
+        println("[Pipeline-NL] no pipeline match")
+        return null
+    }
+
     fun sendMessage() {
         val text = input.trim()
         if (text.isEmpty() || isSending) return
 
+        val normalized = text.lowercase().trim()
+        println("[Pipeline-NL] raw='$text', normalized='$normalized'")
+
+        val pipelineCommand = mapUserTextToPipelineCommand(text)
+        if (pipelineCommand != null && handlePipelineCommand(pipelineCommand)) {
+            println("[Pipeline] handled via NLP trigger: '$text' -> '$pipelineCommand'")
+            input = ""
+            return
+        }
+
+        if (handlePipelineCommand(text)) {
+            println("[Pipeline] handled via explicit command: '$text'")
+            input = ""
+            return
+        }
+
+        println("[Pipeline-NL] no pipeline match")
+
         if (handleMcpCommand(text)) {
+            println("[MCP] handled via explicit MCP command: '$text'")
             input = ""
             return
         }

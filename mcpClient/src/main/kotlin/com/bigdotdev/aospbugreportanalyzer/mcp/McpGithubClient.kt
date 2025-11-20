@@ -41,23 +41,54 @@ class McpGithubClientException(
 suspend fun <T> withMcpGithubClient(
     block: suspend (McpGithubClient) -> T
 ): T {
-    val json = Json {
-        ignoreUnknownKeys = true
-        encodeDefaults = true
-        prettyPrint = false
+    println("[MCP-CLIENT] withMcpGithubClient: starting connection...")
+    val json = defaultMcpJson()
+    val connection = startMcpConnection(json, setOf("github.list_pull_requests", "github.get_pr_diff"))
+    try {
+        val client = McpGithubClientImpl(connection)
+        val result = block(client)
+        println("[MCP-CLIENT] withMcpGithubClient: completed successfully")
+        return result
+    } finally {
+        connection.close()
     }
+}
 
-    val config = McpServerConfig(
-        command = listOf(
-            "npx",
-            "tsx",
-            "/Users/artem/work/projects/kmp/AOSPBugreportAnalyzerMCPServer/src/server.ts"
-        )
+suspend fun withMcpFsClient(
+    block: suspend (McpConnection) -> SaveSummaryResult
+): SaveSummaryResult {
+    val json = defaultMcpJson()
+    val connection = startMcpConnection(json, setOf("fs.save_summary"))
+    try {
+        return block(connection)
+    } finally {
+        connection.close()
+    }
+}
+
+private fun defaultMcpJson(): Json = Json {
+    ignoreUnknownKeys = true
+    encodeDefaults = true
+    prettyPrint = false
+}
+
+private fun defaultMcpConfig(): McpServerConfig = McpServerConfig(
+    command = listOf(
+        "npx",
+        "tsx",
+        "/Users/artem/work/projects/kmp/AOSPBugreportAnalyzerMCPServer/src/server.ts"
     )
+)
 
+private suspend fun startMcpConnection(
+    json: Json,
+    requiredTools: Set<String>
+): McpConnection {
+    val config = defaultMcpConfig()
     val connection = try {
         McpConnection.start(config, json)
     } catch (t: Throwable) {
+        println("[MCP-CLIENT] Failed to start MCP connection: ${t.message}")
         throw McpGithubClientException(
             message = t.message ?: "Failed to start MCP server",
             isConnectionError = true,
@@ -67,6 +98,7 @@ suspend fun <T> withMcpGithubClient(
 
     try {
         val initializeResponse = connection.initialize()
+        println("[MCP-CLIENT] initialize() response: $initializeResponse")
         initializeResponse.error?.let { error ->
             throw McpGithubClientException(
                 message = "MCP initialize failed: ${error.message}",
@@ -78,6 +110,7 @@ suspend fun <T> withMcpGithubClient(
             method = "tools/list",
             params = buildJsonObject { }
         )
+        println("[MCP-CLIENT] tools/list response: $toolsListResponse")
 
         toolsListResponse.error?.let { error ->
             throw McpGithubClientException(
@@ -94,7 +127,6 @@ suspend fun <T> withMcpGithubClient(
             ?.toSet()
             ?: emptySet()
 
-        val requiredTools = setOf("github.list_pull_requests", "github.get_pr_diff")
         val missingTools = requiredTools - availableTools
         if (missingTools.isNotEmpty()) {
             throw McpGithubClientException(
@@ -103,10 +135,13 @@ suspend fun <T> withMcpGithubClient(
             )
         }
 
-        val client = McpGithubClientImpl(connection)
-        return block(client)
-    } finally {
+        println("[MCP-CLIENT] startMcpConnection: all required tools available: ${availableTools.joinToString()}")
+
+        return connection
+    } catch (t: Throwable) {
+        println("[MCP-CLIENT] startMcpConnection failed: ${t.message}")
         connection.close()
+        throw t
     }
 }
 
@@ -130,6 +165,7 @@ private class McpGithubClientImpl(
             }
         )
         response.error?.let { error ->
+            println("[MCP-CLIENT] tools/call error for github.list_pull_requests: code=${error.code}, message=${error.message}, data=${error.data}")
             throw McpGithubClientException(
                 message = "MCP error for github.list_pull_requests: ${error.message}",
                 isConnectionError = false
@@ -183,6 +219,7 @@ private class McpGithubClientImpl(
             }
         )
         response.error?.let { error ->
+            println("[MCP-CLIENT] tools/call error for github.get_pr_diff: code=${error.code}, message=${error.message}, data=${error.data}")
             throw McpGithubClientException(
                 message = "MCP error for github.get_pr_diff: ${error.message}",
                 isConnectionError = false
