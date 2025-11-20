@@ -879,7 +879,7 @@ private fun DesktopChatApp() {
         }
     }
 
-    private fun handlePipelineCommand(raw: String): Boolean {
+    fun handlePipelineCommand(raw: String): Boolean {
         val trimmed = raw.trim()
         if (!trimmed.startsWith("/pipeline")) return false
 
@@ -912,7 +912,7 @@ private fun DesktopChatApp() {
         return true
     }
 
-    private suspend fun runPrSummaryPipeline(mode: PipelineMode) {
+    suspend fun runPrSummaryPipeline(mode: PipelineMode) {
         val maxPrs = 5
         val shouldLoadDiff = mode is PipelineMode.SinglePr
         val prData = withContext(Dispatchers.IO) {
@@ -975,7 +975,7 @@ private fun DesktopChatApp() {
         }
 
         val summaryText = try {
-            requestGithubPrSummaryFromLlm(context)
+            requestPipelinePrSummaryFromLlm(context)
         } catch (t: Throwable) {
             println("[Pipeline] Failed to get summary from LLM: ${t.message}")
             addSystemMessage("Pipeline: не удалось получить summary от LLM: ${t.message}")
@@ -1008,7 +1008,7 @@ private fun DesktopChatApp() {
         )
     }
 
-    private suspend fun requestGithubPrSummaryFromLlm(context: String): String {
+    suspend fun requestPipelinePrSummaryFromLlm(context: String): String {
         val apiKey = settings.openRouterApiKey.takeIf { it.isNotBlank() } ?: OpenRouterConfig.apiKey
         val messages = listOf(
             ORMessage(
@@ -1094,7 +1094,7 @@ private fun DesktopChatApp() {
         return false
     }
 
-    private fun mapUserTextToPipelineCommand(input: String): String? {
+    fun mapUserTextToPipelineCommand(input: String): String? {
         val text = input.lowercase().trim()
 
         val triggersAll = listOf(
