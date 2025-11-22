@@ -789,6 +789,41 @@ private fun DesktopChatApp() {
         }
     }
 
+    /**
+     * Определяет, как получить путь к текстовому багрепорту:
+     * - если bugreportPath указывает на zip — достаём самый большой .txt из архива;
+     * - иначе — считаем, что это уже текстовый файл и просто возвращаем bugreportPath.
+     *
+     * В случае проблем с zip кидает BugreportExtractionException.
+     */
+    private suspend fun resolveBugreportTextFilePath(bugreportPath: String): String {
+        val file = File(bugreportPath)
+        val ext = file.extension.lowercase(Locale.getDefault())
+
+        return if (ext == "zip") {
+            println("[BugreportExtractor] Treating bugreport as ZIP archive: $bugreportPath")
+            val extractedContent = extractLargestTxtFromBugreportZip(bugreportPath)
+            withContext(Dispatchers.IO) {
+                try {
+                    val tempFile = File.createTempFile("bugreport-", ".txt")
+                    tempFile.writeText(extractedContent)
+                    tempFile.absolutePath
+                } catch (t: Throwable) {
+                    throw BugreportExtractionException(
+                        "Не удалось подготовить bugreport из архива: $bugreportPath",
+                        t
+                    )
+                }
+            }
+        } else {
+            println("[BugreportExtractor] Treating bugreport as plain text file: $bugreportPath")
+            if (!file.exists()) {
+                throw BugreportExtractionException("Bugreport file not found: $bugreportPath")
+            }
+            bugreportPath
+        }
+    }
+
     suspend fun runBugreportPipeline( mode: BugreportPipelineMode,  onMessage: (String) -> Unit ) {
         onMessage("[Pipeline] Стартую пайплайн ADB → LLM → файл (режим: $mode)")
 
@@ -807,13 +842,15 @@ private fun DesktopChatApp() {
         val bugreportPath = bugreportResult.filePath
         onMessage("[Pipeline] Bugreport сохранён в файле: $bugreportPath")
 
-        val bugreportRaw = try {
-            extractLargestTxtFromBugreportZip(bugreportPath)
+        val textFilePath = try {
+            resolveBugreportTextFilePath(bugreportPath)
         } catch (e: BugreportExtractionException) {
-            onMessage(e.message ?: "Не удалось извлечь .txt из bugreport.zip. Убедись, что это стандартный Android bugreport.")
+            println("[BugreportExtractor] Failed to prepare bugreport text file: ${e.message}")
+            onMessage(e.message ?: "Не удалось подготовить bugreport из файла: $bugreportPath")
             return
         }
-        println("[Orchestrator] Using extracted .txt file for bugreport analysis")
+        val bugreportRaw = File(textFilePath).readText()
+        println("[Orchestrator] Using bugreport text file for analysis: $textFilePath")
         onMessage("Готово! Нашёл bugreport.txt в архиве и отправил в анализ.")
 
         val bugreportForPrompt = bugreportRaw.take(MAX_BUGREPORT_CHARS_FOR_LLM)
@@ -1358,14 +1395,16 @@ private fun DesktopChatApp() {
                     val bugreportPath = bugreportResult.filePath
                     println("[Orchestration] Bugreport file path: $bugreportPath")
 
-                    val bugreportRaw = try {
-                        extractLargestTxtFromBugreportZip(bugreportPath)
+                    val textFilePath = try {
+                        resolveBugreportTextFilePath(bugreportPath)
                     } catch (e: BugreportExtractionException) {
-                        addSystemMessage(e.message ?: "Не удалось извлечь .txt из bugreport.zip. Убедись, что это стандартный Android bugreport.")
+                        println("[BugreportExtractor] Failed to prepare bugreport text file in /orchestrate bugreport: ${e.message}")
+                        addSystemMessage(e.message ?: "Не удалось подготовить bugreport из файла: $bugreportPath")
                         return@launch
                     }
-                    println("[Orchestrator] Using extracted .txt file for bugreport analysis")
-                    addSystemMessage("Готово! Нашёл bugreport.txt в архиве и отправил в анализ.")
+                    val bugreportRaw = File(textFilePath).readText()
+                    println("[Orchestrator] Using bugreport text file for /orchestrate bugreport: $textFilePath")
+                    addSystemMessage("Готово! Нашёл текстовый bugreport и отправил в анализ.\nФайл: $textFilePath")
 
                     val bugreportForPrompt = bugreportRaw.take(MAX_BUGREPORT_CHARS_FOR_LLM)
                     val isTruncated = bugreportRaw.length > MAX_BUGREPORT_CHARS_FOR_LLM
