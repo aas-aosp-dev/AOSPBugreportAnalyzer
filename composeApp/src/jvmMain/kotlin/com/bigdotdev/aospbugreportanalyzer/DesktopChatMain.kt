@@ -111,7 +111,7 @@ private sealed class BugreportPipelineMode {
 
 private const val MESSAGES_PER_SUMMARY = 10
 private const val MAX_RECENT_MESSAGES = 8
-private const val MAX_BUGREPORT_CHARS_FOR_LLM = 12_000
+private const val MAX_BUGREPORT_PROMPT_CHARS = 200_000
 
 private data class MsgMetrics(
     val promptTokens: Int?,
@@ -849,23 +849,35 @@ private fun DesktopChatApp() {
             onMessage(e.message ?: "Не удалось подготовить bugreport из файла: $bugreportPath")
             return
         }
-        val bugreportRaw = File(textFilePath).readText()
+        val bugreportRaw = try {
+            withContext(Dispatchers.IO) { File(textFilePath).readText() }
+        } catch (t: Throwable) {
+            println("[Orchestrator] Failed to read bugreport text: ${t.message}")
+            onMessage("Не удалось прочитать текст bugreport из файла `$textFilePath`. Проверь, что файл существует и доступен.")
+            return
+        }
         println("[Orchestrator] Using bugreport text file for analysis: $textFilePath")
-        onMessage("Готово! Нашёл bugreport.txt в архиве и отправил в анализ.")
 
-        val bugreportForPrompt = bugreportRaw.take(MAX_BUGREPORT_CHARS_FOR_LLM)
-        val isTruncated = bugreportRaw.length > MAX_BUGREPORT_CHARS_FOR_LLM
+        val normalizedBugreportText = bugreportRaw.take(MAX_BUGREPORT_PROMPT_CHARS)
+        val isTruncated = bugreportRaw.length > MAX_BUGREPORT_PROMPT_CHARS
+        println(
+            "[Orchestrator] Loaded bugreport text from $textFilePath, length=${bugreportRaw.length}, used=${normalizedBugreportText.length}"
+        )
+        val preview = normalizedBugreportText.replace("\\s+".toRegex(), " ").take(200)
+        println("[Orchestrator] Bugreport text preview: $preview")
+
+        onMessage("Готово! Нашёл bugreport.txt в архиве и отправил в анализ.")
 
         val systemPrompt = BUGREPORT_SYSTEM_PROMPT
 
         val userPrompt = buildString {
+            appendLine("Ниже полный текст bugreport (обрезан до $MAX_BUGREPORT_PROMPT_CHARS символов, если он слишком большой):")
+            appendLine()
             if (isTruncated) {
-                appendLine("Текст bugreport усечён до ${MAX_BUGREPORT_CHARS_FOR_LLM} символов.")
+                appendLine("Текст bugreport усечён до $MAX_BUGREPORT_PROMPT_CHARS символов.")
                 appendLine()
             }
-            appendLine("Вот содержимое bugreport (может быть усечено):")
-            appendLine()
-            appendLine(bugreportForPrompt)
+            appendLine(normalizedBugreportText)
         }
 
         val apiKey = settings.openRouterApiKey.takeIf { it.isNotBlank() } ?: OpenRouterConfig.apiKey
@@ -896,6 +908,8 @@ private fun DesktopChatApp() {
                 return
             }
         }
+
+        println("[Orchestrator] Bugreport summary generated, length=${summaryText.length}")
 
         onMessage("[Pipeline] LLM сгенерировал summary, сохраняю в файл через MCP...")
 
@@ -1402,12 +1416,22 @@ private fun DesktopChatApp() {
                         addSystemMessage(e.message ?: "Не удалось подготовить bugreport из файла: $bugreportPath")
                         return@launch
                     }
-                    val bugreportRaw = File(textFilePath).readText()
+                    val bugreportRaw = try {
+                        withContext(Dispatchers.IO) { File(textFilePath).readText() }
+                    } catch (t: Throwable) {
+                        println("[Orchestrator] Failed to read bugreport text: ${t.message}")
+                        addSystemMessage("Не удалось прочитать текст bugreport из файла `$textFilePath`. Проверь, что файл существует и доступен.")
+                        return@launch
+                    }
                     println("[Orchestrator] Using bugreport text file for /orchestrate bugreport: $textFilePath")
+                    val normalizedBugreportText = bugreportRaw.take(MAX_BUGREPORT_PROMPT_CHARS)
+                    val isTruncated = bugreportRaw.length > MAX_BUGREPORT_PROMPT_CHARS
+                    println(
+                        "[Orchestrator] Loaded bugreport text from $textFilePath, length=${bugreportRaw.length}, used=${normalizedBugreportText.length}"
+                    )
+                    val preview = normalizedBugreportText.replace("\\s+".toRegex(), " ").take(200)
+                    println("[Orchestrator] Bugreport text preview: $preview")
                     addSystemMessage("Готово! Нашёл текстовый bugreport и отправил в анализ.\nФайл: $textFilePath")
-
-                    val bugreportForPrompt = bugreportRaw.take(MAX_BUGREPORT_CHARS_FOR_LLM)
-                    val isTruncated = bugreportRaw.length > MAX_BUGREPORT_CHARS_FOR_LLM
 
                     val apiKey = settings.openRouterApiKey.takeIf { it.isNotBlank() } ?: OpenRouterConfig.apiKey
                     if (apiKey.isNullOrBlank()) {
@@ -1416,13 +1440,13 @@ private fun DesktopChatApp() {
                     }
 
                     val userPrompt = buildString {
+                        appendLine("Ниже полный текст bugreport (обрезан до $MAX_BUGREPORT_PROMPT_CHARS символов, если он слишком большой):")
+                        appendLine()
                         if (isTruncated) {
-                            appendLine("Текст bugreport усечён до ${MAX_BUGREPORT_CHARS_FOR_LLM} символов.")
+                            appendLine("Текст bugreport усечён до $MAX_BUGREPORT_PROMPT_CHARS символов.")
                             appendLine()
                         }
-                        appendLine("Вот содержимое bugreport (может быть усечено):")
-                        appendLine()
-                        appendLine(bugreportForPrompt)
+                        appendLine(normalizedBugreportText)
                     }
 
                     val llmResult = withContext(Dispatchers.IO) {
@@ -1440,12 +1464,14 @@ private fun DesktopChatApp() {
 
                     when (llmResult) {
                         is OpenRouterResult.Success -> {
+                            val summaryText = llmResult.content
+                            println("[Orchestrator] Bugreport summary generated, length=${summaryText.length}")
                             addSystemMessage("[Orchestration] Анализ проведён. Использован текстовый bugreport.")
                             addAssistantMessage(
                                 buildString {
                                     appendLine("Готово! Нашёл bugreport.txt в архиве и отправил в анализ.")
                                     appendLine()
-                                    appendLine(llmResult.content)
+                                    appendLine(summaryText)
                                 }
                             )
                         }
