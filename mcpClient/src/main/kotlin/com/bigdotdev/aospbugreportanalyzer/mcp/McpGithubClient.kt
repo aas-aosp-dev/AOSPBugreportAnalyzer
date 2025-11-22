@@ -58,16 +58,15 @@ suspend fun <T> withMcpGithubClient(
         prettyPrint = false
     }
 
-    val config = McpServerConfig(
-        command = listOf(
-            "npx",
-            "tsx",
-            "/Users/artem/work/projects/kmp/AOSPBugreportAnalyzerMCPServer/src/server.ts"
-        )
+    val command = resolveCommand(
+        envVarName = "MCP_GITHUB_SERVER_COMMAND",
+        defaultCommand = defaultGithubServerCommand(),
+        logTag = "MCP-GITHUB-CLIENT"
     )
+    val config = McpServerConfig(command)
 
     val connection = try {
-        McpConnection.start(config, json)
+        McpConnection.start(config, json, logTag = "MCP-GITHUB-CLIENT")
     } catch (t: Throwable) {
         throw McpGithubClientException(
             message = t.message ?: "Failed to start MCP server",
@@ -280,6 +279,3 @@ private class McpGithubClientImpl(
         }
     }
 }
-
-private fun JsonObject.unwrapStructuredContent(): JsonObject =
-    this["structuredContent"]?.jsonObject ?: this

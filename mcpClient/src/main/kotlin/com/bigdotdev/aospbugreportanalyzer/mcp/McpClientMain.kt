@@ -23,13 +23,14 @@ fun main() = runBlocking {
     }
 
     val config = McpServerConfig(
-        command = listOf(
-            "npx", "tsx",
-            "/Users/artem/work/projects/kmp/AOSPBugreportAnalyzerMCPServer/src/server.ts"
+        command = resolveCommand(
+            envVarName = "MCP_GITHUB_SERVER_COMMAND",
+            defaultCommand = defaultGithubServerCommand(),
+            logTag = "MCP-CLIENT-DEMO"
         )
     )
 
-    val connection = McpConnection.start(config, json)
+    val connection = McpConnection.start(config, json, logTag = "MCP-CLIENT-DEMO")
     try {
         println("📡 [MCP-CLIENT] Sending initialize...")
         val initializeResponse = connection.initialize()
