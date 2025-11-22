@@ -34,17 +34,21 @@ class McpConnection private constructor(
     private var lastId = 0
 
     companion object {
-        fun start(config: McpServerConfig, json: Json): McpConnection {
+        fun start(
+            config: McpServerConfig,
+            json: Json,
+            logTag: String = "MCP-CLIENT"
+        ): McpConnection {
             require(config.command.isNotEmpty()) { "MCP server command must not be empty" }
             val command = config.command.first()
             val args = config.command.drop(1)
             val argsSuffix = if (args.isEmpty()) "" else " ${args.joinToString(" ")}" 
-            println("🔧 [MCP-CLIENT] Starting MCP server process: $command$argsSuffix")
+            println("🔧 [$logTag] Starting MCP server process: $command$argsSuffix")
             val process = ProcessBuilder(config.command)
                 .redirectError(ProcessBuilder.Redirect.INHERIT)
                 .start()
 
-            println("🔧 [MCP-CLIENT] MCP server PID: ${process.pid()}")
+            println("🔧 [$logTag] MCP server PID: ${process.pid()}")
 
             val input = process.inputStream.bufferedReader()
             val output = process.outputStream.bufferedWriter()

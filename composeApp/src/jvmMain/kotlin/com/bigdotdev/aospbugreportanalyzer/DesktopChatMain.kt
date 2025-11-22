@@ -56,6 +56,9 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Window
 import androidx.compose.ui.window.application
 import com.bigdotdev.aospbugreportanalyzer.mcp.McpPullRequest
+import com.bigdotdev.aospbugreportanalyzer.mcp.adbGetBugreport
+import com.bigdotdev.aospbugreportanalyzer.mcp.adbListDevices
+import com.bigdotdev.aospbugreportanalyzer.mcp.withMcpAdbClient
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -70,6 +73,7 @@ import java.net.URI
 import java.net.http.HttpClient
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
+import java.io.File
 import java.time.Duration
 import java.time.Instant
 import java.time.ZoneId
@@ -100,8 +104,13 @@ sealed class PipelineMode {
     data class SinglePr(val number: Int) : PipelineMode()
 }
 
+private sealed class BugreportPipelineMode {
+    data class SingleDevice(val serial: String) : BugreportPipelineMode()
+}
+
 private const val MESSAGES_PER_SUMMARY = 10
 private const val MAX_RECENT_MESSAGES = 8
+private const val MAX_BUGREPORT_CHARS_FOR_LLM = 12_000
 
 private data class MsgMetrics(
     val promptTokens: Int?,
@@ -200,6 +209,15 @@ You are an AOSP bugreport Expert. Keep answers short, actionable, and plain text
 private val SYSTEM_JSON = """
 You are an AOSP bugreport Expert. Keep answers short and actionable.
 Return ONLY valid JSON (UTF-8) with keys: version, ok, generated_at, items, error.
+""".trimIndent()
+
+private val BUGREPORT_SYSTEM_PROMPT = """
+Ты ассистент, который анализирует Android bugreport и делает техническое summary для разработчика.
+Формат ответа — Markdown.
+Обязательно выделяй:
+- ключевые проблемы и ошибки;
+- возможные проблемы с памятью, ANR, перформансом;
+- рекомендации по дальнейшей диагностике.
 """.trimIndent()
 
 private val SUMMARY_SYSTEM_PROMPT = """
@@ -728,6 +746,39 @@ private fun DesktopChatApp() {
         )
     }
 
+    fun handleBugreportPipelineCommand(text: String): Boolean {
+        val trimmed = text.trim()
+        if (!trimmed.startsWith("/orchestrate", ignoreCase = true)) return false
+
+        val payload = trimmed.removePrefix("/orchestrate").trim()
+        if (!payload.startsWith("bugreport", ignoreCase = true)) {
+            addSystemMessage("Некорректный формат команды /orchestrate. Используй: /orchestrate bugreport <serial>.")
+            return true
+        }
+
+        val serial = payload.removePrefix("bugreport").trim()
+        if (serial.isBlank()) {
+            addSystemMessage("Укажи serial устройства: /orchestrate bugreport <serial>")
+            return true
+        }
+
+        scope.launch {
+            isSending = true
+            try {
+                runBugreportPipeline(BugreportPipelineMode.SingleDevice(serial)) { message ->
+                    addSystemMessage(message)
+                }
+            } catch (t: Throwable) {
+                t.printStackTrace()
+                addSystemMessage("[Pipeline] Ошибка пайплайна bugreport: ${t.message ?: "см. логи"}")
+            } finally {
+                isSending = false
+            }
+        }
+
+        return true
+    }
+
     suspend fun runPrSummaryPipeline(
         mode: PipelineMode,
         onMessage: (String) -> Unit
@@ -913,6 +964,110 @@ private fun DesktopChatApp() {
         }
     }
 
+    private suspend fun runBugreportPipeline(
+        mode: BugreportPipelineMode,
+        onMessage: (String) -> Unit
+    ) {
+        onMessage("[Pipeline] Стартую пайплайн ADB → LLM → файл (режим: $mode)")
+
+        val serial = when (mode) {
+            is BugreportPipelineMode.SingleDevice -> mode.serial
+        }
+
+        onMessage("[Pipeline] Снимаю bugreport с устройства $serial через MCP ADB...")
+
+        val bugreportResult = withContext(Dispatchers.IO) {
+            withMcpAdbClient { conn ->
+                conn.adbGetBugreport(serial)
+            }
+        }
+
+        val bugreportPath = bugreportResult.filePath
+        onMessage("[Pipeline] Bugreport сохранён в файле: $bugreportPath")
+
+        val bugreportRaw = withContext(Dispatchers.IO) { File(bugreportPath).readText() }
+        val bugreportForPrompt = bugreportRaw.take(MAX_BUGREPORT_CHARS_FOR_LLM)
+        val isTruncated = bugreportRaw.length > MAX_BUGREPORT_CHARS_FOR_LLM
+
+        val systemPrompt = BUGREPORT_SYSTEM_PROMPT
+
+        val userPrompt = buildString {
+            if (isTruncated) {
+                appendLine("Текст bugreport усечён до ${MAX_BUGREPORT_CHARS_FOR_LLM} символов.")
+                appendLine()
+            }
+            appendLine("Вот содержимое bugreport (может быть усечено):")
+            appendLine()
+            appendLine(bugreportForPrompt)
+        }
+
+        val apiKey = settings.openRouterApiKey.takeIf { it.isNotBlank() } ?: OpenRouterConfig.apiKey
+        if (apiKey.isNullOrBlank()) {
+            onMessage("[Pipeline] Ошибка: отсутствует OPENROUTER_API_KEY для вызова LLM.")
+            return
+        }
+
+        onMessage("[Pipeline] Отправляю bugreport в LLM для генерации summary...")
+        val llmResult = withContext(Dispatchers.IO) {
+            callOpenRouter(
+                model = settings.openRouterModel,
+                messages = listOf(
+                    ORMessage("system", systemPrompt),
+                    ORMessage("user", userPrompt)
+                ),
+                forceJson = false,
+                apiKeyOverride = apiKey,
+                temperature = 0.2
+            )
+        }
+
+        val summaryText = when (llmResult) {
+            is OpenRouterResult.Success -> llmResult.content
+            is OpenRouterResult.Failure -> {
+                val message = llmResult.error.message ?: llmResult.error.rawBody ?: "неизвестная ошибка"
+                onMessage("[Pipeline] Ошибка при вызове LLM: $message")
+                return
+            }
+        }
+
+        onMessage("[Pipeline] LLM сгенерировал summary, сохраняю в файл через MCP...")
+
+        val timestamp = DateTimeFormatter.ofPattern("yyyyMMdd-HHmm").withZone(ZoneId.systemDefault())
+            .format(Instant.now())
+        val fileName = "bugreport-${serial}-$timestamp-summary.md"
+
+        val saveResult = withContext(Dispatchers.IO) {
+            withMcpGithubClient { client ->
+                client.saveSummaryToFile(
+                    fileName = fileName,
+                    content = summaryText
+                )
+            }
+        }
+
+        val summaryFilePath = saveResult.filePath
+        onMessage("[Pipeline] Summary по bugreport сохранён в файле: $summaryFilePath")
+
+        val shortSummary = summaryText
+            .split("\n\n".toRegex())
+            .take(2)
+            .joinToString("\n\n")
+            .ifBlank { summaryText.take(600) }
+
+        addAssistantMessage(
+            buildString {
+                appendLine("Готово! Я:")
+                appendLine("1. Снял bugreport с устройства `$serial` через MCP ADB.")
+                appendLine("2. Проанализировал его с помощью LLM.")
+                appendLine("3. Сохранил summary в файл:")
+                appendLine("   $summaryFilePath")
+                appendLine()
+                appendLine("Краткое summary:")
+                append(shortSummary)
+            }
+        )
+    }
+
     suspend fun requestGithubPrSummaryFromLlm(prs: List<McpPullRequest>): String {
         if (prs.isEmpty()) {
             return "Сейчас нет открытых PR — все задачи закрыты 👍"
@@ -1094,6 +1249,126 @@ private fun DesktopChatApp() {
         return true
     }
 
+    fun handleAdbCommand(text: String): Boolean {
+        val trimmed = text.trim()
+        if (trimmed.equals("/adb devices", ignoreCase = true)) {
+            addSystemMessage("[Orchestration] Запрашиваю список adb-устройств через MCP...")
+            scope.launch {
+                isSending = true
+                try {
+                    val result = withContext(Dispatchers.IO) {
+                        withMcpAdbClient { conn ->
+                            conn.adbListDevices()
+                        }
+                    }
+                    val message = if (result.devices.isEmpty()) {
+                        "[Orchestration] adb-устройства не найдены."
+                    } else {
+                        buildString {
+                            appendLine("Найдены adb-устройства:")
+                            appendLine()
+                            result.devices.forEach { device ->
+                                appendLine("- serial: ${device.serial}")
+                                appendLine("  state: ${device.state}")
+                                device.model?.let { appendLine("  model: $it") }
+                                device.device?.let { appendLine("  device: $it") }
+                                appendLine()
+                            }
+                        }.trimEnd()
+                    }
+                    addAssistantMessage(message)
+                } catch (t: Throwable) {
+                    t.printStackTrace()
+                    addSystemMessage("[Orchestration] Ошибка при запросе устройств adb: ${t.message ?: "неизвестная ошибка"}")
+                } finally {
+                    isSending = false
+                }
+            }
+            return true
+        }
+
+        val bugreportPrefix = "/adb bugreport"
+        if (trimmed.startsWith(bugreportPrefix, ignoreCase = true)) {
+            val serial = trimmed.removePrefix(bugreportPrefix).trim()
+            if (serial.isBlank()) {
+                addSystemMessage("Используй: /adb bugreport <serial>")
+                return true
+            }
+
+            addSystemMessage("[Orchestration] Снимаю bugreport с устройства $serial через MCP ADB...")
+            scope.launch {
+                isSending = true
+                try {
+                    val bugreportResult = withContext(Dispatchers.IO) {
+                        withMcpAdbClient { conn ->
+                            conn.adbGetBugreport(serial)
+                        }
+                    }
+                    val bugreportPath = bugreportResult.filePath
+                    println("[Orchestration] Bugreport file path: $bugreportPath")
+
+                    val bugreportRaw = withContext(Dispatchers.IO) { File(bugreportPath).readText() }
+                    val bugreportForPrompt = bugreportRaw.take(MAX_BUGREPORT_CHARS_FOR_LLM)
+                    val isTruncated = bugreportRaw.length > MAX_BUGREPORT_CHARS_FOR_LLM
+
+                    val apiKey = settings.openRouterApiKey.takeIf { it.isNotBlank() } ?: OpenRouterConfig.apiKey
+                    if (apiKey.isNullOrBlank()) {
+                        addSystemMessage("[Orchestration] Ошибка: отсутствует OPENROUTER_API_KEY для вызова LLM.")
+                        return@launch
+                    }
+
+                    val userPrompt = buildString {
+                        if (isTruncated) {
+                            appendLine("Текст bugreport усечён до ${MAX_BUGREPORT_CHARS_FOR_LLM} символов.")
+                            appendLine()
+                        }
+                        appendLine("Вот содержимое bugreport (может быть усечено):")
+                        appendLine()
+                        appendLine(bugreportForPrompt)
+                    }
+
+                    val llmResult = withContext(Dispatchers.IO) {
+                        callOpenRouter(
+                            model = settings.openRouterModel,
+                            messages = listOf(
+                                ORMessage("system", BUGREPORT_SYSTEM_PROMPT),
+                                ORMessage("user", userPrompt)
+                            ),
+                            forceJson = false,
+                            apiKeyOverride = apiKey,
+                            temperature = 0.2
+                        )
+                    }
+
+                    when (llmResult) {
+                        is OpenRouterResult.Success -> {
+                            addAssistantMessage(
+                                buildString {
+                                    appendLine("Готово! Bugreport для $serial получен (файл: $bugreportPath).")
+                                    appendLine()
+                                    appendLine(llmResult.content)
+                                }
+                            )
+                        }
+
+                        is OpenRouterResult.Failure -> {
+                            val message = llmResult.error.message ?: llmResult.error.rawBody ?: "неизвестная ошибка"
+                            addSystemMessage("[Orchestration] Ошибка при анализе bugreport: $message")
+                        }
+                    }
+                } catch (t: Throwable) {
+                    t.printStackTrace()
+                    addSystemMessage("[Orchestration] Ошибка при снятии bugreport: ${t.message ?: "неизвестная ошибка"}")
+                } finally {
+                    isSending = false
+                }
+            }
+            return true
+        }
+
+        return false
+    }
+
     fun handleMcpCommand(text: String): Boolean {
         val trimmed = text.trim()
         val lower = trimmed.lowercase()
@@ -1148,7 +1423,17 @@ private fun DesktopChatApp() {
         val text = input.trim()
         if (text.isEmpty() || isSending) return
 
+        if (handleBugreportPipelineCommand(text)) {
+            input = ""
+            return
+        }
+
         if (handlePipelineCommand(text)) {
+            input = ""
+            return
+        }
+
+        if (handleAdbCommand(text)) {
             input = ""
             return
         }
