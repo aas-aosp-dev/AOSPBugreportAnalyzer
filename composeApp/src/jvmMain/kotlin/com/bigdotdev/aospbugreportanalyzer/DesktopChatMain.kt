@@ -79,6 +79,7 @@ import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.util.Locale
+import java.util.zip.ZipFile
 import java.util.UUID
 import com.bigdotdev.aospbugreportanalyzer.mcp.McpGithubClientException
 import com.bigdotdev.aospbugreportanalyzer.mcp.withMcpGithubClient
@@ -185,6 +186,11 @@ private fun CallStats.toMessageStats(): MessageStats =
         costUsd = costUsd,
         durationMs = elapsedMs
     )
+
+private class BugreportExtractionException(
+    message: String,
+    cause: Throwable? = null
+) : Exception(message, cause)
 
 private object OpenRouterConfig {
     const val BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
@@ -746,6 +752,43 @@ private fun DesktopChatApp() {
         )
     }
 
+    private suspend fun extractLargestTxtFromBugreportZip(zipPath: String): String {
+        println("[BugreportExtractor] Extracting largest .txt from: $zipPath")
+        return withContext(Dispatchers.IO) {
+            try {
+                ZipFile(zipPath).use { zipFile ->
+                    val txtEntries = zipFile.entries().asSequence()
+                        .filter { entry ->
+                            !entry.isDirectory && entry.name.lowercase(Locale.getDefault()).endsWith(".txt")
+                        }
+                        .map { entry ->
+                            val bytes = zipFile.getInputStream(entry).use { it.readBytes() }
+                            entry to bytes
+                        }
+                        .toList()
+
+                    if (txtEntries.isEmpty()) {
+                        println("[BugreportExtractor] No .txt files found in zip: $zipPath")
+                        throw IllegalStateException("No .txt files in bugreport zip")
+                    }
+
+                    val (largestEntry, bytes) = txtEntries.maxByOrNull { it.second.size }
+                        ?: throw IllegalStateException("No .txt files in bugreport zip")
+
+                    println("[BugreportExtractor] Using file: ${largestEntry.name} (size=${bytes.size})")
+                    bytes.toString(Charsets.UTF_8)
+                }
+            } catch (t: Throwable) {
+                println("[BugreportExtractor] Failed to extract txt: ${t.message}")
+                t.printStackTrace()
+                throw BugreportExtractionException(
+                    "Не удалось извлечь .txt из bugreport.zip. Убедись, что это стандартный Android bugreport.",
+                    t
+                )
+            }
+        }
+    }
+
     suspend fun runBugreportPipeline( mode: BugreportPipelineMode,  onMessage: (String) -> Unit ) {
         onMessage("[Pipeline] Стартую пайплайн ADB → LLM → файл (режим: $mode)")
 
@@ -764,7 +807,15 @@ private fun DesktopChatApp() {
         val bugreportPath = bugreportResult.filePath
         onMessage("[Pipeline] Bugreport сохранён в файле: $bugreportPath")
 
-        val bugreportRaw = withContext(Dispatchers.IO) { File(bugreportPath).readText() }
+        val bugreportRaw = try {
+            extractLargestTxtFromBugreportZip(bugreportPath)
+        } catch (e: BugreportExtractionException) {
+            onMessage(e.message ?: "Не удалось извлечь .txt из bugreport.zip. Убедись, что это стандартный Android bugreport.")
+            return
+        }
+        println("[Orchestrator] Using extracted .txt file for bugreport analysis")
+        onMessage("Готово! Нашёл bugreport.txt в архиве и отправил в анализ.")
+
         val bugreportForPrompt = bugreportRaw.take(MAX_BUGREPORT_CHARS_FOR_LLM)
         val isTruncated = bugreportRaw.length > MAX_BUGREPORT_CHARS_FOR_LLM
 
@@ -826,6 +877,7 @@ private fun DesktopChatApp() {
 
         val summaryFilePath = saveResult.filePath
         onMessage("[Pipeline] Summary по bugreport сохранён в файле: $summaryFilePath")
+        onMessage("[Orchestration] Анализ проведён. Использован текстовый bugreport.")
 
         val shortSummary = summaryText
             .split("\n\n".toRegex())
@@ -1306,7 +1358,15 @@ private fun DesktopChatApp() {
                     val bugreportPath = bugreportResult.filePath
                     println("[Orchestration] Bugreport file path: $bugreportPath")
 
-                    val bugreportRaw = withContext(Dispatchers.IO) { File(bugreportPath).readText() }
+                    val bugreportRaw = try {
+                        extractLargestTxtFromBugreportZip(bugreportPath)
+                    } catch (e: BugreportExtractionException) {
+                        addSystemMessage(e.message ?: "Не удалось извлечь .txt из bugreport.zip. Убедись, что это стандартный Android bugreport.")
+                        return@launch
+                    }
+                    println("[Orchestrator] Using extracted .txt file for bugreport analysis")
+                    addSystemMessage("Готово! Нашёл bugreport.txt в архиве и отправил в анализ.")
+
                     val bugreportForPrompt = bugreportRaw.take(MAX_BUGREPORT_CHARS_FOR_LLM)
                     val isTruncated = bugreportRaw.length > MAX_BUGREPORT_CHARS_FOR_LLM
 
@@ -1341,9 +1401,10 @@ private fun DesktopChatApp() {
 
                     when (llmResult) {
                         is OpenRouterResult.Success -> {
+                            addSystemMessage("[Orchestration] Анализ проведён. Использован текстовый bugreport.")
                             addAssistantMessage(
                                 buildString {
-                                    appendLine("Готово! Bugreport для $serial получен (файл: $bugreportPath).")
+                                    appendLine("Готово! Нашёл bugreport.txt в архиве и отправил в анализ.")
                                     appendLine()
                                     appendLine(llmResult.content)
                                 }
