@@ -50,6 +50,81 @@ class McpGithubClientException(
 ) : IllegalStateException(message, cause)
 
 suspend fun <T> withMcpGithubClient(
+    block: suspend (McpClient) -> T
+): T {
+    val json = Json {
+        ignoreUnknownKeys = true
+        encodeDefaults = true
+        prettyPrint = false
+    }
+
+    val defaultCommand = defaultGithubServerCommand()
+    val command = resolveCommand(
+        envVarName = "MCP_GITHUB_SERVER_COMMAND",
+        defaultCommand = defaultCommand,
+        logTag = "MCP-GITHUB-CLIENT"
+    )
+
+    println("🔧 [MCP-GITHUB-CLIENT] Starting MCP GitHub server process: ${command.joinToString(" ")}")
+
+    val connection = try {
+        McpConnection.start(
+            config = McpServerConfig(command),
+            json = json,
+            logTag = "MCP-GITHUB-CLIENT"
+        )
+    } catch (t: Throwable) {
+        throw McpGithubClientException(
+            message = t.message ?: "Failed to start MCP GitHub server",
+            isConnectionError = true,
+            cause = t
+        )
+    }
+
+    try {
+        val initializeResponse = connection.initialize()
+        initializeResponse.error?.let { error ->
+            throw McpGithubClientException(
+                message = "MCP initialize failed: ${error.message}",
+                isConnectionError = true
+            )
+        }
+
+        val toolsListResponse = connection.sendRequest(
+            method = "tools/list",
+            params = buildJsonObject { }
+        )
+        toolsListResponse.error?.let { error ->
+            throw McpGithubClientException(
+                message = "MCP tools/list failed: ${error.message}",
+                isConnectionError = true
+            )
+        }
+
+        val availableTools = toolsListResponse.result
+            ?.jsonObject
+            ?.get("tools")
+            ?.jsonArray
+            ?.mapNotNull { it.jsonObject["name"]?.jsonPrimitive?.content }
+            ?.toSet()
+            ?: emptySet()
+
+        val requiredTools = setOf("github.list_open_pull_requests")
+        val missingTools = requiredTools - availableTools
+        if (missingTools.isNotEmpty()) {
+            throw McpGithubClientException(
+                message = "Missing required MCP tools: ${missingTools.joinToString()}",
+                isConnectionError = true
+            )
+        }
+
+        return block(connection)
+    } finally {
+        connection.close()
+    }
+}
+
+suspend fun <T> withMcpGithubClient(
     block: suspend (McpGithubClient) -> T
 ): T {
     val json = Json {

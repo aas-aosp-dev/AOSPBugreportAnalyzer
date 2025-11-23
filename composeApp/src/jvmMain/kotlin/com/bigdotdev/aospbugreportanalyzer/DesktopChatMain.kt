@@ -55,10 +55,12 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Window
 import androidx.compose.ui.window.application
+import com.bigdotdev.aospbugreportanalyzer.mcp.GithubPullRequest
 import com.bigdotdev.aospbugreportanalyzer.mcp.McpGithubClientException
 import com.bigdotdev.aospbugreportanalyzer.mcp.McpPullRequest
 import com.bigdotdev.aospbugreportanalyzer.mcp.adbGetBugreport
 import com.bigdotdev.aospbugreportanalyzer.mcp.adbListDevices
+import com.bigdotdev.aospbugreportanalyzer.mcp.listOpenPullRequestsViaMcpGithub
 import com.bigdotdev.aospbugreportanalyzer.mcp.withMcpAdbClient
 import com.bigdotdev.aospbugreportanalyzer.mcp.withMcpGithubClient
 import kotlinx.coroutines.Dispatchers
@@ -1014,6 +1016,72 @@ private fun DesktopChatApp() {
         }
     }
 
+    suspend fun findRelatedPullRequestsBySummary(
+        summaryText: String,
+        pullRequests: List<GithubPullRequest>,
+        apiKey: String,
+        model: String
+    ): String {
+        val truncatedSummary = summaryText.take(2_000)
+        val prsText = buildString {
+            pullRequests.forEach { pr ->
+                appendLine("#${pr.number}: ${pr.title}")
+                appendLine("- labels: ${if (pr.labels.isEmpty()) "нет" else pr.labels.joinToString(", ")}")
+                appendLine("- updatedAt: ${pr.updatedAt ?: "n/a"}")
+                appendLine("- url: ${pr.htmlUrl}")
+                pr.bodyPreview?.takeIf { it.isNotBlank() }?.let { preview ->
+                    appendLine("- body: ${preview.take(200)}")
+                }
+                appendLine()
+            }
+        }
+
+        val prompt = buildString {
+            appendLine("У тебя есть summary Android bugreport и список открытых PR в GitHub.")
+            appendLine()
+            appendLine("Сначала summary:")
+            appendLine()
+            appendLine(truncatedSummary)
+            appendLine()
+            appendLine("Теперь список PR:")
+            appendLine()
+            appendLine(prsText.ifBlank { "(список пуст)" })
+            appendLine("Твоя задача:")
+            appendLine("1. Определи, есть ли среди PR те, которые, скорее всего, относятся к описанной в summary проблеме.")
+            appendLine("2. Если да — перечисли такие PR (номера и названия) и кратко объясни, почему они релевантны.")
+            appendLine("3. Если нет — напиши, что подходящих PR нет.")
+            appendLine()
+            append("Ответ верни в кратком Markdown-формате.")
+        }
+
+        HistoryLogger.log("LLM: analyzing ${pullRequests.size} PR(s) relevance to bugreport summary")
+
+        val llmResult = withContext(Dispatchers.IO) {
+            callOpenRouter(
+                model = model,
+                messages = listOf(
+                    ORMessage(
+                        "system",
+                        "Ты ассистент, который сопоставляет багрепорты Android с открытыми PR и сообщает об их релевантности."
+                    ),
+                    ORMessage("user", prompt)
+                ),
+                forceJson = false,
+                apiKeyOverride = apiKey,
+                temperature = 0.3,
+                maxTokens = 1_200,
+                topP = 0.9
+            )
+        }
+
+        return when (llmResult) {
+            is OpenRouterResult.Success -> llmResult.content
+            is OpenRouterResult.Failure -> throw IllegalStateException(
+                llmResult.error.message ?: llmResult.error.rawBody ?: "LLM returned an error"
+            )
+        }
+    }
+
     suspend fun runBugreportPipeline(mode: BugreportPipelineMode, onMessage: (String) -> Unit) {
         HistoryLogger.log("COMMAND: /orchestrate bugreport $mode")
         println("[Orchestrator] Starting bugreport pipeline for mode=$mode")
@@ -1096,6 +1164,49 @@ private fun DesktopChatApp() {
         println("[Orchestrator] Bugreport summary generated, length=${summaryText.length}")
         HistoryLogger.log("LLM: bugreport summary length=${summaryText.length}")
 
+        addSystemMessage("[Pipeline] Ищу связанные PR в GitHub через MCP...")
+
+        val pullRequests = try {
+            listOpenPullRequestsViaMcpGithub(limit = 10)
+        } catch (e: Exception) {
+            HistoryLogger.log("GitHub MCP list_open_pull_requests failed: ${e.message}")
+            addSystemMessage("[Pipeline] Не удалось получить список PR из GitHub через MCP: ${e.message}")
+            emptyList()
+        }
+
+        var prAnalysisForChat: String? = null
+        if (pullRequests.isEmpty()) {
+            addSystemMessage("[Pipeline] Открытых PR не нашлось или GitHub MCP недоступен.")
+        } else {
+            HistoryLogger.log("GitHub MCP returned ${pullRequests.size} open PR(s) for analysis")
+            val prAnalysis = try {
+                findRelatedPullRequestsBySummary(
+                    summaryText = summaryText,
+                    pullRequests = pullRequests,
+                    apiKey = apiKey,
+                    model = settings.openRouterModel
+                )
+            } catch (e: Exception) {
+                HistoryLogger.log("GitHub PR analysis via LLM failed: ${e.message}")
+                addSystemMessage("[Pipeline] Не удалось проанализировать PR через LLM: ${e.message}")
+                null
+            }
+
+            prAnalysis?.let { analysis ->
+                HistoryLogger.log("LLM: PR relevance analysis length=${analysis.length}")
+                addSystemMessage("[Pipeline] Анализ PR завершён. Ниже результаты:")
+                addSystemMessage(analysis)
+                addAssistantMessage(
+                    buildString {
+                        appendLine("Я проанализировал открытые PR в GitHub и их возможную связь с этим багрепортом:")
+                        appendLine()
+                        appendLine(analysis)
+                    }
+                )
+                prAnalysisForChat = analysis
+            }
+        }
+
         onMessage("[Pipeline] LLM сгенерировал summary, сохраняю в файл через MCP...")
 
         val timestamp = DateTimeFormatter.ofPattern("yyyyMMdd-HHmm").withZone(ZoneId.systemDefault())
@@ -1132,6 +1243,12 @@ private fun DesktopChatApp() {
                 appendLine("3. Сохранил summary в файл:")
                 appendLine("   $summaryFilePath")
                 appendLine()
+                prAnalysisForChat?.let { analysis ->
+                    appendLine("Я также проанализировал открытые PR в GitHub и их связь с багрепортом:")
+                    appendLine()
+                    appendLine(analysis)
+                    appendLine()
+                }
                 appendLine("Краткое summary:")
                 append(shortSummary)
             }

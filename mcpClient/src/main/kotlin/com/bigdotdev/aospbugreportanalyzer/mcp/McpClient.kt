@@ -128,6 +128,10 @@ class McpConnection private constructor(
     }
 }
 
+// Alias used to highlight the stdio-based MCP client interface
+// shared between different MCP servers (ADB, GitHub, etc.).
+typealias McpClient = McpConnection
+
 @Serializable
 data class JsonRpcRequest(
     val jsonrpc: String = "2.0",
