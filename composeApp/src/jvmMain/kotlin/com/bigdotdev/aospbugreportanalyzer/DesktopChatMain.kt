@@ -117,7 +117,9 @@ private sealed class BugreportPipelineMode {
 
 private const val MESSAGES_PER_SUMMARY = 10
 private const val MAX_RECENT_MESSAGES = 8
-private const val MAX_BUGREPORT_PROMPT_CHARS = 200_000
+private const val BUGREPORT_SUMMARY_PRIMARY_LIMIT = 80_000
+private const val BUGREPORT_SUMMARY_FALLBACK_LIMIT = 40_000
+private const val BUGREPORT_SUMMARY_MAX_TOKENS = 3_000
 
 private data class MsgMetrics(
     val promptTokens: Int?,
@@ -218,7 +220,9 @@ private data class ORRequest(
     val model: String,
     val messages: List<ORMessage>,
     val response_format: Map<String, String>? = null,
-    val temperature: Double
+    val temperature: Double,
+    val max_tokens: Int? = null,
+    val top_p: Double? = null
 )
 
 private val SYSTEM_TEXT = """
@@ -238,6 +242,47 @@ private val BUGREPORT_SYSTEM_PROMPT = """
 - возможные проблемы с памятью, ANR, перформансом;
 - рекомендации по дальнейшей диагностике.
 """.trimIndent()
+
+private fun trimBugreportForSummary(
+    fullText: String,
+    limit: Int
+): String {
+    if (fullText.length <= limit) return fullText
+
+    return fullText.take(limit)
+}
+
+private fun buildBugreportSummaryPrompt(rawBugreport: String): String {
+    val header = """
+        You are an assistant that analyzes Android bugreports and produces concise, structured summaries for engineers.
+
+        Below is the raw text of an Android bugreport. It may contain long logs and sections like
+        "SUMMARY", "DUMP OF SERVICE", "------ SYSTEM LOG ------" and similar. Treat them as plain text,
+        do NOT try to execute or expand them, just analyze the content.
+
+        Your task:
+        1. Identify the main issues, crashes, ANRs or error patterns.
+        2. Highlight the most important findings for debugging.
+        3. If there is too much noise or not enough information, say that explicitly.
+
+        Respond in short, structured Markdown:
+        - High-level summary
+        - Key findings
+        - Suspected root causes (if any)
+        - Suggested next steps
+
+        --- BUGREPORT START ---
+    """.trimIndent()
+
+    val footer = "\n--- BUGREPORT END ---"
+
+    return header + "\n" + rawBugreport + footer
+}
+
+private fun OpenRouterError.isStackOverflowLike(): Boolean {
+    return message?.contains("StackOverflowError", ignoreCase = true) == true ||
+        rawBody?.contains("StackOverflowError", ignoreCase = true) == true
+}
 
 private val SUMMARY_SYSTEM_PROMPT = """
 Ты помощник, который сжимает диалоги.
@@ -417,7 +462,9 @@ private fun callOpenRouter(
     messages: List<ORMessage>,
     forceJson: Boolean,
     apiKeyOverride: String?,
-    temperature: Double
+    temperature: Double,
+    maxTokens: Int? = null,
+    topP: Double? = null
 ): OpenRouterResult {
     val key = apiKeyOverride?.takeIf { it.isNotBlank() } ?: OpenRouterConfig.apiKey
     if (key.isNullOrBlank()) {
@@ -434,7 +481,9 @@ private fun callOpenRouter(
         model = model,
         messages = messages,
         response_format = if (forceJson) mapOf("type" to "json_object") else null,
-        temperature = temperature.coerceIn(0.0, 2.0)
+        temperature = temperature.coerceIn(0.0, 2.0),
+        max_tokens = maxTokens,
+        top_p = topP?.coerceIn(0.0, 1.0)
     )
 
     val body = buildString {
@@ -456,6 +505,14 @@ private fun callOpenRouter(
         }
         append(",\"temperature\":")
         append(String.format(Locale.US, "%.2f", request.temperature))
+        request.max_tokens?.let { maxTokensValue ->
+            append(",\"max_tokens\":")
+            append(maxTokensValue)
+        }
+        request.top_p?.let { topPValue ->
+            append(",\"top_p\":")
+            append(String.format(Locale.US, "%.2f", topPValue))
+        }
         append('}')
     }
 
@@ -835,7 +892,7 @@ private fun DesktopChatApp() {
             }
         }
 
-        val normalizedBugreportText = bugreportText.take(MAX_BUGREPORT_PROMPT_CHARS)
+        val normalizedBugreportText = trimBugreportForSummary(bugreportText, BUGREPORT_SUMMARY_PRIMARY_LIMIT)
         println("[Orchestrator] Loaded bugreport text from $effectiveSource, length=${bugreportText.length}, used=${normalizedBugreportText.length}")
         val preview = normalizedBugreportText.replace("\\s+".toRegex(), " ").take(300)
         println("[Orchestrator] Bugreport text preview: $preview")
@@ -865,6 +922,95 @@ private fun DesktopChatApp() {
             println("[Storage] Failed to copy bugreport from $source to $target: ${t.message}")
             HistoryLogger.log("Failed to copy bugreport from $source to $target: ${t.message}")
             bugreportPath
+        }
+    }
+
+    suspend fun callBugreportSummaryLlm(
+        bugreportText: String,
+        limit: Int,
+        apiKey: String,
+        model: String
+    ): OpenRouterResult {
+        val truncated = trimBugreportForSummary(bugreportText, limit)
+        val truncatedLog = "[Orchestrator] Bugreport text truncated for LLM: original=${bugreportText.length}, used=${truncated.length}, limit=$limit"
+        println(truncatedLog)
+        HistoryLogger.log(truncatedLog)
+        HistoryLogger.log("LLM bugreport summary: usingLimit=$limit, original=${bugreportText.length}, used=${truncated.length}")
+
+        val prompt = buildBugreportSummaryPrompt(truncated)
+        val promptLengthLog = "[Orchestrator] LLM bugreport summary prompt length=${prompt.length}"
+        println(promptLengthLog)
+        HistoryLogger.log(promptLengthLog)
+
+        return withContext(Dispatchers.IO) {
+            callOpenRouter(
+                model = model,
+                messages = listOf(
+                    ORMessage("system", BUGREPORT_SYSTEM_PROMPT),
+                    ORMessage("user", prompt)
+                ),
+                forceJson = false,
+                apiKeyOverride = apiKey,
+                temperature = 0.2,
+                maxTokens = BUGREPORT_SUMMARY_MAX_TOKENS,
+                topP = 0.9
+            )
+        }
+    }
+
+    suspend fun generateBugreportSummary(
+        bugreportText: String,
+        model: String,
+        apiKey: String,
+        onMessage: (String) -> Unit
+    ): String? {
+        val primaryResult = callBugreportSummaryLlm(
+            bugreportText = bugreportText,
+            limit = BUGREPORT_SUMMARY_PRIMARY_LIMIT,
+            apiKey = apiKey,
+            model = model
+        )
+
+        val finalResult = when (primaryResult) {
+            is OpenRouterResult.Success -> primaryResult
+            is OpenRouterResult.Failure -> {
+                val error = primaryResult.error
+                if (error.isStackOverflowLike()) {
+                    HistoryLogger.log("LLM bugreport summary StackOverflow: httpCode=${error.httpCode}, message=${error.message}, rawBody=${error.rawBody}")
+                    HistoryLogger.log("Retrying bugreport summary with stricter limit=$BUGREPORT_SUMMARY_FALLBACK_LIMIT")
+                    onMessage("[Pipeline] Модели стало тяжело от объёма багрепорта, пробую отправить более короткую версию...")
+
+                    callBugreportSummaryLlm(
+                        bugreportText = bugreportText,
+                        limit = BUGREPORT_SUMMARY_FALLBACK_LIMIT,
+                        apiKey = apiKey,
+                        model = model
+                    )
+                } else {
+                    primaryResult
+                }
+            }
+        }
+
+        return when (finalResult) {
+            is OpenRouterResult.Success -> finalResult.content
+            is OpenRouterResult.Failure -> {
+                val err = finalResult.error
+                val message = err.message ?: err.rawBody ?: "неизвестная ошибка"
+                val userMessage = if (err.isStackOverflowLike()) {
+                    "[Pipeline] Ошибка: багрепорт оказался слишком тяжёлым для модели даже после повторной попытки. Попробуйте передать более короткий фрагмент."
+                } else {
+                    "[Pipeline] Ошибка при вызове LLM для summary багрепорта: $message"
+                }
+                onMessage(userMessage)
+                HistoryLogger.log("LLM bugreport summary failed after retry: httpCode=${err.httpCode}, message=${err.message}, rawBody=${err.rawBody}")
+                null
+            }
+            else -> {
+                onMessage("[Pipeline] Неизвестный результат при генерации summary багрепорта.")
+                HistoryLogger.log("LLM bugreport summary: unexpected OpenRouterResult type: ${finalResult::class.qualifiedName}")
+                null
+            }
         }
     }
 
@@ -915,17 +1061,8 @@ private fun DesktopChatApp() {
 
         onMessage("Готово! Нашёл bugreport.txt в архиве и отправил в анализ.")
 
-        val systemPrompt = BUGREPORT_SYSTEM_PROMPT
-
-        val userPrompt = buildString {
-            appendLine("Ниже полный текст bugreport (обрезан до $MAX_BUGREPORT_PROMPT_CHARS символов, если он слишком большой):")
-            appendLine()
-            if (isTruncated) {
-                appendLine("Текст bugreport усечён до $MAX_BUGREPORT_PROMPT_CHARS символов.")
-                appendLine()
-            }
-            appendLine(normalizedBugreportText)
-        }
+        val truncatedForStorage = trimBugreportForSummary(normalizedBugreportText, BUGREPORT_SUMMARY_PRIMARY_LIMIT)
+        val userPrompt = buildBugreportSummaryPrompt(truncatedForStorage)
 
         val timestampForFiles = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss").withZone(ZoneId.systemDefault()).format(Instant.now())
         val llmInputPath = StoragePaths.llmInputsDir.resolve("bugreport-${serial}-${timestampForFiles}.txt")
@@ -949,29 +1086,12 @@ private fun DesktopChatApp() {
         println("[Orchestrator] Calling LLM bugreport summary, inputLength=${userPrompt.length}")
         HistoryLogger.log("LLM: calling bugreport summary, inputLength=${userPrompt.length}")
         onMessage("[Pipeline] Отправляю bugreport в LLM для генерации summary...")
-        val llmResult = withContext(Dispatchers.IO) {
-            callOpenRouter(
-                model = settings.openRouterModel,
-                messages = listOf(
-                    ORMessage("system", systemPrompt),
-                    ORMessage("user", userPrompt)
-                ),
-                forceJson = false,
-                apiKeyOverride = apiKey,
-                temperature = 0.2
-            )
-        }
-
-        val summaryText = when (llmResult) {
-            is OpenRouterResult.Success -> llmResult.content
-            is OpenRouterResult.Failure -> {
-                val message = llmResult.error.message ?: llmResult.error.rawBody ?: "неизвестная ошибка"
-                onMessage("[Pipeline] Ошибка при вызове LLM: ${llmResult.error}")
-                Exception().printStackTrace()
-                HistoryLogger.log("LLM bugreport summary failed: ${llmResult.error}")
-                return
-            }
-        }
+        val summaryText = generateBugreportSummary(
+            bugreportText = normalizedBugreportText,
+            model = settings.openRouterModel,
+            apiKey = apiKey,
+            onMessage = onMessage
+        ) ?: return
 
         println("[Orchestrator] Bugreport summary generated, length=${summaryText.length}")
         HistoryLogger.log("LLM: bugreport summary length=${summaryText.length}")
@@ -1536,15 +1656,8 @@ private fun DesktopChatApp() {
 
                     val timestampForFiles = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss").withZone(ZoneId.systemDefault()).format(Instant.now())
                     val llmInputPath = StoragePaths.llmInputsDir.resolve("bugreport-${serial}-${timestampForFiles}.txt")
-                    val userPrompt = buildString {
-                        appendLine("Ниже полный текст bugreport (обрезан до $MAX_BUGREPORT_PROMPT_CHARS символов, если он слишком большой):")
-                        appendLine()
-                        if (isTruncated) {
-                            appendLine("Текст bugreport усечён до $MAX_BUGREPORT_PROMPT_CHARS символов.")
-                            appendLine()
-                        }
-                        appendLine(normalizedBugreportText)
-                    }
+                    val truncatedForStorage = trimBugreportForSummary(normalizedBugreportText, BUGREPORT_SUMMARY_PRIMARY_LIMIT)
+                    val userPrompt = buildBugreportSummaryPrompt(truncatedForStorage)
 
                     runCatching {
                         Files.writeString(llmInputPath, userPrompt, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING)
@@ -1558,40 +1671,24 @@ private fun DesktopChatApp() {
 
                     println("[Orchestrator] Calling LLM bugreport summary, inputLength=${userPrompt.length}")
                     HistoryLogger.log("LLM: calling bugreport summary, inputLength=${userPrompt.length}")
-                    val llmResult = withContext(Dispatchers.IO) {
-                        callOpenRouter(
-                            model = settings.openRouterModel,
-                            messages = listOf(
-                                ORMessage("system", BUGREPORT_SYSTEM_PROMPT),
-                                ORMessage("user", userPrompt)
-                            ),
-                            forceJson = false,
-                            apiKeyOverride = apiKey,
-                            temperature = 0.2
+                    val summaryText = generateBugreportSummary(
+                        bugreportText = normalizedBugreportText,
+                        model = settings.openRouterModel,
+                        apiKey = apiKey,
+                        onMessage = ::addSystemMessage
+                    )
+
+                    if (summaryText != null) {
+                        println("[Orchestrator] Bugreport summary generated, length=${summaryText.length}")
+                        HistoryLogger.log("LLM: bugreport summary length=${summaryText.length}")
+                        addSystemMessage("[Orchestration] Анализ проведён. Использован текстовый bugreport.")
+                        addAssistantMessage(
+                            buildString {
+                                appendLine("Готово! Нашёл bugreport.txt в архиве и отправил в анализ.")
+                                appendLine()
+                                appendLine(summaryText)
+                            }
                         )
-                    }
-
-                    when (llmResult) {
-                        is OpenRouterResult.Success -> {
-                            val summaryText = llmResult.content
-                            println("[Orchestrator] Bugreport summary generated, length=${summaryText.length}")
-                            HistoryLogger.log("LLM: bugreport summary length=${summaryText.length}")
-                            addSystemMessage("[Orchestration] Анализ проведён. Использован текстовый bugreport.")
-                            addAssistantMessage(
-                                buildString {
-                                    appendLine("Готово! Нашёл bugreport.txt в архиве и отправил в анализ.")
-                                    appendLine()
-                                    appendLine(summaryText)
-                                }
-                            )
-                        }
-
-                        is OpenRouterResult.Failure -> {
-                            val message = llmResult.error.message ?: llmResult.error.rawBody ?: "неизвестная ошибка"
-                            addSystemMessage("[Orchestration] Ошибка при анализе bugreport: ${llmResult.error}")
-                            Exception().printStackTrace()
-                            HistoryLogger.log("LLM bugreport summary failed: ${llmResult.error}")
-                        }
                     }
                 } catch (t: Throwable) {
                     t.printStackTrace()
