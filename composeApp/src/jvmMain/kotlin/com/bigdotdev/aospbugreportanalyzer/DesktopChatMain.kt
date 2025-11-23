@@ -139,6 +139,13 @@ private data class SummaryResult(
     val completionTokens: Int?
 )
 
+private data class BugreportTextResult(
+    val text: String,
+    val source: String,
+    val originalLength: Int,
+    val usedLength: Int
+)
+
 data class CompressionStats(
     val summaryGroupId: Int,
     val messagesCount: Int,
@@ -789,39 +796,51 @@ private fun DesktopChatApp() {
         }
     }
 
-    /**
-     * Определяет, как получить путь к текстовому багрепорту:
-     * - если bugreportPath указывает на zip — достаём самый большой .txt из архива;
-     * - иначе — считаем, что это уже текстовый файл и просто возвращаем bugreportPath.
-     *
-     * В случае проблем с zip кидает BugreportExtractionException.
-     */
-    private suspend fun resolveBugreportTextFilePath(bugreportPath: String): String {
-        val file = File(bugreportPath)
-        val ext = file.extension.lowercase(Locale.getDefault())
-
-        return if (ext == "zip") {
-            println("[BugreportExtractor] Treating bugreport as ZIP archive: $bugreportPath")
-            val extractedContent = extractLargestTxtFromBugreportZip(bugreportPath)
-            withContext(Dispatchers.IO) {
-                try {
-                    val tempFile = File.createTempFile("bugreport-", ".txt")
-                    tempFile.writeText(extractedContent)
-                    tempFile.absolutePath
-                } catch (t: Throwable) {
-                    throw BugreportExtractionException(
-                        "Не удалось подготовить bugreport из архива: $bugreportPath",
-                        t
-                    )
-                }
-            }
-        } else {
-            println("[BugreportExtractor] Treating bugreport as plain text file: $bugreportPath")
-            if (!file.exists()) {
-                throw BugreportExtractionException("Bugreport file not found: $bugreportPath")
-            }
-            bugreportPath
+    private suspend fun loadBugreportTextResult(bugreportFilePath: String): BugreportTextResult {
+        val bugreportFile = File(bugreportFilePath)
+        if (!bugreportFile.exists()) {
+            throw BugreportExtractionException("Bugreport file not found: $bugreportFilePath")
         }
+
+        val ext = bugreportFile.extension.lowercase(Locale.getDefault())
+        var effectiveSource = bugreportFilePath
+        val bugreportText = if (ext == "zip") {
+            println("[BugreportExtractor] Treating bugreport as ZIP archive: $bugreportFilePath")
+            extractLargestTxtFromBugreportZip(bugreportFilePath)
+        } else {
+            println("[BugreportExtractor] Treating bugreport as plain text file: $bugreportFilePath")
+            val text = withContext(Dispatchers.IO) { bugreportFile.readText() }
+            val zipPath = "/\\S+\\.zip".toRegex().find(text)?.value
+            if (zipPath != null) {
+                val zipFile = File(zipPath)
+                if (zipFile.exists()) {
+                    println("[BugreportExtractor] Detected zip path inside text: $zipPath, trying to extract largest txt...")
+                    effectiveSource = zipPath
+                    extractLargestTxtFromBugreportZip(zipPath)
+                } else {
+                    println("[BugreportExtractor] Detected zip path inside text but file not found: $zipPath")
+                    text
+                }
+            } else {
+                text
+            }
+        }
+
+        val normalizedBugreportText = bugreportText.take(MAX_BUGREPORT_PROMPT_CHARS)
+        println("[Orchestrator] Loaded bugreport text from $effectiveSource, length=${bugreportText.length}, used=${normalizedBugreportText.length}")
+        val preview = normalizedBugreportText.replace("\\s+".toRegex(), " ").take(300)
+        println("[Orchestrator] Bugreport text preview: $preview")
+
+        return BugreportTextResult(
+            text = normalizedBugreportText,
+            source = effectiveSource,
+            originalLength = bugreportText.length,
+            usedLength = normalizedBugreportText.length
+        )
+    }
+
+    private suspend fun loadBugreportText(bugreportFilePath: String): String {
+        return loadBugreportTextResult(bugreportFilePath).text
     }
 
     suspend fun runBugreportPipeline( mode: BugreportPipelineMode,  onMessage: (String) -> Unit ) {
@@ -842,29 +861,21 @@ private fun DesktopChatApp() {
         val bugreportPath = bugreportResult.filePath
         onMessage("[Pipeline] Bugreport сохранён в файле: $bugreportPath")
 
-        val textFilePath = try {
-            resolveBugreportTextFilePath(bugreportPath)
+        val bugreportTextResult = try {
+            loadBugreportTextResult(bugreportPath)
         } catch (e: BugreportExtractionException) {
             println("[BugreportExtractor] Failed to prepare bugreport text file: ${e.message}")
             onMessage(e.message ?: "Не удалось подготовить bugreport из файла: $bugreportPath")
             return
-        }
-        val bugreportRaw = try {
-            withContext(Dispatchers.IO) { File(textFilePath).readText() }
         } catch (t: Throwable) {
             println("[Orchestrator] Failed to read bugreport text: ${t.message}")
-            onMessage("Не удалось прочитать текст bugreport из файла `$textFilePath`. Проверь, что файл существует и доступен.")
+            onMessage("Не удалось прочитать текст bugreport из файла `$bugreportPath`. Проверь, что файл существует и доступен.")
             return
         }
-        println("[Orchestrator] Using bugreport text file for analysis: $textFilePath")
+        println("[Orchestrator] Using bugreport text file for analysis: ${bugreportTextResult.source}")
 
-        val normalizedBugreportText = bugreportRaw.take(MAX_BUGREPORT_PROMPT_CHARS)
-        val isTruncated = bugreportRaw.length > MAX_BUGREPORT_PROMPT_CHARS
-        println(
-            "[Orchestrator] Loaded bugreport text from $textFilePath, length=${bugreportRaw.length}, used=${normalizedBugreportText.length}"
-        )
-        val preview = normalizedBugreportText.replace("\\s+".toRegex(), " ").take(200)
-        println("[Orchestrator] Bugreport text preview: $preview")
+        val normalizedBugreportText = bugreportTextResult.text
+        val isTruncated = bugreportTextResult.originalLength > bugreportTextResult.usedLength
 
         onMessage("Готово! Нашёл bugreport.txt в архиве и отправил в анализ.")
 
@@ -1409,29 +1420,21 @@ private fun DesktopChatApp() {
                     val bugreportPath = bugreportResult.filePath
                     println("[Orchestration] Bugreport file path: $bugreportPath")
 
-                    val textFilePath = try {
-                        resolveBugreportTextFilePath(bugreportPath)
+                    val bugreportTextResult = try {
+                        loadBugreportTextResult(bugreportPath)
                     } catch (e: BugreportExtractionException) {
                         println("[BugreportExtractor] Failed to prepare bugreport text file in /orchestrate bugreport: ${e.message}")
                         addSystemMessage(e.message ?: "Не удалось подготовить bugreport из файла: $bugreportPath")
                         return@launch
-                    }
-                    val bugreportRaw = try {
-                        withContext(Dispatchers.IO) { File(textFilePath).readText() }
                     } catch (t: Throwable) {
                         println("[Orchestrator] Failed to read bugreport text: ${t.message}")
-                        addSystemMessage("Не удалось прочитать текст bugreport из файла `$textFilePath`. Проверь, что файл существует и доступен.")
+                        addSystemMessage("Не удалось прочитать текст bugreport из файла `$bugreportPath`. Проверь, что файл существует и доступен.")
                         return@launch
                     }
-                    println("[Orchestrator] Using bugreport text file for /orchestrate bugreport: $textFilePath")
-                    val normalizedBugreportText = bugreportRaw.take(MAX_BUGREPORT_PROMPT_CHARS)
-                    val isTruncated = bugreportRaw.length > MAX_BUGREPORT_PROMPT_CHARS
-                    println(
-                        "[Orchestrator] Loaded bugreport text from $textFilePath, length=${bugreportRaw.length}, used=${normalizedBugreportText.length}"
-                    )
-                    val preview = normalizedBugreportText.replace("\\s+".toRegex(), " ").take(200)
-                    println("[Orchestrator] Bugreport text preview: $preview")
-                    addSystemMessage("Готово! Нашёл текстовый bugreport и отправил в анализ.\nФайл: $textFilePath")
+                    println("[Orchestrator] Using bugreport text file for /orchestrate bugreport: ${bugreportTextResult.source}")
+                    val normalizedBugreportText = bugreportTextResult.text
+                    val isTruncated = bugreportTextResult.originalLength > bugreportTextResult.usedLength
+                    addSystemMessage("Готово! Нашёл текстовый bugreport и отправил в анализ.\nФайл: ${bugreportTextResult.source}")
 
                     val apiKey = settings.openRouterApiKey.takeIf { it.isNotBlank() } ?: OpenRouterConfig.apiKey
                     if (apiKey.isNullOrBlank()) {
