@@ -925,12 +925,12 @@ private fun DesktopChatApp() {
         }
     }
 
-    private suspend fun callBugreportSummaryLlm(
+    suspend fun callBugreportSummaryLlm(
         bugreportText: String,
         limit: Int,
         apiKey: String,
         model: String
-    ): OpenRouterResult<String> {
+    ): OpenRouterResult {
         val truncated = trimBugreportForSummary(bugreportText, limit)
         val truncatedLog = "[Orchestrator] Bugreport text truncated for LLM: original=${bugreportText.length}, used=${truncated.length}, limit=$limit"
         println(truncatedLog)
@@ -958,7 +958,7 @@ private fun DesktopChatApp() {
         }
     }
 
-    private suspend fun generateBugreportSummary(
+    suspend fun generateBugreportSummary(
         bugreportText: String,
         model: String,
         apiKey: String,
@@ -1004,6 +1004,11 @@ private fun DesktopChatApp() {
                 }
                 onMessage(userMessage)
                 HistoryLogger.log("LLM bugreport summary failed after retry: httpCode=${err.httpCode}, message=${err.message}, rawBody=${err.rawBody}")
+                null
+            }
+            else -> {
+                onMessage("[Pipeline] Неизвестный результат при генерации summary багрепорта.")
+                HistoryLogger.log("LLM bugreport summary: unexpected OpenRouterResult type: ${finalResult::class.qualifiedName}")
                 null
             }
         }
