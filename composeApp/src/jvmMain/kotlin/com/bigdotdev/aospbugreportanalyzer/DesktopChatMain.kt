@@ -62,7 +62,7 @@ import com.bigdotdev.aospbugreportanalyzer.mcp.adbGetBugreport
 import com.bigdotdev.aospbugreportanalyzer.mcp.adbListDevices
 import com.bigdotdev.aospbugreportanalyzer.mcp.listOpenPullRequestsViaMcpGithub
 import com.bigdotdev.aospbugreportanalyzer.mcp.withMcpAdbClient
-import com.bigdotdev.aospbugreportanalyzer.mcp.withMcpGithubClient
+import com.bigdotdev.aospbugreportanalyzer.mcp.withMcpGithubApiClient
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -1215,7 +1215,7 @@ private fun DesktopChatApp() {
 
         println("[MCP-CLIENT] Calling fs.save_summary with fileName=$fileName")
         val saveResult = withContext(Dispatchers.IO) {
-            withMcpGithubClient { client ->
+            withMcpGithubApiClient { client ->
                 client.saveSummaryToFile(
                     fileName = fileName,
                     content = summaryText
@@ -1309,7 +1309,7 @@ private fun DesktopChatApp() {
             when (mode) {
                 PipelineMode.AllOpenPrs -> {
                     val prList = withContext(Dispatchers.IO) {
-                        withMcpGithubClient { client ->
+                        withMcpGithubApiClient { client ->
                             client.listPullRequests(state = "open")
                         }
                     }
@@ -1321,7 +1321,7 @@ private fun DesktopChatApp() {
                         emptyMap()
                     } else {
                         withContext(Dispatchers.IO) {
-                            withMcpGithubClient { client ->
+                            withMcpGithubApiClient { client ->
                                 limitedPrList.associate { pr ->
                                     pr.number to client.getPrDiff(number = pr.number)
                                 }
@@ -1333,7 +1333,7 @@ private fun DesktopChatApp() {
                 is PipelineMode.SinglePr -> {
                     val prNumber = mode.number
                     val pr = withContext(Dispatchers.IO) {
-                        withMcpGithubClient { client ->
+                        withMcpGithubApiClient { client ->
                             client.listPullRequests(state = "open")
                                 .find { it.number == prNumber }
                         }
@@ -1344,7 +1344,7 @@ private fun DesktopChatApp() {
                         return
                     }
                     val diff = withContext(Dispatchers.IO) {
-                        withMcpGithubClient { client ->
+                        withMcpGithubApiClient { client ->
                             client.getPrDiff(number = prNumber)
                         }
                     }
@@ -1464,7 +1464,7 @@ private fun DesktopChatApp() {
             }
             println("[MCP-CLIENT] Calling fs.save_summary with fileName=$fileName")
             val saveResult = withContext(Dispatchers.IO) {
-                withMcpGithubClient { client ->
+                withMcpGithubApiClient { client ->
                     client.saveSummaryToFile(
                         fileName = fileName,
                         content = summaryText
@@ -1553,7 +1553,7 @@ private fun DesktopChatApp() {
 
         val prs = try {
             withContext(Dispatchers.IO) {
-                withMcpGithubClient { client ->
+                withMcpGithubApiClient { client ->
                     client.listPullRequests(state = "open")
                 }
             }
@@ -1588,7 +1588,7 @@ private fun DesktopChatApp() {
             try {
                 addSystemMessage("MCP: запрашиваю список PR через GitHub MCP сервер...")
                 val prs = withContext(Dispatchers.IO) {
-                    withMcpGithubClient { client ->
+                    withMcpGithubApiClient { client ->
                         client.listPullRequests()
                     }
                 }
@@ -1617,7 +1617,7 @@ private fun DesktopChatApp() {
             try {
                 addSystemMessage("MCP: запрашиваю diff для PR #$number...")
                 val diff = withContext(Dispatchers.IO) {
-                    withMcpGithubClient { client ->
+                    withMcpGithubApiClient { client ->
                         client.getPrDiff(number = number)
                     }
                 }

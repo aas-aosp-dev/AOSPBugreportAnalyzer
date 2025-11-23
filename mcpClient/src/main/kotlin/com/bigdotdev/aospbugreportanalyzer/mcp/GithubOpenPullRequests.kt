@@ -22,8 +22,8 @@ data class GithubPullRequest(
 suspend fun listOpenPullRequestsViaMcpGithub(
     limit: Int = 10
 ): List<GithubPullRequest> {
-    return withMcpGithubClient { client ->
-        val response = client.sendRequest(
+    return withMcpGithubClient { client: McpClient ->
+        val response: JsonRpcResponse = client.sendRequest(
             method = "tools/call",
             params = buildJsonObject {
                 put("name", JsonPrimitive("github.list_open_pull_requests"))

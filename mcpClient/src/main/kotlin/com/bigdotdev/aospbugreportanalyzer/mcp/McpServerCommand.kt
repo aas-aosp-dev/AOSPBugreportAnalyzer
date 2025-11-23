@@ -7,7 +7,7 @@ private fun mcpServerPath(fileName: String): Path =
     Paths.get("../..", "AOSPBugreportAnalyzerMCPServer", "src", fileName)
 
 internal fun defaultGithubServerCommand(): List<String> {
-    val path = mcpServerPath("githubServer.ts")
+    val path = mcpServerPath("server.ts")
     return listOf("npx", "tsx", path.toString())
 }
 

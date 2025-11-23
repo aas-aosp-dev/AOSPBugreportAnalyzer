@@ -124,43 +124,10 @@ suspend fun <T> withMcpGithubClient(
     }
 }
 
-suspend fun <T> withMcpGithubClient(
+suspend fun <T> withMcpGithubApiClient(
     block: suspend (McpGithubClient) -> T
 ): T {
-    val json = Json {
-        ignoreUnknownKeys = true
-        encodeDefaults = true
-        prettyPrint = false
-    }
-
-    val command = resolveCommand(
-        envVarName = "MCP_GITHUB_SERVER_COMMAND",
-        defaultCommand = defaultGithubServerCommand(),
-        logTag = "MCP-GITHUB-CLIENT"
-    )
-    val config = McpServerConfig(command)
-
-    println("🔧 [MCP-GITHUB-CLIENT] Starting MCP server process: ${command.joinToString(" ")}")
-
-    val connection = try {
-        McpConnection.start(config, json, logTag = "MCP-GITHUB-CLIENT")
-    } catch (t: Throwable) {
-        throw McpGithubClientException(
-            message = t.message ?: "Failed to start MCP server",
-            isConnectionError = true,
-            cause = t
-        )
-    }
-
-    try {
-        val initializeResponse = connection.initialize()
-        initializeResponse.error?.let { error ->
-            throw McpGithubClientException(
-                message = "MCP initialize failed: ${error.message}",
-                isConnectionError = true
-            )
-        }
-
+    return withMcpGithubClient { connection ->
         val toolsListResponse = connection.sendRequest(
             method = "tools/list",
             params = buildJsonObject { }
@@ -195,9 +162,7 @@ suspend fun <T> withMcpGithubClient(
         }
 
         val client = McpGithubClientImpl(connection)
-        return block(client)
-    } finally {
-        connection.close()
+        block(client)
     }
 }
 
