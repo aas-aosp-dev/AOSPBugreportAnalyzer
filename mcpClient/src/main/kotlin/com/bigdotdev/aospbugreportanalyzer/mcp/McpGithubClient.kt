@@ -65,6 +65,8 @@ suspend fun <T> withMcpGithubClient(
     )
     val config = McpServerConfig(command)
 
+    println("🔧 [MCP-GITHUB-CLIENT] Starting MCP server process: ${command.joinToString(" ")}")
+
     val connection = try {
         McpConnection.start(config, json, logTag = "MCP-GITHUB-CLIENT")
     } catch (t: Throwable) {

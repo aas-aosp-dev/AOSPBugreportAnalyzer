@@ -55,10 +55,12 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Window
 import androidx.compose.ui.window.application
+import com.bigdotdev.aospbugreportanalyzer.mcp.McpGithubClientException
 import com.bigdotdev.aospbugreportanalyzer.mcp.McpPullRequest
 import com.bigdotdev.aospbugreportanalyzer.mcp.adbGetBugreport
 import com.bigdotdev.aospbugreportanalyzer.mcp.adbListDevices
 import com.bigdotdev.aospbugreportanalyzer.mcp.withMcpAdbClient
+import com.bigdotdev.aospbugreportanalyzer.mcp.withMcpGithubClient
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -74,6 +76,10 @@ import java.net.http.HttpClient
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.io.File
+import java.nio.file.Files
+import java.nio.file.Paths
+import java.nio.file.StandardCopyOption
+import java.nio.file.StandardOpenOption
 import java.time.Duration
 import java.time.Instant
 import java.time.ZoneId
@@ -81,8 +87,8 @@ import java.time.format.DateTimeFormatter
 import java.util.Locale
 import java.util.zip.ZipFile
 import java.util.UUID
-import com.bigdotdev.aospbugreportanalyzer.mcp.McpGithubClientException
-import com.bigdotdev.aospbugreportanalyzer.mcp.withMcpGithubClient
+import com.bigdotdev.aospbugreportanalyzer.storage.HistoryLogger
+import com.bigdotdev.aospbugreportanalyzer.storage.StoragePaths
 import com.bigdotdev.aospbugreportanalyzer.memory.AgentMemoryEntry
 import com.bigdotdev.aospbugreportanalyzer.memory.AgentMemoryRepository
 import com.bigdotdev.aospbugreportanalyzer.memory.MessageStats
@@ -759,8 +765,9 @@ private fun DesktopChatApp() {
         )
     }
 
-    private suspend fun extractLargestTxtFromBugreportZip(zipPath: String): String {
+    suspend fun extractLargestTxtFromBugreportZip(zipPath: String): String {
         println("[BugreportExtractor] Extracting largest .txt from: $zipPath")
+        println("[BugreportExtractor] Opening ZIP bugreport at $zipPath")
         return withContext(Dispatchers.IO) {
             try {
                 ZipFile(zipPath).use { zipFile ->
@@ -782,12 +789,11 @@ private fun DesktopChatApp() {
                     val (largestEntry, bytes) = txtEntries.maxByOrNull { it.second.size }
                         ?: throw IllegalStateException("No .txt files in bugreport zip")
 
-                    println("[BugreportExtractor] Using file: ${largestEntry.name} (size=${bytes.size})")
+                    println("[BugreportExtractor] Found ${txtEntries.size} .txt entries in zip, largest is ${largestEntry.name} (${bytes.size} bytes)")
                     bytes.toString(Charsets.UTF_8)
                 }
             } catch (t: Throwable) {
-                println("[BugreportExtractor] Failed to extract txt: ${t.message}")
-                t.printStackTrace()
+                println("[BugreportExtractor] Failed to extract txt from $zipPath: ${t.message}")
                 throw BugreportExtractionException(
                     "Не удалось извлечь .txt из bugreport.zip. Убедись, что это стандартный Android bugreport.",
                     t
@@ -796,7 +802,7 @@ private fun DesktopChatApp() {
         }
     }
 
-    private suspend fun loadBugreportTextResult(bugreportFilePath: String): BugreportTextResult {
+    suspend fun loadBugreportTextResult(bugreportFilePath: String): BugreportTextResult {
         val bugreportFile = File(bugreportFilePath)
         if (!bugreportFile.exists()) {
             throw BugreportExtractionException("Bugreport file not found: $bugreportFilePath")
@@ -810,15 +816,18 @@ private fun DesktopChatApp() {
         } else {
             println("[BugreportExtractor] Treating bugreport as plain text file: $bugreportFilePath")
             val text = withContext(Dispatchers.IO) { bugreportFile.readText() }
-            val zipPath = "/\\S+\\.zip".toRegex().find(text)?.value
+            val pointerRegex = Regex("Bug report copied to\\s+(\\S+\\.zip)")
+            val pointerZip = pointerRegex.find(text)?.groupValues?.getOrNull(1)
+            val inlineZip = "/\\S+\\.zip".toRegex().find(text)?.value
+            val zipPath = pointerZip ?: inlineZip
             if (zipPath != null) {
                 val zipFile = File(zipPath)
                 if (zipFile.exists()) {
-                    println("[BugreportExtractor] Detected zip path inside text: $zipPath, trying to extract largest txt...")
+                    println("[BugreportExtractor] Detected pointer TXT, redirecting to ZIP: $zipPath")
                     effectiveSource = zipPath
                     extractLargestTxtFromBugreportZip(zipPath)
                 } else {
-                    println("[BugreportExtractor] Detected zip path inside text but file not found: $zipPath")
+                    println("[BugreportExtractor] Pointer TXT found, but ZIP not found at $zipPath, falling back to plain text.")
                     text
                 }
             } else {
@@ -839,11 +848,29 @@ private fun DesktopChatApp() {
         )
     }
 
-    private suspend fun loadBugreportText(bugreportFilePath: String): String {
+    suspend fun loadBugreportText(bugreportFilePath: String): String {
         return loadBugreportTextResult(bugreportFilePath).text
     }
 
-    suspend fun runBugreportPipeline( mode: BugreportPipelineMode,  onMessage: (String) -> Unit ) {
+    private fun copyBugreportToStorage(bugreportPath: String): String {
+        val source = Paths.get(bugreportPath)
+        val target = StoragePaths.bugreportsDir.resolve(source.fileName)
+        return try {
+            Files.createDirectories(target.parent)
+            Files.copy(source, target, StandardCopyOption.REPLACE_EXISTING)
+            println("[Storage] Copying bugreport from $source to $target")
+            HistoryLogger.log("Bugreport copied to local storage: $target")
+            target.toString()
+        } catch (t: Throwable) {
+            println("[Storage] Failed to copy bugreport from $source to $target: ${t.message}")
+            HistoryLogger.log("Failed to copy bugreport from $source to $target: ${t.message}")
+            bugreportPath
+        }
+    }
+
+    suspend fun runBugreportPipeline(mode: BugreportPipelineMode, onMessage: (String) -> Unit) {
+        HistoryLogger.log("COMMAND: /orchestrate bugreport $mode")
+        println("[Orchestrator] Starting bugreport pipeline for mode=$mode")
         onMessage("[Pipeline] Стартую пайплайн ADB → LLM → файл (режим: $mode)")
 
         val serial = when (mode) {
@@ -860,22 +887,31 @@ private fun DesktopChatApp() {
 
         val bugreportPath = bugreportResult.filePath
         onMessage("[Pipeline] Bugreport сохранён в файле: $bugreportPath")
+        HistoryLogger.log("MCP-ADB: bugreport stored at $bugreportPath")
+
+        val localBugreportPath = copyBugreportToStorage(bugreportPath)
 
         val bugreportTextResult = try {
-            loadBugreportTextResult(bugreportPath)
+            loadBugreportTextResult(localBugreportPath)
         } catch (e: BugreportExtractionException) {
             println("[BugreportExtractor] Failed to prepare bugreport text file: ${e.message}")
-            onMessage(e.message ?: "Не удалось подготовить bugreport из файла: $bugreportPath")
+            onMessage(e.message ?: "Не удалось подготовить bugreport из файла: $localBugreportPath")
+            HistoryLogger.log("Bugreport extraction failed: ${e.message}")
             return
         } catch (t: Throwable) {
             println("[Orchestrator] Failed to read bugreport text: ${t.message}")
-            onMessage("Не удалось прочитать текст bugreport из файла `$bugreportPath`. Проверь, что файл существует и доступен.")
+            onMessage("Не удалось прочитать текст bugreport из файла `$localBugreportPath`. Проверь, что файл существует и доступен.")
+            HistoryLogger.log("Bugreport read failed: ${t.message}")
             return
         }
         println("[Orchestrator] Using bugreport text file for analysis: ${bugreportTextResult.source}")
+        HistoryLogger.log("Bugreport text ready from ${bugreportTextResult.source}, length=${bugreportTextResult.originalLength}, used=${bugreportTextResult.usedLength}")
 
         val normalizedBugreportText = bugreportTextResult.text
         val isTruncated = bugreportTextResult.originalLength > bugreportTextResult.usedLength
+        if (isTruncated) {
+            println("[Orchestrator] Truncating bugreport text from ${bugreportTextResult.originalLength} to ${bugreportTextResult.usedLength} characters for LLM")
+        }
 
         onMessage("Готово! Нашёл bugreport.txt в архиве и отправил в анализ.")
 
@@ -891,12 +927,27 @@ private fun DesktopChatApp() {
             appendLine(normalizedBugreportText)
         }
 
+        val timestampForFiles = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss").withZone(ZoneId.systemDefault()).format(Instant.now())
+        val llmInputPath = StoragePaths.llmInputsDir.resolve("bugreport-${serial}-${timestampForFiles}.txt")
+        runCatching {
+            Files.writeString(llmInputPath, userPrompt, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING)
+        }.onSuccess {
+            println("[Storage] Saved LLM bugreport input to $llmInputPath (length=${userPrompt.length})")
+            HistoryLogger.log("LLM input (bugreport) saved to $llmInputPath, length=${userPrompt.length}")
+        }.onFailure {
+            println("[Storage] Failed to store LLM bugreport input: ${it.message}")
+            HistoryLogger.log("Failed to store LLM bugreport input: ${it.message}")
+        }
+
         val apiKey = settings.openRouterApiKey.takeIf { it.isNotBlank() } ?: OpenRouterConfig.apiKey
         if (apiKey.isNullOrBlank()) {
             onMessage("[Pipeline] Ошибка: отсутствует OPENROUTER_API_KEY для вызова LLM.")
+            HistoryLogger.log("LLM call skipped: missing OPENROUTER_API_KEY")
             return
         }
 
+        println("[Orchestrator] Calling LLM bugreport summary, inputLength=${userPrompt.length}")
+        HistoryLogger.log("LLM: calling bugreport summary, inputLength=${userPrompt.length}")
         onMessage("[Pipeline] Отправляю bugreport в LLM для генерации summary...")
         val llmResult = withContext(Dispatchers.IO) {
             callOpenRouter(
@@ -916,11 +967,13 @@ private fun DesktopChatApp() {
             is OpenRouterResult.Failure -> {
                 val message = llmResult.error.message ?: llmResult.error.rawBody ?: "неизвестная ошибка"
                 onMessage("[Pipeline] Ошибка при вызове LLM: $message")
+                HistoryLogger.log("LLM bugreport summary failed: $message")
                 return
             }
         }
 
         println("[Orchestrator] Bugreport summary generated, length=${summaryText.length}")
+        HistoryLogger.log("LLM: bugreport summary length=${summaryText.length}")
 
         onMessage("[Pipeline] LLM сгенерировал summary, сохраняю в файл через MCP...")
 
@@ -928,6 +981,7 @@ private fun DesktopChatApp() {
             .format(Instant.now())
         val fileName = "bugreport-${serial}-$timestamp-summary.md"
 
+        println("[MCP-CLIENT] Calling fs.save_summary with fileName=$fileName")
         val saveResult = withContext(Dispatchers.IO) {
             withMcpGithubClient { client ->
                 client.saveSummaryToFile(
@@ -938,6 +992,8 @@ private fun DesktopChatApp() {
         }
 
         val summaryFilePath = saveResult.filePath
+        println("[MCP-CLIENT] fs.save_summary -> filePath=$summaryFilePath")
+        HistoryLogger.log("fs.save_summary saved bugreport summary to $summaryFilePath")
         onMessage("[Pipeline] Summary по bugreport сохранён в файле: $summaryFilePath")
         onMessage("[Orchestration] Анализ проведён. Использован текстовый bugreport.")
 
@@ -1000,6 +1056,7 @@ private fun DesktopChatApp() {
         onMessage: (String) -> Unit
     ) {
         try {
+            HistoryLogger.log("COMMAND: /pipeline $mode")
             onMessage(
                 when (mode) {
                     PipelineMode.AllOpenPrs -> "[Pipeline] Запускаю пайплайн summary по всем открытым PR..."
@@ -1109,6 +1166,23 @@ private fun DesktopChatApp() {
                 }
             }
 
+            val prTimestamp = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss").withZone(ZoneId.systemDefault())
+                .format(Instant.now())
+            val llmInputFileName = when (mode) {
+                is PipelineMode.SinglePr -> "pr-${mode.number}-summary-input.md"
+                PipelineMode.AllOpenPrs -> "prs-open-$prTimestamp-summary-input.md"
+            }
+            val prLlmInputPath = StoragePaths.llmInputsDir.resolve(llmInputFileName)
+            runCatching {
+                Files.writeString(prLlmInputPath, llmInput, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING)
+            }.onSuccess {
+                println("[Storage] Saved LLM PR input to $prLlmInputPath (length=${llmInput.length})")
+                HistoryLogger.log("LLM input (PR summary) saved to $prLlmInputPath, length=${llmInput.length}")
+            }.onFailure {
+                println("[Storage] Failed to store LLM PR input: ${it.message}")
+                HistoryLogger.log("Failed to store LLM PR input: ${it.message}")
+            }
+
             val apiKey = settings.openRouterApiKey.takeIf { it.isNotBlank() } ?: OpenRouterConfig.apiKey
             if (apiKey.isNullOrBlank()) {
                 onMessage("[Pipeline] Ошибка: отсутствует OPENROUTER_API_KEY для вызова LLM.")
@@ -1116,6 +1190,7 @@ private fun DesktopChatApp() {
             }
 
             println("[Pipeline] Calling LLM to generate summary...")
+            HistoryLogger.log("LLM: calling PR summary, inputLength=${llmInput.length}")
             val llmResult = withContext(Dispatchers.IO) {
                 callOpenRouter(
                     model = settings.openRouterModel,
@@ -1141,6 +1216,7 @@ private fun DesktopChatApp() {
             }
             println("[Pipeline] LLM summary generated, length=${summaryText.length}")
             onMessage("[Pipeline] LLM сгенерировал summary, сохраняю в файл через MCP...")
+            HistoryLogger.log("LLM: PR summary generated, length=${summaryText.length}")
 
             val timestamp = DateTimeFormatter.ofPattern("yyyyMMdd-HHmm").withZone(ZoneId.systemDefault())
                 .format(Instant.now())
@@ -1148,6 +1224,7 @@ private fun DesktopChatApp() {
                 is PipelineMode.SinglePr -> "pr-${mode.number}-summary.md"
                 PipelineMode.AllOpenPrs -> "prs-open-summary-$timestamp.md"
             }
+            println("[MCP-CLIENT] Calling fs.save_summary with fileName=$fileName")
             val saveResult = withContext(Dispatchers.IO) {
                 withMcpGithubClient { client ->
                     client.saveSummaryToFile(
@@ -1157,6 +1234,8 @@ private fun DesktopChatApp() {
                 }
             }
             val filePath = saveResult.filePath
+            println("[MCP-CLIENT] fs.save_summary -> filePath=$filePath")
+            HistoryLogger.log("fs.save_summary saved PR summary to $filePath")
             println("[Pipeline] Summary saved via MCP to: $filePath")
             onMessage(
                 buildString {
@@ -1365,6 +1444,7 @@ private fun DesktopChatApp() {
     fun handleAdbCommand(text: String): Boolean {
         val trimmed = text.trim()
         if (trimmed.equals("/adb devices", ignoreCase = true)) {
+            HistoryLogger.log("COMMAND: /adb devices")
             addSystemMessage("[Orchestration] Запрашиваю список adb-устройств через MCP...")
             scope.launch {
                 isSending = true
@@ -1374,6 +1454,7 @@ private fun DesktopChatApp() {
                             conn.adbListDevices()
                         }
                     }
+                    HistoryLogger.log("MCP-ADB: listed ${result.devices.size} device(s)")
                     val message = if (result.devices.isEmpty()) {
                         "[Orchestration] adb-устройства не найдены."
                     } else {
@@ -1408,6 +1489,7 @@ private fun DesktopChatApp() {
                 return true
             }
 
+            HistoryLogger.log("COMMAND: /adb bugreport $serial")
             addSystemMessage("[Orchestration] Снимаю bugreport с устройства $serial через MCP ADB...")
             scope.launch {
                 isSending = true
@@ -1419,22 +1501,31 @@ private fun DesktopChatApp() {
                     }
                     val bugreportPath = bugreportResult.filePath
                     println("[Orchestration] Bugreport file path: $bugreportPath")
+                    HistoryLogger.log("MCP-ADB: bugreport stored at $bugreportPath")
 
+                    val localBugreportPath = copyBugreportToStorage(bugreportPath)
                     val bugreportTextResult = try {
-                        loadBugreportTextResult(bugreportPath)
+                        loadBugreportTextResult(localBugreportPath)
                     } catch (e: BugreportExtractionException) {
                         println("[BugreportExtractor] Failed to prepare bugreport text file in /orchestrate bugreport: ${e.message}")
-                        addSystemMessage(e.message ?: "Не удалось подготовить bugreport из файла: $bugreportPath")
+                        addSystemMessage(e.message ?: "Не удалось подготовить bugreport из файла: $localBugreportPath")
+                        HistoryLogger.log("Bugreport extraction failed: ${e.message}")
                         return@launch
                     } catch (t: Throwable) {
                         println("[Orchestrator] Failed to read bugreport text: ${t.message}")
-                        addSystemMessage("Не удалось прочитать текст bugreport из файла `$bugreportPath`. Проверь, что файл существует и доступен.")
+                        addSystemMessage("Не удалось прочитать текст bugreport из файла `$localBugreportPath`. Проверь, что файл существует и доступен.")
+                        HistoryLogger.log("Bugreport read failed: ${t.message}")
                         return@launch
                     }
                     println("[Orchestrator] Using bugreport text file for /orchestrate bugreport: ${bugreportTextResult.source}")
+                    HistoryLogger.log("Bugreport text ready from ${bugreportTextResult.source}, length=${bugreportTextResult.originalLength}, used=${bugreportTextResult.usedLength}")
                     val normalizedBugreportText = bugreportTextResult.text
                     val isTruncated = bugreportTextResult.originalLength > bugreportTextResult.usedLength
                     addSystemMessage("Готово! Нашёл текстовый bugreport и отправил в анализ.\nФайл: ${bugreportTextResult.source}")
+
+                    if (isTruncated) {
+                        println("[Orchestrator] Truncating bugreport text from ${bugreportTextResult.originalLength} to ${bugreportTextResult.usedLength} characters for LLM")
+                    }
 
                     val apiKey = settings.openRouterApiKey.takeIf { it.isNotBlank() } ?: OpenRouterConfig.apiKey
                     if (apiKey.isNullOrBlank()) {
@@ -1442,6 +1533,8 @@ private fun DesktopChatApp() {
                         return@launch
                     }
 
+                    val timestampForFiles = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss").withZone(ZoneId.systemDefault()).format(Instant.now())
+                    val llmInputPath = StoragePaths.llmInputsDir.resolve("bugreport-${serial}-${timestampForFiles}.txt")
                     val userPrompt = buildString {
                         appendLine("Ниже полный текст bugreport (обрезан до $MAX_BUGREPORT_PROMPT_CHARS символов, если он слишком большой):")
                         appendLine()
@@ -1452,6 +1545,18 @@ private fun DesktopChatApp() {
                         appendLine(normalizedBugreportText)
                     }
 
+                    runCatching {
+                        Files.writeString(llmInputPath, userPrompt, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING)
+                    }.onSuccess {
+                        println("[Storage] Saved LLM bugreport input to $llmInputPath (length=${userPrompt.length})")
+                        HistoryLogger.log("LLM input (bugreport) saved to $llmInputPath, length=${userPrompt.length}")
+                    }.onFailure {
+                        println("[Storage] Failed to store LLM bugreport input: ${it.message}")
+                        HistoryLogger.log("Failed to store LLM bugreport input: ${it.message}")
+                    }
+
+                    println("[Orchestrator] Calling LLM bugreport summary, inputLength=${userPrompt.length}")
+                    HistoryLogger.log("LLM: calling bugreport summary, inputLength=${userPrompt.length}")
                     val llmResult = withContext(Dispatchers.IO) {
                         callOpenRouter(
                             model = settings.openRouterModel,
@@ -1469,6 +1574,7 @@ private fun DesktopChatApp() {
                         is OpenRouterResult.Success -> {
                             val summaryText = llmResult.content
                             println("[Orchestrator] Bugreport summary generated, length=${summaryText.length}")
+                            HistoryLogger.log("LLM: bugreport summary length=${summaryText.length}")
                             addSystemMessage("[Orchestration] Анализ проведён. Использован текстовый bugreport.")
                             addAssistantMessage(
                                 buildString {
@@ -1482,6 +1588,7 @@ private fun DesktopChatApp() {
                         is OpenRouterResult.Failure -> {
                             val message = llmResult.error.message ?: llmResult.error.rawBody ?: "неизвестная ошибка"
                             addSystemMessage("[Orchestration] Ошибка при анализе bugreport: $message")
+                            HistoryLogger.log("LLM bugreport summary failed: $message")
                         }
                     }
                 } catch (t: Throwable) {

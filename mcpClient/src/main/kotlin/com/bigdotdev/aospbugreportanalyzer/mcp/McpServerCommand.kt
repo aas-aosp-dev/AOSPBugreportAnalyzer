@@ -4,7 +4,7 @@ import java.nio.file.Path
 import java.nio.file.Paths
 
 private fun mcpServerPath(fileName: String): Path =
-    Paths.get("..", "AOSPBugreportAnalyzerMCPServer", "src", fileName)
+    Paths.get("../..", "AOSPBugreportAnalyzerMCPServer", "src", fileName)
 
 internal fun defaultGithubServerCommand(): List<String> {
     val path = mcpServerPath("server.ts")
