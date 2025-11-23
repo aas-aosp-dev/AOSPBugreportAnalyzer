@@ -1,5 +1,6 @@
 package com.bigdotdev.aospbugreportanalyzer.reminder
 
+import com.bigdotdev.aospbugreportanalyzer.storage.StoragePaths
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.booleanOrNull
@@ -31,8 +32,7 @@ object GithubReminderStorage {
     }
 
     private val configFile: File by lazy {
-        val userHome = System.getProperty("user.home") ?: "."
-        val dir = File(userHome, ".aosp_bugreport_analyzer")
+        val dir = StoragePaths.configDir.toFile()
         if (!dir.exists()) {
             dir.mkdirs()
         }
