@@ -12,9 +12,10 @@ object StoragePaths {
     val historyDir: Path = baseDir.resolve("history")
     val bugreportsDir: Path = baseDir.resolve("bugreports")
     val llmInputsDir: Path = baseDir.resolve("llm_inputs")
+    val indexesDir: Path = baseDir.resolve("indexes")
 
     init {
-        listOf(baseDir, configDir, historyDir, bugreportsDir, llmInputsDir).forEach { dir ->
+        listOf(baseDir, configDir, historyDir, bugreportsDir, llmInputsDir, indexesDir).forEach { dir ->
             try {
                 Files.createDirectories(dir)
             } catch (t: Throwable) {
