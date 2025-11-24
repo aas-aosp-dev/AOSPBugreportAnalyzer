@@ -11,8 +11,8 @@ import java.time.format.DateTimeFormatter
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 
-private const val BUGREPORT_INDEX_CHUNK_SIZE = 1500
-private const val BUGREPORT_INDEX_CHUNK_OVERLAP = 300
+private const val BUGREPORT_INDEX_CHUNK_SIZE = 800
+private const val BUGREPORT_INDEX_CHUNK_OVERLAP = 200
 const val DEFAULT_EMBEDDINGS_MODEL = "nomic-embed-text"
 
 suspend fun buildBugreportIndex(
