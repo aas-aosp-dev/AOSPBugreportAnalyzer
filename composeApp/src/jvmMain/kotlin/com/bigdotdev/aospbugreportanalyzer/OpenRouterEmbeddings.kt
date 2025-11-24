@@ -2,52 +2,109 @@ package com.bigdotdev.aospbugreportanalyzer
 
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.double
+import java.net.URI
+import java.net.http.HttpClient
+import java.net.http.HttpRequest
+import java.net.http.HttpResponse
+import java.time.Duration
 
 /**
- * Локальные "эмбеддинги" без внешних API.
+ * Эмбеддинги через локальный Ollama:
  *
- * Для каждого текста строим вектор фиксированной длины (по умолчанию 128)
- * по схеме hash-bag-of-words:
- *  - разбиваем текст на слова
- *  - для каждого слова считаем hashCode()
- *  - бакет = (hash & Int.MAX_VALUE) % dim
- *  - увеличиваем счётчик в этом бакете
+ * POST http://localhost:11434/api/embeddings
  *
- * Это не семантические эмбеддинги, но для демонстрации RAG-индекса
- * (День 15: чанки + векторы + JSON) этого достаточно.
+ * Request:
+ * {
+ *   "model": "nomic-embed-text",
+ *   "prompt": "..."      // один текст
+ * }
+ *
+ * Response:
+ * {
+ *   "embedding": [ ... ] // один вектор
+ * }
+ *
+ * Мы вызываем Ollama по одному запросу на каждый чанк.
  */
 suspend fun callOpenRouterEmbeddings(
     texts: List<String>,
-    model: String,              // игнорируем, но оставляем для совместимости
-    apiKeyOverride: String? = null
-): Result<List<List<Double>>> = withContext(Dispatchers.Default) {
+    model: String,
+    apiKeyOverride: String? = null // не используется, но оставлен для совместимости
+): Result<List<List<Double>>> = withContext(Dispatchers.IO) {
 
     if (texts.isEmpty()) {
         return@withContext Result.success(emptyList())
     }
 
-    // Размер вектора можно потом вынести в конфиг
-    val dim = 128
+    // Максимальная длина текста, которую отправляем в Ollama
+    // (если текст больше — аккуратно отрезаем начало)
+    val maxPromptLength = 2000
+
+    val json = Json {
+        ignoreUnknownKeys = true
+    }
+
+    val client = HttpClient.newBuilder()
+        .connectTimeout(Duration.ofSeconds(30))
+        .build()
+
+    val results = mutableListOf<List<Double>>()
 
     try {
-        val embeddings = texts.map { text ->
-            val vector = DoubleArray(dim) { 0.0 }
+        for ((idx, text) in texts.withIndex()) {
+            val safePrompt =
+                if (text.length > maxPromptLength) text.take(maxPromptLength) else text
 
-            // очень простое разбиение, нам хватает
-            val words = text.split(Regex("\\s+"))
-                .filter { it.isNotBlank() }
-
-            for (word in words) {
-                val h = word.hashCode()
-                val idx = (h and Int.MAX_VALUE) % dim
-                vector[idx] += 1.0
+            val bodyJson = buildJsonObject {
+                put("model", JsonPrimitive(model))
+                put("prompt", JsonPrimitive(safePrompt))
             }
 
-            vector.toList()
+            val request = HttpRequest.newBuilder()
+                .uri(URI.create("http://localhost:11434/api/embeddings"))
+                .header("Content-Type", "application/json")
+                .timeout(Duration.ofSeconds(60))
+                .POST(
+                    HttpRequest.BodyPublishers.ofString(
+                        json.encodeToString(JsonObject.serializer(), bodyJson)
+                    )
+                )
+                .build()
+
+            val response = client.send(request, HttpResponse.BodyHandlers.ofString())
+
+            if (response.statusCode() !in 200..299) {
+                return@withContext Result.failure<List<List<Double>>>(
+                    IllegalStateException(
+                        "Ollama embeddings request failed for chunk $idx: " +
+                                "status ${response.statusCode()}, body=${response.body()}"
+                    )
+                )
+            }
+
+            val root = json.parseToJsonElement(response.body()).jsonObject
+            val embeddingArray = root["embedding"]?.jsonArray
+                ?: return@withContext Result.failure<List<List<Double>>>(
+                    IllegalStateException("Ollama embeddings response missing 'embedding' field for chunk $idx")
+                )
+
+            val embedding: List<Double> = embeddingArray.map { value ->
+                value.jsonPrimitive.double
+            }
+
+            results.add(embedding)
         }
 
-        Result.success(embeddings)
+        return@withContext Result.success(results.toList())
     } catch (t: Throwable) {
-        Result.failure(t)
+        return@withContext Result.failure<List<List<Double>>>(t)
     }
 }
