@@ -209,8 +209,9 @@ private class BugreportExtractionException(
     cause: Throwable? = null
 ) : Exception(message, cause)
 
-private object OpenRouterConfig {
+object OpenRouterConfig {
     const val BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
+    const val EMBEDDINGS_URL = "https://openrouter.ai/api/v1/embeddings"
     val apiKey: String? get() = System.getenv("OPENROUTER_API_KEY")
     const val referer: String = "http://localhost"
     const val title: String = "AOSPBugreportAnalyzer"
@@ -1164,6 +1165,23 @@ private fun DesktopChatApp() {
         println("[Orchestrator] Bugreport summary generated, length=${summaryText.length}")
         HistoryLogger.log("LLM: bugreport summary length=${summaryText.length}")
 
+        onMessage("[Pipeline] Строю локальный индекс bugreport (чанки + эмбеддинги)...")
+        HistoryLogger.log("BugreportIndex: building index for current bugreport")
+        try {
+            val index = buildBugreportIndex(
+                bugreportText = normalizedBugreportText,
+                bugreportSourcePath = bugreportTextResult.source,
+                embeddingsModel = DEFAULT_EMBEDDINGS_MODEL,
+                apiKey = apiKey
+            )
+            val indexPath = saveBugreportIndexToFile(index, StoragePaths.indexesDir)
+            onMessage("[Pipeline] Индекс bugreport сохранён: $indexPath")
+            HistoryLogger.log("BugreportIndex: saved to $indexPath, chunks=${index.chunks.size}")
+        } catch (t: Throwable) {
+            onMessage("[Pipeline] Не удалось построить индекс bugreport (чанки + эмбеддинги): ${t.message}")
+            HistoryLogger.log("BugreportIndex: failed to build index: ${t.message}")
+        }
+
         addSystemMessage("[Pipeline] Ищу связанные PR в GitHub через MCP...")
 
         val pullRequests = try {
@@ -1798,6 +1816,22 @@ private fun DesktopChatApp() {
                     if (summaryText != null) {
                         println("[Orchestrator] Bugreport summary generated, length=${summaryText.length}")
                         HistoryLogger.log("LLM: bugreport summary length=${summaryText.length}")
+                        addSystemMessage("[Pipeline] Строю локальный индекс bugreport (чанки + эмбеддинги)...")
+                        HistoryLogger.log("BugreportIndex: building index for current bugreport")
+                        try {
+                            val index = buildBugreportIndex(
+                                bugreportText = normalizedBugreportText,
+                                bugreportSourcePath = bugreportTextResult.source,
+                                embeddingsModel = DEFAULT_EMBEDDINGS_MODEL,
+                                apiKey = apiKey
+                            )
+                            val indexPath = saveBugreportIndexToFile(index, StoragePaths.indexesDir)
+                            addSystemMessage("[Pipeline] Индекс bugreport сохранён: $indexPath")
+                            HistoryLogger.log("BugreportIndex: saved to $indexPath, chunks=${index.chunks.size}")
+                        } catch (t: Throwable) {
+                            addSystemMessage("[Pipeline] Не удалось построить индекс bugreport (чанки + эмбеддинги): ${t.message}")
+                            HistoryLogger.log("BugreportIndex: failed to build index: ${t.message}")
+                        }
                         addSystemMessage("[Orchestration] Анализ проведён. Использован текстовый bugreport.")
                         addAssistantMessage(
                             buildString {
