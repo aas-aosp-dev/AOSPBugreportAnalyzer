@@ -31,6 +31,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
@@ -97,6 +98,13 @@ import com.bigdotdev.aospbugreportanalyzer.memory.MessageStats
 import com.bigdotdev.aospbugreportanalyzer.memory.MemoryMeta
 import com.bigdotdev.aospbugreportanalyzer.memory.createAgentMemoryStore
 import com.bigdotdev.aospbugreportanalyzer.reminder.GithubReminderStorage
+import com.bigdotdev.aospbugreportanalyzer.rag.RagMode
+import com.bigdotdev.aospbugreportanalyzer.rag.RagServiceLocator
+import com.bigdotdev.aospbugreportanalyzer.rag.ScoredChunk
+import com.bigdotdev.aospbugreportanalyzer.rag.askLlmPlain
+import com.bigdotdev.aospbugreportanalyzer.rag.askLlmWithRag
+import com.bigdotdev.aospbugreportanalyzer.rag.compareRagAndPlain
+import com.bigdotdev.aospbugreportanalyzer.rag.toEmbeddingIndex
 
 private enum class Screen { MAIN, SETTINGS }
 
@@ -664,6 +672,7 @@ private fun DesktopChatApp() {
     var memoryCount by remember { mutableStateOf(0) }
     var recentMemoryEntries by remember { mutableStateOf<List<AgentMemoryEntry>>(emptyList()) }
     var reminderConfig by remember { mutableStateOf(GithubReminderStorage.load()) }
+    var ragMode by remember { mutableStateOf(RagMode.PLAIN) }
 
     val reminderEnabled = reminderConfig.enabled
     val reminderIntervalMinutes = reminderConfig.intervalMinutes
@@ -700,6 +709,47 @@ private fun DesktopChatApp() {
             withContext(Dispatchers.Main) {
                 memoryCount = 0
                 recentMemoryEntries = emptyList()
+            }
+        }
+    }
+
+    fun configureRagProviders(apiKey: String, model: String) {
+        RagServiceLocator.embeddingProvider = { text, embeddingModel ->
+            val result = callOpenRouterEmbeddings(listOf(text), embeddingModel, apiKeyOverride = apiKey)
+            result.getOrElse { throw it }.firstOrNull() ?: emptyList()
+        }
+        RagServiceLocator.llmResponder = { prompt ->
+            val messages = listOf(
+                ORMessage("system", selectSystemPrompt(false)),
+                ORMessage("user", prompt)
+            )
+            when (val result = callOpenRouter(
+                model = model,
+                messages = messages,
+                forceJson = false,
+                apiKeyOverride = apiKey,
+                temperature = 0.0
+            )) {
+                is OpenRouterResult.Success -> result.content
+                is OpenRouterResult.Failure -> throw IllegalStateException(result.error.toUserMessage())
+            }
+        }
+    }
+
+    fun formatChunks(chunks: List<ScoredChunk>): String {
+        if (chunks.isEmpty()) return "Чанки не найдены для этого запроса."
+        return buildString {
+            appendLine("Использованные чанки (top-${chunks.size}):")
+            chunks.forEachIndexed { idx, scored ->
+                appendLine("${idx + 1}) [ID=${scored.chunk.id}] score=${"%.3f".format(scored.score)}")
+                if (scored.chunk.metadata.isNotEmpty()) {
+                    scored.chunk.metadata.forEach { (key, value) ->
+                        appendLine("   [$key=$value]")
+                    }
+                }
+                val snippet = scored.chunk.text.take(160).replace('\n', ' ')
+                appendLine("   \"$snippet...\"")
+                appendLine()
             }
         }
     }
@@ -1904,6 +1954,166 @@ private fun DesktopChatApp() {
         return false
     }
 
+    fun handlePlainMode(
+        history: List<ChatMessage>,
+        userText: String,
+        apiKey: String,
+        strictJson: Boolean,
+        model: String
+    ) {
+        scope.launch(Dispatchers.IO) {
+            val requestMessages = buildChatRequestMessages(history, strictJson)
+            val result = callOpenRouter(
+                model = model,
+                messages = requestMessages,
+                forceJson = strictJson,
+                apiKeyOverride = apiKey,
+                temperature = 0.0
+            )
+            val agentMessage = when (result) {
+                is OpenRouterResult.Success -> ChatMessage(
+                    author = "Эксперт",
+                    role = AuthorRole.EXPERT,
+                    text = result.content,
+                    metrics = result.stats.toMsgMetrics()
+                )
+
+                is OpenRouterResult.Failure -> {
+                    val errorMessage = result.error.toUserMessage()
+                    ChatMessage(
+                        author = "Эксперт",
+                        role = AuthorRole.EXPERT,
+                        text = errorResponse(strictJson, errorMessage),
+                        metrics = MsgMetrics(null, null, null, null, null, error = errorMessage)
+                    )
+                }
+            }
+            println("[AgentMemory] before persistTurnAndFetch: result=${result::class.simpleName}, agentText='${agentMessage.text.take(80)}'")
+            withContext(Dispatchers.Main) {
+                appendMessage(agentMessage)
+                maybeCompressHistory()
+                isSending = false
+            }
+            val updatedEntries = runCatching {
+                persistTurnAndFetch(
+                    userMessage = userText,
+                    assistantMessage = agentMessage.text,
+                    stats = (result as? OpenRouterResult.Success)?.stats?.toMessageStats(),
+                    tags = listOf("chat"),
+                    isSummaryTurn = false
+                )
+            }
+                .onFailure {
+                    println("[AgentMemory] persistTurnAndFetch failed: ${it.message}")
+                    it.printStackTrace()
+                }
+                .getOrNull()
+            if (updatedEntries != null) {
+                withContext(Dispatchers.Main) {
+                    refreshMemory(updatedEntries)
+                }
+            }
+        }
+    }
+
+    fun handleRagOnlyMode(
+        userText: String,
+        appendMessage: (ChatMessage) -> Unit,
+        addSystemMessage: (String) -> Unit
+    ) {
+        scope.launch(Dispatchers.IO) {
+            val index = loadLatestBugreportIndex()?.toEmbeddingIndex()
+            if (index == null) {
+                withContext(Dispatchers.Main) {
+                    addSystemMessage("Не найден локальный индекс bugreport. Сначала постройте индекс.")
+                    isSending = false
+                }
+                return@launch
+            }
+            val result = runCatching { askLlmWithRag(userText, index, topK = 5) }
+            val responseMessage = result.fold(
+                onSuccess = {
+                    ChatMessage(
+                        author = "Эксперт",
+                        role = AuthorRole.EXPERT,
+                        text = "${it.answer}\n\nРежим: RAG",
+                        metrics = null
+                    )
+                },
+                onFailure = {
+                    ChatMessage(
+                        author = "Эксперт",
+                        role = AuthorRole.EXPERT,
+                        text = "Ошибка RAG: ${it.message}",
+                        metrics = MsgMetrics(null, null, null, null, null, error = it.message)
+                    )
+                }
+            )
+            val chunkMessage = result.getOrNull()?.let {
+                ChatMessage(
+                    author = "RAG",
+                    role = AuthorRole.EXPERT,
+                    text = formatChunks(it.usedChunks),
+                    metrics = null
+                )
+            }
+            withContext(Dispatchers.Main) {
+                appendMessage(responseMessage)
+                chunkMessage?.let { appendMessage(it) }
+                isSending = false
+            }
+        }
+    }
+
+    fun handleCompareMode(
+        userText: String,
+        appendMessage: (ChatMessage) -> Unit,
+        addSystemMessage: (String) -> Unit
+    ) {
+        scope.launch(Dispatchers.IO) {
+            val index = loadLatestBugreportIndex()?.toEmbeddingIndex()
+            if (index == null) {
+                withContext(Dispatchers.Main) {
+                    addSystemMessage("Не найден локальный индекс bugreport. Сначала постройте индекс.")
+                    isSending = false
+                }
+                return@launch
+            }
+            val comparison = runCatching { compareRagAndPlain(userText, index, topK = 5) }
+            comparison.onFailure { err ->
+                withContext(Dispatchers.Main) {
+                    addSystemMessage("Ошибка сравнения RAG: ${err.message}")
+                    isSending = false
+                }
+            }
+            val result = comparison.getOrNull() ?: return@launch
+            val plainMsg = ChatMessage(
+                author = "Эксперт",
+                role = AuthorRole.EXPERT,
+                text = "Ответ без RAG:\n${result.plainAnswer}",
+                metrics = null
+            )
+            val ragMsg = ChatMessage(
+                author = "Эксперт",
+                role = AuthorRole.EXPERT,
+                text = "Ответ с RAG:\n${result.ragAnswer}",
+                metrics = null
+            )
+            val chunkMsg = ChatMessage(
+                author = "RAG",
+                role = AuthorRole.EXPERT,
+                text = formatChunks(result.usedChunks),
+                metrics = null
+            )
+            withContext(Dispatchers.Main) {
+                appendMessage(plainMsg)
+                appendMessage(ragMsg)
+                appendMessage(chunkMsg)
+                isSending = false
+            }
+        }
+    }
+
     fun sendMessage() {
         val text = input.trim()
         if (text.isEmpty() || isSending) return
@@ -1930,7 +2140,7 @@ private fun DesktopChatApp() {
 
         println("[AgentMemory] sendMessage: userText='${text.take(80)}'")
         val userMessage = ChatMessage(
-            author = "USER",
+            author = "Вы",
             role = AuthorRole.USER,
             text = text,
             metrics = MsgMetrics(null, null, null, null, null, error = null)
@@ -1939,62 +2149,34 @@ private fun DesktopChatApp() {
         messages = newHistory
         input = ""
         val apiKey = settings.openRouterApiKey.takeIf { it.isNotBlank() } ?: OpenRouterConfig.apiKey
+        if (apiKey.isNullOrBlank()) {
+            addSystemMessage("Укажите OPENROUTER_API_KEY, чтобы Эксперт мог отвечать.")
+            return
+        }
+        configureRagProviders(apiKey, settings.openRouterModel)
         isSending = true
-        val model = settings.openRouterModel
         val strictJson = settings.strictJsonEnabled
-        scope.launch(Dispatchers.IO) {
-            val requestMessages = buildChatRequestMessages(newHistory, strictJson)
-            val result = callOpenRouter(
-                model = model,
-                messages = requestMessages,
-                forceJson = strictJson,
-                apiKeyOverride = apiKey,
-                temperature = 0.0
+        val currentHistory = newHistory
+        when (ragMode) {
+            RagMode.PLAIN -> handlePlainMode(
+                history = currentHistory,
+                userText = text,
+                apiKey = apiKey,
+                strictJson = strictJson,
+                model = settings.openRouterModel
             )
-            val agentMessage = when (result) {
-                is OpenRouterResult.Success -> ChatMessage(
-                    author = "Эксперт",
-                    role = AuthorRole.EXPERT,
-                    text = result.content,
-                    metrics = result.stats.toMsgMetrics()
-                )
-                is OpenRouterResult.Failure -> {
-                    val errorMessage = result.error.toUserMessage()
-                    ChatMessage(
-                        author = "Эксперт",
-                        role = AuthorRole.EXPERT,
-                        text = errorResponse(strictJson, errorMessage),
-                        metrics = MsgMetrics(null, null, null, null, null, error = errorMessage)
-                    )
-                }
-            }
-            println(
-                "[AgentMemory] before persistTurnAndFetch: result=${result::class.simpleName}, agentText='${agentMessage.text.take(80)}'"
+
+            RagMode.RAG_ONLY -> handleRagOnlyMode(
+                userText = text,
+                appendMessage = { appendMessage(it) },
+                addSystemMessage = { addSystemMessage(it) }
             )
-            withContext(Dispatchers.Main) {
-                appendMessage(agentMessage)
-                maybeCompressHistory()
-                isSending = false
-            }
-            val updatedEntries = runCatching {
-                persistTurnAndFetch(
-                    userMessage = text,
-                    assistantMessage = agentMessage.text,
-                    stats = (result as? OpenRouterResult.Success)?.stats?.toMessageStats(),
-                    tags = listOf("chat"),
-                    isSummaryTurn = false
-                )
-            }
-                .onFailure {
-                    println("[AgentMemory] persistTurnAndFetch failed: ${it.message}")
-                    it.printStackTrace()
-                }
-                .getOrNull()
-            if (updatedEntries != null) {
-                withContext(Dispatchers.Main) {
-                    refreshMemory(updatedEntries)
-                }
-            }
+
+            RagMode.COMPARE -> handleCompareMode(
+                userText = text,
+                appendMessage = { appendMessage(it) },
+                addSystemMessage = { addSystemMessage(it) }
+            )
         }
     }
 
@@ -2071,6 +2253,28 @@ private fun DesktopChatApp() {
                             GithubReminderStorage.save(updated)
                         }
                     )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text("Режим ответа:", style = MaterialTheme.typography.bodyMedium)
+                        RagMode.values().forEach { mode ->
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                RadioButton(
+                                    selected = ragMode == mode,
+                                    onClick = { ragMode = mode }
+                                )
+                                Text(
+                                    text = when (mode) {
+                                        RagMode.PLAIN -> "Без RAG"
+                                        RagMode.RAG_ONLY -> "RAG"
+                                        RagMode.COMPARE -> "Сравнить"
+                                    }
+                                )
+                            }
+                        }
+                    }
                     OutlinedTextField(
                         value = input,
                         onValueChange = { input = it },
