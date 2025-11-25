@@ -1985,7 +1985,8 @@ private fun DesktopChatApp() {
             text = text,
             metrics = MsgMetrics(null, null, null, null, null, error = null)
         )
-        messages = messages + userMessage
+        val newHistory = messages + userMessage
+        messages = newHistory
         input = ""
         val apiKey = settings.openRouterApiKey.takeIf { it.isNotBlank() } ?: OpenRouterConfig.apiKey
         if (apiKey.isNullOrBlank()) {
@@ -1995,7 +1996,7 @@ private fun DesktopChatApp() {
         configureRagProviders(apiKey, settings.openRouterModel)
         isSending = true
         val strictJson = settings.strictJsonEnabled
-        val currentHistory = messages
+        val currentHistory = newHistory
         when (ragMode) {
             RagMode.PLAIN -> {
                 val model = settings.openRouterModel
