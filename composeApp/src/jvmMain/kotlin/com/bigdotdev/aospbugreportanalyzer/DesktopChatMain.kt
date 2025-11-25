@@ -1988,6 +1988,7 @@ private fun DesktopChatApp() {
                     )
                 }
             }
+            println("[AgentMemory] before persistTurnAndFetch: result=${result::class.simpleName}, agentText='${agentMessage.text.take(80)}'")
             withContext(Dispatchers.Main) {
                 appendMessage(agentMessage)
                 maybeCompressHistory()
@@ -2139,7 +2140,7 @@ private fun DesktopChatApp() {
 
         println("[AgentMemory] sendMessage: userText='${text.take(80)}'")
         val userMessage = ChatMessage(
-            author = "USER",
+            author = "Вы",
             role = AuthorRole.USER,
             text = text,
             metrics = MsgMetrics(null, null, null, null, null, error = null)
