@@ -127,8 +127,7 @@ private sealed class BugreportPipelineMode {
 
 private const val MESSAGES_PER_SUMMARY = 10
 private const val MAX_RECENT_MESSAGES = 8
-private const val BUGREPORT_SUMMARY_PRIMARY_LIMIT = 80_000
-private const val BUGREPORT_SUMMARY_FALLBACK_LIMIT = 40_000
+private const val BUGREPORT_SUMMARY_FALLBACK_LIMIT = 8_000
 private const val BUGREPORT_SUMMARY_MAX_TOKENS = 3_000
 
 private data class MsgMetrics(
@@ -158,10 +157,11 @@ private data class SummaryResult(
 )
 
 private data class BugreportTextResult(
-    val text: String,
+    val fullText: String,
+    val summaryText: String,
     val source: String,
     val originalLength: Int,
-    val usedLength: Int
+    val summaryLength: Int
 )
 
 data class CompressionStats(
@@ -945,21 +945,22 @@ private fun DesktopChatApp() {
             }
         }
 
-        val normalizedBugreportText = trimBugreportForSummary(bugreportText, BUGREPORT_SUMMARY_PRIMARY_LIMIT)
-        println("[Orchestrator] Loaded bugreport text from $effectiveSource, length=${bugreportText.length}, used=${normalizedBugreportText.length}")
-        val preview = normalizedBugreportText.replace("\\s+".toRegex(), " ").take(300)
+        val summaryReadyText = bugreportText
+        println("[Orchestrator] Loaded bugreport text from $effectiveSource, length=${bugreportText.length}, used=${summaryReadyText.length}")
+        val preview = summaryReadyText.replace("\\s+".toRegex(), " ").take(300)
         println("[Orchestrator] Bugreport text preview: $preview")
 
         return BugreportTextResult(
-            text = normalizedBugreportText,
+            fullText = bugreportText,
+            summaryText = summaryReadyText,
             source = effectiveSource,
             originalLength = bugreportText.length,
-            usedLength = normalizedBugreportText.length
+            summaryLength = summaryReadyText.length
         )
     }
 
     suspend fun loadBugreportText(bugreportFilePath: String): String {
-        return loadBugreportTextResult(bugreportFilePath).text
+        return loadBugreportTextResult(bugreportFilePath).summaryText
     }
 
     fun copyBugreportToStorage(bugreportPath: String): String {
@@ -980,9 +981,9 @@ private fun DesktopChatApp() {
 
     suspend fun callBugreportSummaryLlm(
         bugreportText: String,
-        limit: Int,
         apiKey: String,
-        model: String
+        model: String,
+        limit: Int = BUGREPORT_SUMMARY_CHUNK_LIMIT
     ): OpenRouterResult {
         val truncated = trimBugreportForSummary(bugreportText, limit)
         val truncatedLog = "[Orchestrator] Bugreport text truncated for LLM: original=${bugreportText.length}, used=${truncated.length}, limit=$limit"
@@ -1011,17 +1012,38 @@ private fun DesktopChatApp() {
         }
     }
 
-    suspend fun generateBugreportSummary(
-        bugreportText: String,
+    private fun buildBugreportMergePrompt(chunkSummaries: List<String>): String {
+        val normalizedSummaries = chunkSummaries
+            .take(BUGREPORT_SUMMARY_MAX_CHUNKS)
+            .mapIndexed { index, summary ->
+                buildString {
+                    appendLine("Часть #${index + 1} (локальное summary):")
+                    appendLine(summary.trim().take(2_000))
+                }
+            }
+
+        return buildString {
+            appendLine("Ты помощник, который объединяет частичные summary разных частей Android bugreport.")
+            appendLine("На основе списка локальных summary составь единое итоговое summary в том же формате, что и обычный ответ на багрепорт.")
+            appendLine("Структура: High-level summary, Key findings, Suspected root causes (если есть), Suggested next steps.")
+            appendLine()
+            appendLine("===== PARTIAL SUMMARIES START =====")
+            normalizedSummaries.forEach { appendLine(it) }
+            appendLine("===== PARTIAL SUMMARIES END =====")
+        }
+    }
+
+    private suspend fun summarizeBugreportChunkWithRetry(
+        chunkText: String,
         model: String,
         apiKey: String,
         onMessage: (String) -> Unit
     ): String? {
         val primaryResult = callBugreportSummaryLlm(
-            bugreportText = bugreportText,
-            limit = BUGREPORT_SUMMARY_PRIMARY_LIMIT,
+            bugreportText = chunkText,
             apiKey = apiKey,
-            model = model
+            model = model,
+            limit = BUGREPORT_SUMMARY_CHUNK_LIMIT
         )
 
         val finalResult = when (primaryResult) {
@@ -1031,13 +1053,13 @@ private fun DesktopChatApp() {
                 if (error.isStackOverflowLike()) {
                     HistoryLogger.log("LLM bugreport summary StackOverflow: httpCode=${error.httpCode}, message=${error.message}, rawBody=${error.rawBody}")
                     HistoryLogger.log("Retrying bugreport summary with stricter limit=$BUGREPORT_SUMMARY_FALLBACK_LIMIT")
-                    onMessage("[Pipeline] Модели стало тяжело от объёма багрепорта, пробую отправить более короткую версию...")
+                    onMessage("[Pipeline] Модели стало тяжело от объёма чанка багрепорта, пробую отправить более короткую версию...")
 
                     callBugreportSummaryLlm(
-                        bugreportText = bugreportText,
-                        limit = BUGREPORT_SUMMARY_FALLBACK_LIMIT,
+                        bugreportText = chunkText,
                         apiKey = apiKey,
-                        model = model
+                        model = model,
+                        limit = BUGREPORT_SUMMARY_FALLBACK_LIMIT
                     )
                 } else {
                     primaryResult
@@ -1051,20 +1073,80 @@ private fun DesktopChatApp() {
                 val err = finalResult.error
                 val message = err.message ?: err.rawBody ?: "неизвестная ошибка"
                 val userMessage = if (err.isStackOverflowLike()) {
-                    "[Pipeline] Ошибка: багрепорт оказался слишком тяжёлым для модели даже после повторной попытки. Попробуйте передать более короткий фрагмент."
+                    "[Pipeline] Ошибка: чанк багрепорта оказался слишком тяжёлым для модели даже после повторной попытки."
                 } else {
-                    "[Pipeline] Ошибка при вызове LLM для summary багрепорта: $message"
+                    "[Pipeline] Ошибка при вызове LLM для summary части багрепорта: $message"
                 }
                 onMessage(userMessage)
-                HistoryLogger.log("LLM bugreport summary failed after retry: httpCode=${err.httpCode}, message=${err.message}, rawBody=${err.rawBody}")
+                HistoryLogger.log("LLM bugreport summary failed after retry for chunk: httpCode=${err.httpCode}, message=${err.message}, rawBody=${err.rawBody}")
                 null
             }
             else -> {
-                onMessage("[Pipeline] Неизвестный результат при генерации summary багрепорта.")
-                HistoryLogger.log("LLM bugreport summary: unexpected OpenRouterResult type: ${finalResult::class.qualifiedName}")
+                onMessage("[Pipeline] Неизвестный результат при генерации summary части багрепорта.")
+                HistoryLogger.log("LLM bugreport summary: unexpected OpenRouterResult type for chunk: ${finalResult::class.qualifiedName}")
                 null
             }
         }
+    }
+
+    private suspend fun mergeBugreportChunkSummariesWithLlm(
+        chunkSummaries: List<String>,
+        model: String,
+        apiKey: String
+    ): String? {
+        val prompt = buildBugreportMergePrompt(chunkSummaries)
+        val promptLengthLog = "[Orchestrator] LLM bugreport summary merge prompt length=${prompt.length}"
+        println(promptLengthLog)
+        HistoryLogger.log(promptLengthLog)
+
+        val result = withContext(Dispatchers.IO) {
+            callOpenRouter(
+                model = model,
+                messages = listOf(
+                    ORMessage("system", BUGREPORT_SYSTEM_PROMPT),
+                    ORMessage("user", prompt)
+                ),
+                forceJson = false,
+                apiKeyOverride = apiKey,
+                temperature = 0.2,
+                maxTokens = BUGREPORT_SUMMARY_MAX_TOKENS,
+                topP = 0.9
+            )
+        }
+
+        return when (result) {
+            is OpenRouterResult.Success -> result.content
+            is OpenRouterResult.Failure -> {
+                val err = result.error
+                HistoryLogger.log("LLM bugreport summary merge failed: httpCode=${err.httpCode}, message=${err.message}, rawBody=${err.rawBody}")
+                null
+            }
+        }
+    }
+
+    suspend fun generateBugreportSummary(
+        bugreportText: String,
+        model: String,
+        apiKey: String,
+        onMessage: (String) -> Unit
+    ): String? {
+        val settings = BugreportSummarySettings()
+        val summary = summarizeBugreportMultiStage(
+            fullBugreportText = bugreportText,
+            settings = settings,
+            summarizeChunk = { chunk, _ -> summarizeBugreportChunkWithRetry(chunk, model, apiKey, onMessage) },
+            mergeSummaries = { summaries, _ -> mergeBugreportChunkSummariesWithLlm(summaries, model, apiKey) },
+            onChunkError = { index, throwable ->
+                HistoryLogger.log("LLM bugreport summary: chunk #$index failed: ${throwable.message}")
+            }
+        )
+
+        if (summary == null) {
+            onMessage("[Pipeline] Ошибка при генерации summary багрепорта: пустой результат.")
+            HistoryLogger.log("LLM bugreport summary failed: empty result after multi-stage pipeline")
+        }
+
+        return summary
     }
 
     suspend fun findRelatedPullRequestsBySummary(
@@ -1170,17 +1252,25 @@ private fun DesktopChatApp() {
             return
         }
         println("[Orchestrator] Using bugreport text file for analysis: ${bugreportTextResult.source}")
-        HistoryLogger.log("Bugreport text ready from ${bugreportTextResult.source}, length=${bugreportTextResult.originalLength}, used=${bugreportTextResult.usedLength}")
+        HistoryLogger.log("Bugreport text ready from ${bugreportTextResult.source}, length=${bugreportTextResult.originalLength}, used=${bugreportTextResult.summaryLength}")
 
-        val normalizedBugreportText = bugreportTextResult.text
-        val isTruncated = bugreportTextResult.originalLength > bugreportTextResult.usedLength
+        val fullBugreportText = bugreportTextResult.fullText
+        val summaryReadyBugreportText = bugreportTextResult.summaryText
+        val isTruncated = bugreportTextResult.originalLength > bugreportTextResult.summaryLength
         if (isTruncated) {
-            println("[Orchestrator] Truncating bugreport text from ${bugreportTextResult.originalLength} to ${bugreportTextResult.usedLength} characters for LLM")
+            println("[Orchestrator] Truncating bugreport text from ${bugreportTextResult.originalLength} to ${bugreportTextResult.summaryLength} characters for LLM")
         }
 
         onMessage("Готово! Нашёл bugreport.txt в архиве и отправил в анализ.")
 
-        val truncatedForStorage = trimBugreportForSummary(normalizedBugreportText, BUGREPORT_SUMMARY_PRIMARY_LIMIT)
+        val summaryChunksForStorage = splitBugreportForSummary(
+            bugreportText = summaryReadyBugreportText,
+            chunkLimit = BUGREPORT_SUMMARY_CHUNK_LIMIT,
+            maxChunks = BUGREPORT_SUMMARY_MAX_CHUNKS
+        )
+        val truncatedForStorage = summaryChunksForStorage.joinToString(
+            separator = "\n\n----- BUGREPORT SUMMARY CHUNK -----\n\n"
+        ) { chunk -> chunk.take(BUGREPORT_SUMMARY_CHUNK_LIMIT) }
         val userPrompt = buildBugreportSummaryPrompt(truncatedForStorage)
 
         val timestampForFiles = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss").withZone(ZoneId.systemDefault()).format(Instant.now())
@@ -1206,7 +1296,7 @@ private fun DesktopChatApp() {
         HistoryLogger.log("LLM: calling bugreport summary, inputLength=${userPrompt.length}")
         onMessage("[Pipeline] Отправляю bugreport в LLM для генерации summary...")
         val summaryText = generateBugreportSummary(
-            bugreportText = normalizedBugreportText,
+            bugreportText = fullBugreportText,
             model = settings.openRouterModel,
             apiKey = apiKey,
             onMessage = onMessage
@@ -1219,7 +1309,7 @@ private fun DesktopChatApp() {
         HistoryLogger.log("BugreportIndex: building index for current bugreport")
         try {
             val index = buildBugreportIndex(
-                bugreportText = normalizedBugreportText,
+                bugreportText = fullBugreportText,
                 bugreportSourcePath = bugreportTextResult.source,
                 embeddingsModel = DEFAULT_EMBEDDINGS_MODEL,
                 apiKey = apiKey
@@ -1824,13 +1914,14 @@ private fun DesktopChatApp() {
                         return@launch
                     }
                     println("[Orchestrator] Using bugreport text file for /orchestrate bugreport: ${bugreportTextResult.source}")
-                    HistoryLogger.log("Bugreport text ready from ${bugreportTextResult.source}, length=${bugreportTextResult.originalLength}, used=${bugreportTextResult.usedLength}")
-                    val normalizedBugreportText = bugreportTextResult.text
-                    val isTruncated = bugreportTextResult.originalLength > bugreportTextResult.usedLength
+                    HistoryLogger.log("Bugreport text ready from ${bugreportTextResult.source}, length=${bugreportTextResult.originalLength}, used=${bugreportTextResult.summaryLength}")
+                    val fullBugreportText = bugreportTextResult.fullText
+                    val summaryReadyBugreportText = bugreportTextResult.summaryText
+                    val isTruncated = bugreportTextResult.originalLength > bugreportTextResult.summaryLength
                     addSystemMessage("Готово! Нашёл текстовый bugreport и отправил в анализ.\nФайл: ${bugreportTextResult.source}")
 
                     if (isTruncated) {
-                        println("[Orchestrator] Truncating bugreport text from ${bugreportTextResult.originalLength} to ${bugreportTextResult.usedLength} characters for LLM")
+                        println("[Orchestrator] Truncating bugreport text from ${bugreportTextResult.originalLength} to ${bugreportTextResult.summaryLength} characters for LLM")
                     }
 
                     val apiKey = settings.openRouterApiKey.takeIf { it.isNotBlank() } ?: OpenRouterConfig.apiKey
@@ -1841,7 +1932,14 @@ private fun DesktopChatApp() {
 
                     val timestampForFiles = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss").withZone(ZoneId.systemDefault()).format(Instant.now())
                     val llmInputPath = StoragePaths.llmInputsDir.resolve("bugreport-${serial}-${timestampForFiles}.txt")
-                    val truncatedForStorage = trimBugreportForSummary(normalizedBugreportText, BUGREPORT_SUMMARY_PRIMARY_LIMIT)
+                    val summaryChunksForStorage = splitBugreportForSummary(
+                        bugreportText = summaryReadyBugreportText,
+                        chunkLimit = BUGREPORT_SUMMARY_CHUNK_LIMIT,
+                        maxChunks = BUGREPORT_SUMMARY_MAX_CHUNKS
+                    )
+                    val truncatedForStorage = summaryChunksForStorage.joinToString(
+                        separator = "\n\n----- BUGREPORT SUMMARY CHUNK -----\n\n"
+                    ) { chunk -> chunk.take(BUGREPORT_SUMMARY_CHUNK_LIMIT) }
                     val userPrompt = buildBugreportSummaryPrompt(truncatedForStorage)
 
                     runCatching {
@@ -1857,7 +1955,7 @@ private fun DesktopChatApp() {
                     println("[Orchestrator] Calling LLM bugreport summary, inputLength=${userPrompt.length}")
                     HistoryLogger.log("LLM: calling bugreport summary, inputLength=${userPrompt.length}")
                     val summaryText = generateBugreportSummary(
-                        bugreportText = normalizedBugreportText,
+                        bugreportText = fullBugreportText,
                         model = settings.openRouterModel,
                         apiKey = apiKey,
                         onMessage = ::addSystemMessage
@@ -1870,7 +1968,7 @@ private fun DesktopChatApp() {
                         HistoryLogger.log("BugreportIndex: building index for current bugreport")
                         try {
                             val index = buildBugreportIndex(
-                                bugreportText = normalizedBugreportText,
+                                bugreportText = fullBugreportText,
                                 bugreportSourcePath = bugreportTextResult.source,
                                 embeddingsModel = DEFAULT_EMBEDDINGS_MODEL,
                                 apiKey = apiKey
