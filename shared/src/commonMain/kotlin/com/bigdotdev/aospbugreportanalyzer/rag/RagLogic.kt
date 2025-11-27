@@ -37,30 +37,36 @@ fun buildRagPrompt(
     scoredChunks: List<ScoredChunk>
 ): String {
     return buildString {
-        appendLine("You are an assistant that analyzes Android bugreports.")
-        appendLine("You are given relevant excerpts (\"chunks\") from a bugreport and a question.")
+        appendLine("Ты — ассистент, который отвечает на вопросы только на основе приведённых ниже источников (фрагментов багрепорта).")
+        appendLine("Тебе дан вопрос пользователя и список источников в формате с номерами.")
         appendLine()
-        appendLine("Use ONLY the provided context to answer the question.")
-        appendLine("If the context does not contain the answer, say that it is not clearly present.")
+        appendLine("Правила ответа:")
+        appendLine("- Отвечай только фактами из источников.")
+        appendLine("- После каждого важного утверждения ставь ссылку на источник в виде [1], [2], [3] и т.д.")
+        appendLine("- Если утверждение опирается на несколько источников, можно написать [1, 3].")
+        appendLine("- Не выдумывай источники и номера — используй только те номера, которые есть в списке ниже.")
+        appendLine("- Если в источниках нет ответа, прямо скажи об этом и укажи, на какие источники опирался (например: [1–3]).")
         appendLine()
-        appendLine("===== CONTEXT START =====")
+        appendLine("Источники (chunks):")
+        appendLine()
         scoredChunks.forEachIndexed { index, scored ->
-            appendLine("Chunk #${index + 1}")
-            appendLine("Chunk ID: ${scored.chunk.id}")
-            if (scored.chunk.metadata.isNotEmpty()) {
-                val metaText = scored.chunk.metadata.entries.joinToString { "${it.key}=${it.value}" }
-                appendLine("Meta: $metaText")
-            }
-            appendLine("Score: ${"%.4f".format(scored.score)}")
-            appendLine()
+            val sourceNumber = index + 1
+            val bugreport = scored.chunk.metadata["bugreport"] ?: "unknown"
+            val range = scored.chunk.metadata["range"] ?: "unknown"
+            appendLine("[${sourceNumber}] bugreport=${bugreport}, range=${range}, score=${"%.4f".format(scored.score)}")
+            appendLine("Текст:")
+            appendLine("\"\"\"")
             appendLine(scored.chunk.text)
-            appendLine("---")
+            appendLine("\"\"\"")
+            appendLine()
         }
-        appendLine("===== CONTEXT END =====")
+        appendLine("Формат ответа:")
+        appendLine("- Свободный текст (можно использовать абзацы и пункты).")
+        appendLine("- Обязательно должны присутствовать ссылки вида [N] в тексте.")
+        appendLine("- Отвечай лаконично на русском языке.")
         appendLine()
-        appendLine("Question: $question")
-        appendLine()
-        appendLine("Answer in concise technical Russian.")
+        appendLine("Вопрос пользователя:")
+        appendLine("\"$question\"")
     }
 }
 
@@ -74,6 +80,10 @@ suspend fun askLlmWithRag(
     val scoredChunks = retrieveRelevantChunks(question, index, topK)
     val prompt = buildRagPrompt(question, scoredChunks)
     val answer = RagServiceLocator.llmResponder(prompt)
+    val citationRegex = "\\[\\d+]".toRegex()
+    if (!citationRegex.containsMatchIn(answer)) {
+        println("[RAG] Warning: LLM answer without citations for question '${question.take(80)}'")
+    }
     return RagResult(answer = answer, usedChunks = scoredChunks)
 }
 
