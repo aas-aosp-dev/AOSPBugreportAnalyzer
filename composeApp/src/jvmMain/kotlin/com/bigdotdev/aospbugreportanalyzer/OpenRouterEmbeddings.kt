@@ -37,7 +37,8 @@ import java.time.Duration
 suspend fun callOpenRouterEmbeddings(
     texts: List<String>,
     model: String,
-    apiKeyOverride: String? = null // не используется, но оставлен для совместимости
+    apiKeyOverride: String? = null, // не используется, но оставлен для совместимости
+    onChunkProcessed: ((Int) -> Unit)? = null
 ): Result<List<List<Double>>> = withContext(Dispatchers.IO) {
 
     if (texts.isEmpty()) {
@@ -101,6 +102,7 @@ suspend fun callOpenRouterEmbeddings(
             }
 
             results.add(embedding)
+            onChunkProcessed?.invoke(idx + 1)
         }
 
         return@withContext Result.success(results.toList())
