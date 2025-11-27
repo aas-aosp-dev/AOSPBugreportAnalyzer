@@ -15,7 +15,7 @@ object StoragePaths {
     val llmInputsDir: Path = baseDir.resolve("llm_inputs")
     val indexesDir: Path = baseDir.resolve("indexes")
 
-    init {
+    fun ensureDirs() {
         listOf(baseDir, configDir, historyDir, bugreportsDir, logcatDir, llmInputsDir, indexesDir).forEach { dir ->
             try {
                 Files.createDirectories(dir)
@@ -23,5 +23,9 @@ object StoragePaths {
                 println("[Storage] Failed to create dir $dir: ${t.message}")
             }
         }
+    }
+
+    init {
+        ensureDirs()
     }
 }
