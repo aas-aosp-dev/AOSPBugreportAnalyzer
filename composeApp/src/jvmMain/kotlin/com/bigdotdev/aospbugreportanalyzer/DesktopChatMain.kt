@@ -30,6 +30,7 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
@@ -68,6 +69,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.contentOrNull
@@ -79,6 +81,7 @@ import java.net.http.HttpClient
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.io.File
+import java.io.IOException
 import java.nio.file.Files
 import java.nio.file.Paths
 import java.nio.file.StandardCopyOption
@@ -97,7 +100,6 @@ import com.bigdotdev.aospbugreportanalyzer.memory.AgentMemoryRepository
 import com.bigdotdev.aospbugreportanalyzer.memory.MessageStats
 import com.bigdotdev.aospbugreportanalyzer.memory.MemoryMeta
 import com.bigdotdev.aospbugreportanalyzer.memory.createAgentMemoryStore
-import com.bigdotdev.aospbugreportanalyzer.reminder.GithubReminderStorage
 import com.bigdotdev.aospbugreportanalyzer.rag.RagMode
 import com.bigdotdev.aospbugreportanalyzer.rag.RagServiceLocator
 import com.bigdotdev.aospbugreportanalyzer.rag.ScoredChunk
@@ -172,6 +174,14 @@ data class CompressionStats(
     val reductionPercent: Int,
     val summaryPromptTokens: Int? = null,
     val summaryCompletionTokens: Int? = null
+)
+
+data class IndexingState(
+    val isRunning: Boolean,
+    val currentStep: String,
+    val totalChunks: Int?,
+    val processedChunks: Int,
+    val startedAtMillis: Long
 )
 
 private data class CallStats(
@@ -305,7 +315,9 @@ data class AppSettings(
     val openRouterApiKey: String = System.getenv("OPENROUTER_API_KEY") ?: "",
     val openRouterModel: String = "x-ai/grok-4.1-fast:free",
     val strictJsonEnabled: Boolean = false,
-    val useCompression: Boolean = false
+    val useCompression: Boolean = false,
+    val indexingTimeoutMinutes: Int = 50,
+    val ragEnabled: Boolean = true
 )
 
 private fun selectSystemPrompt(forceJson: Boolean): String = if (forceJson) SYSTEM_JSON else SYSTEM_TEXT
@@ -671,11 +683,22 @@ private fun DesktopChatApp() {
     var isCompressionRunning by remember { mutableStateOf(false) }
     var memoryCount by remember { mutableStateOf(0) }
     var recentMemoryEntries by remember { mutableStateOf<List<AgentMemoryEntry>>(emptyList()) }
-    var reminderConfig by remember { mutableStateOf(GithubReminderStorage.load()) }
     var ragMode by remember { mutableStateOf(RagMode.PLAIN) }
+    var indexingState by remember {
+        mutableStateOf(
+            IndexingState(
+                isRunning = false,
+                currentStep = "",
+                totalChunks = null,
+                processedChunks = 0,
+                startedAtMillis = 0L
+            )
+        )
+    }
 
-    val reminderEnabled = reminderConfig.enabled
-    val reminderIntervalMinutes = reminderConfig.intervalMinutes
+    LaunchedEffect(Unit) {
+        StoragePaths.ensureDirs()
+    }
 
     suspend fun persistTurnAndFetch(
         userMessage: String,
@@ -1065,6 +1088,178 @@ private fun DesktopChatApp() {
         }
     }
 
+    suspend fun runIndexingPipelineFromText(
+        sourceText: String,
+        sourcePath: String,
+        onMessage: (String) -> Unit
+    ): Boolean {
+        val apiKey = settings.openRouterApiKey.takeIf { it.isNotBlank() } ?: OpenRouterConfig.apiKey
+        if (apiKey.isNullOrBlank()) {
+            onMessage("[Pipeline] Ошибка: отсутствует OPENROUTER_API_KEY для вызова LLM.")
+            HistoryLogger.log("LLM call skipped: missing OPENROUTER_API_KEY")
+            return false
+        }
+
+        StoragePaths.ensureDirs()
+
+        val timeoutMillis = settings.indexingTimeoutMinutes.coerceAtLeast(1) * 60_000L
+        withContext(Dispatchers.Main) {
+            indexingState = IndexingState(
+                isRunning = true,
+                currentStep = "Разбиение на чанки…",
+                totalChunks = null,
+                processedChunks = 0,
+                startedAtMillis = System.currentTimeMillis()
+            )
+        }
+
+        return try {
+            val index = withTimeoutOrNull(timeoutMillis) {
+                buildBugreportIndex(
+                    bugreportText = sourceText,
+                    bugreportSourcePath = sourcePath,
+                    embeddingsModel = DEFAULT_EMBEDDINGS_MODEL,
+                    apiKey = apiKey,
+                    onChunksPrepared = { total ->
+                        scope.launch(Dispatchers.Main) {
+                            indexingState = indexingState.copy(
+                                currentStep = "Построение эмбеддингов…",
+                                totalChunks = total,
+                                processedChunks = 0
+                            )
+                        }
+                    },
+                    onChunkProcessed = { processed, total ->
+                        scope.launch(Dispatchers.Main) {
+                            indexingState = indexingState.copy(
+                                processedChunks = processed,
+                                totalChunks = total
+                            )
+                        }
+                    }
+                )
+            }
+
+            if (index == null) {
+                onMessage("Индексация прервана: превышен лимит ${settings.indexingTimeoutMinutes} минут.")
+                HistoryLogger.log("BugreportIndex: timed out after ${settings.indexingTimeoutMinutes} minutes")
+                return false
+            }
+
+            withContext(Dispatchers.Main) {
+                indexingState = indexingState.copy(
+                    currentStep = "Финализация индекса",
+                    totalChunks = index.chunks.size,
+                    processedChunks = index.chunks.size
+                )
+            }
+
+            val indexPath = saveBugreportIndexToFile(index, StoragePaths.indexesDir)
+            onMessage("[Pipeline] Индекс источника сохранён: $indexPath")
+            HistoryLogger.log("BugreportIndex: saved to $indexPath, chunks=${index.chunks.size}")
+            true
+        } catch (t: Throwable) {
+            onMessage("[Pipeline] Не удалось построить индекс bugreport (чанки + эмбеддинги): ${t.message}")
+            HistoryLogger.log("BugreportIndex: failed to build index: ${t.message}")
+            false
+        } finally {
+            withContext(Dispatchers.Main) {
+                indexingState = IndexingState(
+                    isRunning = false,
+                    currentStep = "",
+                    totalChunks = null,
+                    processedChunks = 0,
+                    startedAtMillis = System.currentTimeMillis()
+                )
+            }
+        }
+    }
+
+    suspend fun indexBugreportFromFile(serial: String, outputFile: File) {
+        withContext(Dispatchers.Main) {
+            indexingState = IndexingState(
+                isRunning = true,
+                currentStep = "Чтение файла",
+                totalChunks = null,
+                processedChunks = 0,
+                startedAtMillis = System.currentTimeMillis()
+            )
+        }
+
+        val bugreportTextResult = try {
+            loadBugreportTextResult(outputFile.absolutePath)
+        } catch (e: BugreportExtractionException) {
+            addSystemMessage(e.message ?: "Не удалось подготовить bugreport из файла: ${outputFile.absolutePath}")
+            HistoryLogger.log("Bugreport extraction failed: ${e.message}")
+            withContext(Dispatchers.Main) {
+                indexingState = IndexingState(
+                    isRunning = false,
+                    currentStep = "",
+                    totalChunks = null,
+                    processedChunks = 0,
+                    startedAtMillis = System.currentTimeMillis()
+                )
+            }
+            return
+        } catch (t: Throwable) {
+            addSystemMessage("Не удалось прочитать текст bugreport из файла `${outputFile.absolutePath}`. Детали: ${t.message}")
+            HistoryLogger.log("Bugreport read failed: ${t.message}")
+            withContext(Dispatchers.Main) {
+                indexingState = IndexingState(
+                    isRunning = false,
+                    currentStep = "",
+                    totalChunks = null,
+                    processedChunks = 0,
+                    startedAtMillis = System.currentTimeMillis()
+                )
+            }
+            return
+        }
+
+        addSystemMessage("Снял bugreport с устройства `$serial`, файл: ${bugreportTextResult.source}. Запускаю индексацию…")
+        runIndexingPipelineFromText(
+            sourceText = bugreportTextResult.text,
+            sourcePath = bugreportTextResult.source,
+            onMessage = ::addSystemMessage
+        )
+    }
+
+    suspend fun indexLogcatFromFile(serial: String, outputFile: File) {
+        withContext(Dispatchers.Main) {
+            indexingState = IndexingState(
+                isRunning = true,
+                currentStep = "Чтение файла",
+                totalChunks = null,
+                processedChunks = 0,
+                startedAtMillis = System.currentTimeMillis()
+            )
+        }
+
+        val logcatText = try {
+            withContext(Dispatchers.IO) { outputFile.readText() }
+        } catch (t: Throwable) {
+            addSystemMessage("Не удалось прочитать logcat из файла `${outputFile.absolutePath}`: ${t.message}")
+            HistoryLogger.log("Logcat read failed: ${t.message}")
+            withContext(Dispatchers.Main) {
+                indexingState = IndexingState(
+                    isRunning = false,
+                    currentStep = "",
+                    totalChunks = null,
+                    processedChunks = 0,
+                    startedAtMillis = System.currentTimeMillis()
+                )
+            }
+            return
+        }
+
+        addSystemMessage("Снял logcat с устройства `$serial`, файл: ${outputFile.absolutePath}. Запускаю индексацию…")
+        runIndexingPipelineFromText(
+            sourceText = logcatText,
+            sourcePath = outputFile.absolutePath,
+            onMessage = ::addSystemMessage
+        )
+    }
+
     suspend fun findRelatedPullRequestsBySummary(
         summaryText: String,
         pullRequests: List<GithubPullRequest>,
@@ -1215,20 +1410,12 @@ private fun DesktopChatApp() {
 
         onMessage("[Pipeline] Строю локальный индекс bugreport (чанки + эмбеддинги)...")
         HistoryLogger.log("BugreportIndex: building index for current bugreport")
-        try {
-            val index = buildBugreportIndex(
-                bugreportText = normalizedBugreportText,
-                bugreportSourcePath = bugreportTextResult.source,
-                embeddingsModel = DEFAULT_EMBEDDINGS_MODEL,
-                apiKey = apiKey
-            )
-            val indexPath = saveBugreportIndexToFile(index, StoragePaths.indexesDir)
-            onMessage("[Pipeline] Индекс bugreport сохранён: $indexPath")
-            HistoryLogger.log("BugreportIndex: saved to $indexPath, chunks=${index.chunks.size}")
-        } catch (t: Throwable) {
-            onMessage("[Pipeline] Не удалось построить индекс bugreport (чанки + эмбеддинги): ${t.message}")
-            HistoryLogger.log("BugreportIndex: failed to build index: ${t.message}")
-        }
+        val indexSuccess = runIndexingPipelineFromText(
+            sourceText = normalizedBugreportText,
+            sourcePath = bugreportTextResult.source,
+            onMessage = onMessage
+        )
+        if (!indexSuccess) return
 
         addSystemMessage("[Pipeline] Ищу связанные PR в GitHub через MCP...")
 
@@ -1607,37 +1794,6 @@ private fun DesktopChatApp() {
         }
     }
 
-    suspend fun runGithubReminderIfDue() {
-        val currentConfig = reminderConfig
-        if (!currentConfig.enabled) return
-        val now = System.currentTimeMillis()
-        val intervalMillis = currentConfig.intervalMinutes.coerceAtLeast(1L) * 60_000L
-        val lastRun = currentConfig.lastRunAtEpochMillis
-        if (lastRun != null && now - lastRun < intervalMillis) {
-            return
-        }
-
-        val prs = try {
-            withContext(Dispatchers.IO) {
-                withMcpGithubApiClient { client ->
-                    client.listPullRequests(state = "open")
-                }
-            }
-        } catch (t: Throwable) {
-            addSystemMessage("Reminder (MCP): ошибка при получении PR: ${t.message}")
-            val updatedConfig = currentConfig.copy(lastRunAtEpochMillis = now)
-            reminderConfig = updatedConfig
-            GithubReminderStorage.save(updatedConfig)
-            return
-        }
-
-        val summaryText = requestGithubPrSummaryFromLlm(prs)
-        addAssistantMessage("⏰ Автоматический GitHub summary:\n$summaryText")
-        val updatedConfig = currentConfig.copy(lastRunAtEpochMillis = now)
-        reminderConfig = updatedConfig
-        GithubReminderStorage.save(updatedConfig)
-    }
-
     fun formatMcpError(message: String, throwable: Throwable? = null): String {
         return if (throwable is McpGithubClientException && throwable.isConnectionError) {
             "MCP: не удалось подключиться к GitHub серверу. Проверьте GITHUB_TOKEN и путь к серверу. Детали: ${throwable.message}"
@@ -1784,118 +1940,91 @@ private fun DesktopChatApp() {
             }
             return true
         }
-
-        val bugreportPrefix = "/adb bugreport"
-        if (trimmed.startsWith(bugreportPrefix, ignoreCase = true)) {
-            val serial = trimmed.removePrefix(bugreportPrefix).trim()
-            if (serial.isBlank()) {
-                addSystemMessage("Используй: /adb bugreport <serial>")
-                return true
-            }
-
+        val bugreportMatch = Regex("^/adb\\s+bugreport\\s+(\\S+)$", RegexOption.IGNORE_CASE).matchEntire(trimmed)
+        if (bugreportMatch != null) {
+            val serial = bugreportMatch.groupValues[1]
+            val timestamp = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss").withZone(ZoneId.systemDefault()).format(Instant.now())
+            val outputFile = StoragePaths.bugreportsDir.resolve("bugreport-$serial-$timestamp.zip").toFile()
             HistoryLogger.log("COMMAND: /adb bugreport $serial")
-            addSystemMessage("[Orchestration] Снимаю bugreport с устройства $serial через MCP ADB...")
             scope.launch {
                 isSending = true
                 try {
-                    val bugreportResult = withContext(Dispatchers.IO) {
-                        withMcpAdbClient { conn ->
-                            conn.adbGetBugreport(serial)
-                        }
-                    }
-                    val bugreportPath = bugreportResult.filePath
-                    println("[Orchestration] Bugreport file path: $bugreportPath")
-                    HistoryLogger.log("MCP-ADB: bugreport stored at $bugreportPath")
-
-                    val localBugreportPath = copyBugreportToStorage(bugreportPath)
-                    val bugreportTextResult = try {
-                        loadBugreportTextResult(localBugreportPath)
-                    } catch (e: BugreportExtractionException) {
-                        println("[BugreportExtractor] Failed to prepare bugreport text file in /orchestrate bugreport: ${e.message}")
-                        addSystemMessage(e.message ?: "Не удалось подготовить bugreport из файла: $localBugreportPath")
-                        HistoryLogger.log("Bugreport extraction failed: ${e.message}")
-                        return@launch
-                    } catch (t: Throwable) {
-                        println("[Orchestrator] Failed to read bugreport text: ${t.message}")
-                        addSystemMessage("Не удалось прочитать текст bugreport из файла `$localBugreportPath`. Проверь, что файл существует и доступен.")
-                        HistoryLogger.log("Bugreport read failed: ${t.message}")
+                    StoragePaths.ensureDirs()
+                    Files.createDirectories(outputFile.toPath().parent)
+                    addSystemMessage("Снимаю bugreport с устройства `$serial`, сохраняю в ${outputFile.absolutePath}...")
+                    val result = withContext(Dispatchers.IO) { AdbHelper.runBugreport(serial, outputFile) }
+                    if (result.exitCode != 0) {
+                        val details = result.stderrPreview.takeIf { it.isNotBlank() }
+                            ?.let { "\nПодробности ошибки:\n$it" }
+                            ?: ""
+                        addSystemMessage("ADB-команда завершилась с ошибкой (код ${result.exitCode}). Проверьте устройство и доступность adb.$details")
+                        HistoryLogger.log("ADB bugreport failed with exitCode=${result.exitCode}, stderr=${result.stderrPreview}")
                         return@launch
                     }
-                    println("[Orchestrator] Using bugreport text file for /orchestrate bugreport: ${bugreportTextResult.source}")
-                    HistoryLogger.log("Bugreport text ready from ${bugreportTextResult.source}, length=${bugreportTextResult.originalLength}, used=${bugreportTextResult.usedLength}")
-                    val normalizedBugreportText = bugreportTextResult.text
-                    val isTruncated = bugreportTextResult.originalLength > bugreportTextResult.usedLength
-                    addSystemMessage("Готово! Нашёл текстовый bugreport и отправил в анализ.\nФайл: ${bugreportTextResult.source}")
-
-                    if (isTruncated) {
-                        println("[Orchestrator] Truncating bugreport text from ${bugreportTextResult.originalLength} to ${bugreportTextResult.usedLength} characters for LLM")
-                    }
-
-                    val apiKey = settings.openRouterApiKey.takeIf { it.isNotBlank() } ?: OpenRouterConfig.apiKey
-                    if (apiKey.isNullOrBlank()) {
-                        addSystemMessage("[Orchestration] Ошибка: отсутствует OPENROUTER_API_KEY для вызова LLM.")
+                    if (!outputFile.exists() || outputFile.length() < 10) {
+                        addSystemMessage("Bugreport получен, но выглядит пустым или повреждённым.")
+                        HistoryLogger.log("ADB bugreport produced empty file at ${outputFile.absolutePath}")
                         return@launch
                     }
-
-                    val timestampForFiles = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss").withZone(ZoneId.systemDefault()).format(Instant.now())
-                    val llmInputPath = StoragePaths.llmInputsDir.resolve("bugreport-${serial}-${timestampForFiles}.txt")
-                    val truncatedForStorage = trimBugreportForSummary(normalizedBugreportText, BUGREPORT_SUMMARY_PRIMARY_LIMIT)
-                    val userPrompt = buildBugreportSummaryPrompt(truncatedForStorage)
-
-                    runCatching {
-                        Files.writeString(llmInputPath, userPrompt, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING)
-                    }.onSuccess {
-                        println("[Storage] Saved LLM bugreport input to $llmInputPath (length=${userPrompt.length})")
-                        HistoryLogger.log("LLM input (bugreport) saved to $llmInputPath, length=${userPrompt.length}")
-                    }.onFailure {
-                        println("[Storage] Failed to store LLM bugreport input: ${it.message}")
-                        HistoryLogger.log("Failed to store LLM bugreport input: ${it.message}")
-                    }
-
-                    println("[Orchestrator] Calling LLM bugreport summary, inputLength=${userPrompt.length}")
-                    HistoryLogger.log("LLM: calling bugreport summary, inputLength=${userPrompt.length}")
-                    val summaryText = generateBugreportSummary(
-                        bugreportText = normalizedBugreportText,
-                        model = settings.openRouterModel,
-                        apiKey = apiKey,
-                        onMessage = ::addSystemMessage
-                    )
-
-                    if (summaryText != null) {
-                        println("[Orchestrator] Bugreport summary generated, length=${summaryText.length}")
-                        HistoryLogger.log("LLM: bugreport summary length=${summaryText.length}")
-                        addSystemMessage("[Pipeline] Строю локальный индекс bugreport (чанки + эмбеддинги)...")
-                        HistoryLogger.log("BugreportIndex: building index for current bugreport")
-                        try {
-                            val index = buildBugreportIndex(
-                                bugreportText = normalizedBugreportText,
-                                bugreportSourcePath = bugreportTextResult.source,
-                                embeddingsModel = DEFAULT_EMBEDDINGS_MODEL,
-                                apiKey = apiKey
-                            )
-                            val indexPath = saveBugreportIndexToFile(index, StoragePaths.indexesDir)
-                            addSystemMessage("[Pipeline] Индекс bugreport сохранён: $indexPath")
-                            HistoryLogger.log("BugreportIndex: saved to $indexPath, chunks=${index.chunks.size}")
-                        } catch (t: Throwable) {
-                            addSystemMessage("[Pipeline] Не удалось построить индекс bugreport (чанки + эмбеддинги): ${t.message}")
-                            HistoryLogger.log("BugreportIndex: failed to build index: ${t.message}")
-                        }
-                        addSystemMessage("[Orchestration] Анализ проведён. Использован текстовый bugreport.")
-                        addAssistantMessage(
-                            buildString {
-                                appendLine("Готово! Нашёл bugreport.txt в архиве и отправил в анализ.")
-                                appendLine()
-                                appendLine(summaryText)
-                            }
-                        )
-                    }
+                    indexBugreportFromFile(serial, outputFile)
+                } catch (ioe: IOException) {
+                    addSystemMessage("adb не найден. Добавьте adb в PATH или установите Android Platform Tools.")
+                    HistoryLogger.log("ADB bugreport failed: adb not found (${ioe.message})")
                 } catch (t: Throwable) {
-                    t.printStackTrace()
-                    addSystemMessage("[Orchestration] Ошибка при снятии bugreport: ${t.message ?: "неизвестная ошибка"}")
+                    addSystemMessage("Ошибка при выполнении adb bugreport: ${t.message}")
+                    HistoryLogger.log("ADB bugreport failed: ${t.message}")
                 } finally {
                     isSending = false
                 }
             }
+            return true
+        }
+        if (trimmed.startsWith("/adb bugreport", ignoreCase = true)) {
+            addSystemMessage("Неверный формат. Используй: `/adb bugreport <serial>`")
+            return true
+        }
+
+        val logcatMatch = Regex("^/adb\\s+logcat\\s+(\\S+)$", RegexOption.IGNORE_CASE).matchEntire(trimmed)
+        if (logcatMatch != null) {
+            val serial = logcatMatch.groupValues[1]
+            val timestamp = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss").withZone(ZoneId.systemDefault()).format(Instant.now())
+            val outputFile = StoragePaths.logcatDir.resolve("logcat-$serial-$timestamp.txt").toFile()
+            HistoryLogger.log("COMMAND: /adb logcat $serial")
+            scope.launch {
+                isSending = true
+                try {
+                    StoragePaths.ensureDirs()
+                    Files.createDirectories(outputFile.toPath().parent)
+                    addSystemMessage("Снимаю logcat с устройства `$serial`, сохраняю в ${outputFile.absolutePath}...")
+                    val result = withContext(Dispatchers.IO) { AdbHelper.runLogcatDump(serial, outputFile) }
+                    if (result.exitCode != 0) {
+                        val details = result.stderrPreview.takeIf { it.isNotBlank() }
+                            ?.let { "\nПодробности ошибки:\n$it" }
+                            ?: ""
+                        addSystemMessage("ADB-команда завершилась с ошибкой (код ${result.exitCode}). Проверьте устройство и доступность adb.$details")
+                        HistoryLogger.log("ADB logcat failed with exitCode=${result.exitCode}, stderr=${result.stderrPreview}")
+                        return@launch
+                    }
+                    if (!outputFile.exists() || outputFile.length() < 10) {
+                        addSystemMessage("Logcat получен, но выглядит пустым или повреждённым.")
+                        HistoryLogger.log("ADB logcat produced empty file at ${outputFile.absolutePath}")
+                        return@launch
+                    }
+                    indexLogcatFromFile(serial, outputFile)
+                } catch (ioe: IOException) {
+                    addSystemMessage("adb не найден. Добавьте adb в PATH или установите Android Platform Tools.")
+                    HistoryLogger.log("ADB logcat failed: adb not found (${ioe.message})")
+                } catch (t: Throwable) {
+                    addSystemMessage("Ошибка при выполнении adb logcat: ${t.message}")
+                    HistoryLogger.log("ADB logcat failed: ${t.message}")
+                } finally {
+                    isSending = false
+                }
+            }
+            return true
+        }
+        if (trimmed.startsWith("/adb logcat", ignoreCase = true)) {
+            addSystemMessage("Неверный формат. Используй: `/adb logcat <serial>`")
             return true
         }
 
@@ -2151,6 +2280,10 @@ private fun DesktopChatApp() {
             addSystemMessage("Укажите OPENROUTER_API_KEY, чтобы Эксперт мог отвечать.")
             return
         }
+        if (!settings.ragEnabled && ragMode != RagMode.PLAIN) {
+            addSystemMessage("RAG выключен в настройках, использую обычный ответ без индекса.")
+            ragMode = RagMode.PLAIN
+        }
         configureRagProviders(apiKey, settings.openRouterModel)
         isSending = true
         val strictJson = settings.strictJsonEnabled
@@ -2188,15 +2321,6 @@ private fun DesktopChatApp() {
                     metrics = MsgMetrics(null, null, null, null, null, error = null)
                 )
             )
-        }
-    }
-
-    LaunchedEffect(reminderEnabled, reminderIntervalMinutes) {
-        if (!reminderEnabled) return@LaunchedEffect
-        while (true) {
-            runGithubReminderIfDue()
-            val intervalMs = reminderIntervalMinutes.coerceAtLeast(1L) * 60_000L
-            delay(intervalMs)
         }
     }
 
@@ -2243,25 +2367,22 @@ private fun DesktopChatApp() {
                     if (compressionStats.isNotEmpty()) {
                         CompressionStatsBlock(compressionStats)
                     }
-                    GithubReminderSection(
-                        enabled = reminderEnabled,
-                        onToggle = { checked ->
-                            val updated = reminderConfig.copy(enabled = checked)
-                            reminderConfig = updated
-                            GithubReminderStorage.save(updated)
-                        }
-                    )
+                    if (indexingState.isRunning) {
+                        IndexingProgress(indexingState)
+                    }
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(12.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Text("Режим ответа:", style = MaterialTheme.typography.bodyMedium)
-                        RagMode.values().forEach { mode ->
+                        val modes = if (settings.ragEnabled) RagMode.values().toList() else listOf(RagMode.PLAIN)
+                        modes.forEach { mode ->
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 RadioButton(
                                     selected = ragMode == mode,
-                                    onClick = { ragMode = mode }
+                                    onClick = { ragMode = mode },
+                                    enabled = settings.ragEnabled || mode == RagMode.PLAIN
                                 )
                                 Text(
                                     text = when (mode) {
@@ -2271,6 +2392,9 @@ private fun DesktopChatApp() {
                                     }
                                 )
                             }
+                        }
+                        if (!settings.ragEnabled) {
+                            Text("RAG выключен", style = MaterialTheme.typography.labelSmall)
                         }
                     }
                     OutlinedTextField(
@@ -2306,33 +2430,6 @@ private fun DesktopChatApp() {
 }
 
 @Composable
-private fun GithubReminderSection(
-    enabled: Boolean,
-    onToggle: (Boolean) -> Unit
-) {
-    Column(
-        modifier = Modifier.fillMaxWidth(),
-        verticalArrangement = Arrangement.spacedBy(8.dp)
-    ) {
-        Text(
-            text = "GitHub PR reminder (MCP)",
-            style = MaterialTheme.typography.bodyMedium,
-            fontWeight = FontWeight.SemiBold
-        )
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            Checkbox(
-                checked = enabled,
-                onCheckedChange = onToggle
-            )
-            Text("Включить summary по открытым PR")
-        }
-    }
-}
-
-@Composable
 private fun CompressionStatsBlock(stats: List<CompressionStats>) {
     Column(
         modifier = Modifier
@@ -2350,6 +2447,27 @@ private fun CompressionStatsBlock(stats: List<CompressionStats>) {
                 text = "Сводка #${entry.summaryGroupId}: ${entry.messagesCount} сообщений → ${entry.charsBefore}→${entry.charsAfter} символов (${entry.reductionPercent}% экономии). summary токены: prompt=${entry.summaryPromptTokens ?: "—"}, completion=${entry.summaryCompletionTokens ?: "—"}",
                 style = MaterialTheme.typography.labelSmall
             )
+        }
+    }
+}
+
+@Composable
+private fun IndexingProgress(state: IndexingState) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(8.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        Text(state.currentStep.ifBlank { "Идёт индексация..." })
+        val progress = state.totalChunks?.takeIf { it > 0 }?.let { total ->
+            state.processedChunks.toFloat() / total.toFloat()
+        }
+        if (progress != null) {
+            LinearProgressIndicator(progress = progress)
+            Text("${state.processedChunks}/${state.totalChunks}", style = MaterialTheme.typography.labelSmall)
+        } else {
+            LinearProgressIndicator()
         }
     }
 }
@@ -2557,6 +2675,30 @@ private fun SettingsScreen(
                     onCheckedChange = { draft = draft.copy(useCompression = it) }
                 )
             }
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "Использовать RAG (поиск по индексу)",
+                    modifier = Modifier.weight(1f)
+                )
+                Switch(
+                    checked = draft.ragEnabled,
+                    onCheckedChange = { draft = draft.copy(ragEnabled = it) }
+                )
+            }
+            OutlinedTextField(
+                value = draft.indexingTimeoutMinutes.toString(),
+                onValueChange = { value ->
+                    val minutes = value.toIntOrNull() ?: draft.indexingTimeoutMinutes
+                    draft = draft.copy(indexingTimeoutMinutes = minutes.coerceAtLeast(1))
+                },
+                label = { Text("Максимальная длительность индексации (мин)") },
+                modifier = Modifier.fillMaxWidth()
+            )
             Spacer(modifier = Modifier.weight(1f))
             Divider()
             Text(
