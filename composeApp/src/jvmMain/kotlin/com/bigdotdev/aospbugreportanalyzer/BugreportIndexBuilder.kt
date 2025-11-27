@@ -19,19 +19,25 @@ suspend fun buildBugreportIndex(
     bugreportText: String,
     bugreportSourcePath: String,
     embeddingsModel: String,
-    apiKey: String
+    apiKey: String,
+    onChunksPrepared: ((Int) -> Unit)? = null,
+    onChunkProcessed: ((Int, Int) -> Unit)? = null
 ): BugreportIndex {
     val chunks = chunkBugreportText(
         fullText = bugreportText,
         chunkSizeChars = BUGREPORT_INDEX_CHUNK_SIZE,
         chunkOverlapChars = BUGREPORT_INDEX_CHUNK_OVERLAP
     )
+    onChunksPrepared?.invoke(chunks.size)
 
     val chunkTexts = chunks.map { it.text }
     val embeddingsResult = callOpenRouterEmbeddings(
         texts = chunkTexts,
         model = embeddingsModel,
-        apiKeyOverride = apiKey
+        apiKeyOverride = apiKey,
+        onChunkProcessed = { processed ->
+            onChunkProcessed?.invoke(processed, chunks.size)
+        }
     )
 
     val embeddings = embeddingsResult.getOrElse { error ->
