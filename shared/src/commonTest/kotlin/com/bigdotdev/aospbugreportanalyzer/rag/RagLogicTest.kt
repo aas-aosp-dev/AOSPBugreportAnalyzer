@@ -53,13 +53,15 @@ class RagLogicTest {
         )
         assertTrue(prompt.contains("Stacktrace"))
         assertTrue(prompt.contains("Почему ANR?"))
+        assertTrue(prompt.contains("[1]"))
+        assertTrue(prompt.contains("Источники (chunks):"))
     }
 
     @Test
     fun compareRagAndPlainUsesBothPaths() = runSuspendTest {
         RagServiceLocator.embeddingProvider = { _, _ -> listOf(1.0) }
         RagServiceLocator.llmResponder = { prompt ->
-            if (prompt.contains("CONTEXT START")) "rag" else "plain"
+            if (prompt.contains("Источники (chunks):")) "rag" else "plain"
         }
         val index = BugreportIndex(
             bugreportSourcePath = "file",
