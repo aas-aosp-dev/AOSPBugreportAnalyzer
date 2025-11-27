@@ -69,7 +69,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.contentOrNull
@@ -81,6 +81,7 @@ import java.net.http.HttpClient
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.io.File
+import java.io.IOException
 import java.nio.file.Files
 import java.nio.file.Paths
 import java.nio.file.StandardCopyOption
@@ -106,7 +107,6 @@ import com.bigdotdev.aospbugreportanalyzer.rag.askLlmPlain
 import com.bigdotdev.aospbugreportanalyzer.rag.askLlmWithRag
 import com.bigdotdev.aospbugreportanalyzer.rag.compareRagAndPlain
 import com.bigdotdev.aospbugreportanalyzer.rag.toEmbeddingIndex
-import kotlinx.coroutines.TimeoutCancellationException
 
 private enum class Screen { MAIN, SETTINGS }
 
@@ -316,7 +316,7 @@ data class AppSettings(
     val openRouterModel: String = "x-ai/grok-4.1-fast:free",
     val strictJsonEnabled: Boolean = false,
     val useCompression: Boolean = false,
-    val indexTimeoutMinutes: Int = 15,
+    val indexingTimeoutMinutes: Int = 50,
     val ragEnabled: Boolean = true
 )
 
@@ -694,6 +694,10 @@ private fun DesktopChatApp() {
                 startedAtMillis = 0L
             )
         )
+    }
+
+    LaunchedEffect(Unit) {
+        StoragePaths.ensureDirs()
     }
 
     suspend fun persistTurnAndFetch(
@@ -1096,11 +1100,13 @@ private fun DesktopChatApp() {
             return false
         }
 
-        val timeoutMillis = settings.indexTimeoutMinutes.coerceAtLeast(1) * 60_000L
+        StoragePaths.ensureDirs()
+
+        val timeoutMillis = settings.indexingTimeoutMinutes.coerceAtLeast(1) * 60_000L
         withContext(Dispatchers.Main) {
             indexingState = IndexingState(
                 isRunning = true,
-                currentStep = "Подготовка...",
+                currentStep = "Разбиение на чанки…",
                 totalChunks = null,
                 processedChunks = 0,
                 startedAtMillis = System.currentTimeMillis()
@@ -1108,7 +1114,7 @@ private fun DesktopChatApp() {
         }
 
         return try {
-            val index = withTimeout(timeoutMillis) {
+            val index = withTimeoutOrNull(timeoutMillis) {
                 buildBugreportIndex(
                     bugreportText = sourceText,
                     bugreportSourcePath = sourcePath,
@@ -1117,7 +1123,7 @@ private fun DesktopChatApp() {
                     onChunksPrepared = { total ->
                         scope.launch(Dispatchers.Main) {
                             indexingState = indexingState.copy(
-                                currentStep = "Построение эмбеддингов...",
+                                currentStep = "Построение эмбеддингов…",
                                 totalChunks = total,
                                 processedChunks = 0
                             )
@@ -1133,35 +1139,80 @@ private fun DesktopChatApp() {
                     }
                 )
             }
+
+            if (index == null) {
+                onMessage("Индексация прервана: превышен лимит ${settings.indexingTimeoutMinutes} минут.")
+                HistoryLogger.log("BugreportIndex: timed out after ${settings.indexingTimeoutMinutes} minutes")
+                return false
+            }
+
+            withContext(Dispatchers.Main) {
+                indexingState = indexingState.copy(
+                    currentStep = "Финализация индекса",
+                    totalChunks = index.chunks.size,
+                    processedChunks = index.chunks.size
+                )
+            }
+
             val indexPath = saveBugreportIndexToFile(index, StoragePaths.indexesDir)
             onMessage("[Pipeline] Индекс источника сохранён: $indexPath")
             HistoryLogger.log("BugreportIndex: saved to $indexPath, chunks=${index.chunks.size}")
             true
-        } catch (timeout: TimeoutCancellationException) {
-            onMessage("Индексация прервана: превысила ${settings.indexTimeoutMinutes} минут.")
-            HistoryLogger.log("BugreportIndex: timed out after ${settings.indexTimeoutMinutes} minutes")
-            false
         } catch (t: Throwable) {
             onMessage("[Pipeline] Не удалось построить индекс bugreport (чанки + эмбеддинги): ${t.message}")
             HistoryLogger.log("BugreportIndex: failed to build index: ${t.message}")
             false
         } finally {
             withContext(Dispatchers.Main) {
-                indexingState = indexingState.copy(isRunning = false)
+                indexingState = IndexingState(
+                    isRunning = false,
+                    currentStep = "",
+                    totalChunks = null,
+                    processedChunks = 0,
+                    startedAtMillis = System.currentTimeMillis()
+                )
             }
         }
     }
 
     suspend fun indexBugreportFromFile(serial: String, outputFile: File) {
+        withContext(Dispatchers.Main) {
+            indexingState = IndexingState(
+                isRunning = true,
+                currentStep = "Чтение файла",
+                totalChunks = null,
+                processedChunks = 0,
+                startedAtMillis = System.currentTimeMillis()
+            )
+        }
+
         val bugreportTextResult = try {
             loadBugreportTextResult(outputFile.absolutePath)
         } catch (e: BugreportExtractionException) {
             addSystemMessage(e.message ?: "Не удалось подготовить bugreport из файла: ${outputFile.absolutePath}")
             HistoryLogger.log("Bugreport extraction failed: ${e.message}")
+            withContext(Dispatchers.Main) {
+                indexingState = IndexingState(
+                    isRunning = false,
+                    currentStep = "",
+                    totalChunks = null,
+                    processedChunks = 0,
+                    startedAtMillis = System.currentTimeMillis()
+                )
+            }
             return
         } catch (t: Throwable) {
             addSystemMessage("Не удалось прочитать текст bugreport из файла `${outputFile.absolutePath}`. Детали: ${t.message}")
             HistoryLogger.log("Bugreport read failed: ${t.message}")
+            withContext(Dispatchers.Main) {
+                indexingState = IndexingState(
+                    isRunning = false,
+                    currentStep = "",
+                    totalChunks = null,
+                    processedChunks = 0,
+                    startedAtMillis = System.currentTimeMillis()
+                )
+            }
             return
         }
 
@@ -1174,11 +1225,30 @@ private fun DesktopChatApp() {
     }
 
     suspend fun indexLogcatFromFile(serial: String, outputFile: File) {
+        withContext(Dispatchers.Main) {
+            indexingState = IndexingState(
+                isRunning = true,
+                currentStep = "Чтение файла",
+                totalChunks = null,
+                processedChunks = 0,
+                startedAtMillis = System.currentTimeMillis()
+            )
+        }
+
         val logcatText = try {
             withContext(Dispatchers.IO) { outputFile.readText() }
         } catch (t: Throwable) {
             addSystemMessage("Не удалось прочитать logcat из файла `${outputFile.absolutePath}`: ${t.message}")
             HistoryLogger.log("Logcat read failed: ${t.message}")
+            withContext(Dispatchers.Main) {
+                indexingState = IndexingState(
+                    isRunning = false,
+                    currentStep = "",
+                    totalChunks = null,
+                    processedChunks = 0,
+                    startedAtMillis = System.currentTimeMillis()
+                )
+            }
             return
         }
 
@@ -1879,15 +1949,27 @@ private fun DesktopChatApp() {
             scope.launch {
                 isSending = true
                 try {
+                    StoragePaths.ensureDirs()
                     Files.createDirectories(outputFile.toPath().parent)
                     addSystemMessage("Снимаю bugreport с устройства `$serial`, сохраняю в ${outputFile.absolutePath}...")
-                    val exitCode = withContext(Dispatchers.IO) { AdbHelper.runBugreport(serial, outputFile) }
-                    if (exitCode != 0) {
-                        addSystemMessage("Не удалось снять bugreport: adb завершился с кодом $exitCode")
-                        HistoryLogger.log("ADB bugreport failed with exitCode=$exitCode")
+                    val result = withContext(Dispatchers.IO) { AdbHelper.runBugreport(serial, outputFile) }
+                    if (result.exitCode != 0) {
+                        val details = result.stderrPreview.takeIf { it.isNotBlank() }
+                            ?.let { "\nПодробности ошибки:\n$it" }
+                            ?: ""
+                        addSystemMessage("ADB-команда завершилась с ошибкой (код ${result.exitCode}). Проверьте устройство и доступность adb.$details")
+                        HistoryLogger.log("ADB bugreport failed with exitCode=${result.exitCode}, stderr=${result.stderrPreview}")
+                        return@launch
+                    }
+                    if (!outputFile.exists() || outputFile.length() < 10) {
+                        addSystemMessage("Bugreport получен, но выглядит пустым или повреждённым.")
+                        HistoryLogger.log("ADB bugreport produced empty file at ${outputFile.absolutePath}")
                         return@launch
                     }
                     indexBugreportFromFile(serial, outputFile)
+                } catch (ioe: IOException) {
+                    addSystemMessage("adb не найден. Добавьте adb в PATH или установите Android Platform Tools.")
+                    HistoryLogger.log("ADB bugreport failed: adb not found (${ioe.message})")
                 } catch (t: Throwable) {
                     addSystemMessage("Ошибка при выполнении adb bugreport: ${t.message}")
                     HistoryLogger.log("ADB bugreport failed: ${t.message}")
@@ -1911,15 +1993,27 @@ private fun DesktopChatApp() {
             scope.launch {
                 isSending = true
                 try {
+                    StoragePaths.ensureDirs()
                     Files.createDirectories(outputFile.toPath().parent)
                     addSystemMessage("Снимаю logcat с устройства `$serial`, сохраняю в ${outputFile.absolutePath}...")
-                    val exitCode = withContext(Dispatchers.IO) { AdbHelper.runLogcatDump(serial, outputFile) }
-                    if (exitCode != 0) {
-                        addSystemMessage("Не удалось снять logcat: adb завершился с кодом $exitCode")
-                        HistoryLogger.log("ADB logcat failed with exitCode=$exitCode")
+                    val result = withContext(Dispatchers.IO) { AdbHelper.runLogcatDump(serial, outputFile) }
+                    if (result.exitCode != 0) {
+                        val details = result.stderrPreview.takeIf { it.isNotBlank() }
+                            ?.let { "\nПодробности ошибки:\n$it" }
+                            ?: ""
+                        addSystemMessage("ADB-команда завершилась с ошибкой (код ${result.exitCode}). Проверьте устройство и доступность adb.$details")
+                        HistoryLogger.log("ADB logcat failed with exitCode=${result.exitCode}, stderr=${result.stderrPreview}")
+                        return@launch
+                    }
+                    if (!outputFile.exists() || outputFile.length() < 10) {
+                        addSystemMessage("Logcat получен, но выглядит пустым или повреждённым.")
+                        HistoryLogger.log("ADB logcat produced empty file at ${outputFile.absolutePath}")
                         return@launch
                     }
                     indexLogcatFromFile(serial, outputFile)
+                } catch (ioe: IOException) {
+                    addSystemMessage("adb не найден. Добавьте adb в PATH или установите Android Platform Tools.")
+                    HistoryLogger.log("ADB logcat failed: adb not found (${ioe.message})")
                 } catch (t: Throwable) {
                     addSystemMessage("Ошибка при выполнении adb logcat: ${t.message}")
                     HistoryLogger.log("ADB logcat failed: ${t.message}")
@@ -2597,12 +2691,12 @@ private fun SettingsScreen(
                 )
             }
             OutlinedTextField(
-                value = draft.indexTimeoutMinutes.toString(),
+                value = draft.indexingTimeoutMinutes.toString(),
                 onValueChange = { value ->
-                    val minutes = value.toIntOrNull() ?: draft.indexTimeoutMinutes
-                    draft = draft.copy(indexTimeoutMinutes = minutes.coerceAtLeast(1))
+                    val minutes = value.toIntOrNull() ?: draft.indexingTimeoutMinutes
+                    draft = draft.copy(indexingTimeoutMinutes = minutes.coerceAtLeast(1))
                 },
-                label = { Text("Таймаут индексации (минуты)") },
+                label = { Text("Максимальная длительность индексации (мин)") },
                 modifier = Modifier.fillMaxWidth()
             )
             Spacer(modifier = Modifier.weight(1f))
