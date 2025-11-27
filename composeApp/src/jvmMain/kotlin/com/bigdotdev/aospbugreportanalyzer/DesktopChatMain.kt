@@ -739,14 +739,12 @@ private fun DesktopChatApp() {
     fun formatChunks(chunks: List<ScoredChunk>): String {
         if (chunks.isEmpty()) return "Чанки не найдены для этого запроса."
         return buildString {
-            appendLine("Использованные чанки (top-${chunks.size}):")
+            appendLine("Источники:")
             chunks.forEachIndexed { idx, scored ->
-                appendLine("${idx + 1}) [ID=${scored.chunk.id}] score=${"%.3f".format(scored.score)}")
-                if (scored.chunk.metadata.isNotEmpty()) {
-                    scored.chunk.metadata.forEach { (key, value) ->
-                        appendLine("   [$key=$value]")
-                    }
-                }
+                val number = idx + 1
+                val bugreport = scored.chunk.metadata["bugreport"] ?: "unknown"
+                val range = scored.chunk.metadata["range"] ?: "unknown"
+                appendLine("[${number}] bugreport=$bugreport, range=$range, score=${"%.3f".format(scored.score)}")
                 val snippet = scored.chunk.text.take(160).replace('\n', ' ')
                 appendLine("   \"$snippet...\"")
                 appendLine()
