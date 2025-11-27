@@ -27,29 +27,50 @@ suspend fun buildBugreportIndex(
         chunkOverlapChars = BUGREPORT_INDEX_CHUNK_OVERLAP
     )
 
-    val chunkTexts = chunks.map { it.text }
-    val embeddingsResult = callOpenRouterEmbeddings(
-        texts = chunkTexts,
-        model = embeddingsModel,
-        apiKeyOverride = apiKey
-    )
+    val normalizedChunks = mutableListOf<BugreportChunk>()
+    val chunkEmbeddings = mutableListOf<BugreportChunkEmbedding>()
+    var nextChunkId = 0
+    var failedChunks = 0
 
-    val embeddings = embeddingsResult.getOrElse { error ->
-        HistoryLogger.log("BugreportIndex: failed to get embeddings: ${error.message}")
-        throw error
-    }
-
-    if (embeddings.size != chunks.size) {
-        val error = IllegalStateException("Embeddings size ${embeddings.size} does not match chunks size ${chunks.size}")
-        HistoryLogger.log("BugreportIndex: embeddings/chunks size mismatch")
-        throw error
-    }
-
-    val chunkEmbeddings = chunks.mapIndexed { index, chunk ->
-        BugreportChunkEmbedding(
-            chunkId = chunk.id,
-            embedding = embeddings.getOrNull(index) ?: emptyList()
+    chunks.forEachIndexed { index, chunk ->
+        val embeddings = embedChunkRobust(
+            chunkText = chunk.text,
+            model = embeddingsModel,
+            apiKey = apiKey
         )
+
+        if (embeddings.isEmpty()) {
+            failedChunks++
+            HistoryLogger.log(
+                "Skipping chunk #$index for embeddings: failed after splits, length=${chunk.text.length}"
+            )
+            return@forEachIndexed
+        }
+
+        embeddings.forEachIndexed { subIndex, embedding ->
+            val chunkId = nextChunkId++
+            val textForEmbedding = if (embeddings.size == 1) chunk.text else chunk.text.take(BUGREPORT_EMBEDDING_CHUNK_LIMIT_CHARS)
+
+            normalizedChunks.add(
+                BugreportChunk(
+                    id = chunkId,
+                    startOffset = chunk.startOffset,
+                    endOffset = chunk.endOffset,
+                    text = textForEmbedding
+                )
+            )
+
+            chunkEmbeddings.add(
+                BugreportChunkEmbedding(
+                    chunkId = chunkId,
+                    embedding = embedding
+                )
+            )
+        }
+    }
+
+    if (failedChunks > 50) {
+        HistoryLogger.log("Warning: many embedding chunks failed, index may be incomplete.")
     }
 
     return BugreportIndex(
@@ -58,7 +79,7 @@ suspend fun buildBugreportIndex(
         model = embeddingsModel,
         chunkSize = BUGREPORT_INDEX_CHUNK_SIZE,
         chunkOverlap = BUGREPORT_INDEX_CHUNK_OVERLAP,
-        chunks = chunks,
+        chunks = normalizedChunks.ifEmpty { chunks },
         embeddings = chunkEmbeddings
     )
 }

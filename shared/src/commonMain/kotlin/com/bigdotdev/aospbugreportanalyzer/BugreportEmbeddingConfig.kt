@@ -1,0 +1,5 @@
+package com.bigdotdev.aospbugreportanalyzer
+
+const val BUGREPORT_EMBEDDING_CHUNK_LIMIT_CHARS = 4_000
+const val BUGREPORT_EMBEDDING_MIN_CHUNK_CHARS = 500
+const val BUGREPORT_EMBEDDING_MAX_SPLIT_DEPTH = 3

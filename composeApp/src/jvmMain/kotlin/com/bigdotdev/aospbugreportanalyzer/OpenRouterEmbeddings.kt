@@ -1,5 +1,9 @@
 package com.bigdotdev.aospbugreportanalyzer
 
+import com.bigdotdev.aospbugreportanalyzer.BUGREPORT_EMBEDDING_CHUNK_LIMIT_CHARS
+import com.bigdotdev.aospbugreportanalyzer.BUGREPORT_EMBEDDING_MAX_SPLIT_DEPTH
+import com.bigdotdev.aospbugreportanalyzer.BUGREPORT_EMBEDDING_MIN_CHUNK_CHARS
+import com.bigdotdev.aospbugreportanalyzer.storage.HistoryLogger
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
@@ -44,10 +48,6 @@ suspend fun callOpenRouterEmbeddings(
         return@withContext Result.success(emptyList())
     }
 
-    // Максимальная длина текста, которую отправляем в Ollama
-    // (если текст больше — аккуратно отрезаем начало)
-    val maxPromptLength = 2000
-
     val json = Json {
         ignoreUnknownKeys = true
     }
@@ -61,7 +61,7 @@ suspend fun callOpenRouterEmbeddings(
     try {
         for ((idx, text) in texts.withIndex()) {
             val safePrompt =
-                if (text.length > maxPromptLength) text.take(maxPromptLength) else text
+                if (text.length > BUGREPORT_EMBEDDING_CHUNK_LIMIT_CHARS) text.take(BUGREPORT_EMBEDDING_CHUNK_LIMIT_CHARS) else text
 
             val bodyJson = buildJsonObject {
                 put("model", JsonPrimitive(model))
@@ -107,4 +107,57 @@ suspend fun callOpenRouterEmbeddings(
     } catch (t: Throwable) {
         return@withContext Result.failure<List<List<Double>>>(t)
     }
+}
+
+private suspend fun tryEmbedChunk(
+    text: String,
+    model: String,
+    apiKey: String?
+): List<Double>? {
+    return try {
+        val result = callOpenRouterEmbeddings(listOf(text), model, apiKeyOverride = apiKey)
+        result.getOrNull()?.firstOrNull()
+    } catch (e: Throwable) {
+        HistoryLogger.log(
+            "Embedding chunk failed: ${e::class.simpleName}: ${e.message?.take(200)}"
+        )
+        null
+    }
+}
+
+suspend fun embedChunkRobust(
+    chunkText: String,
+    model: String,
+    apiKey: String?,
+    depth: Int = 0
+): List<List<Double>> {
+    if (chunkText.isBlank()) return emptyList()
+
+    if (depth >= BUGREPORT_EMBEDDING_MAX_SPLIT_DEPTH ||
+        chunkText.length <= BUGREPORT_EMBEDDING_MIN_CHUNK_CHARS
+    ) {
+        val truncated = chunkText.take(BUGREPORT_EMBEDDING_CHUNK_LIMIT_CHARS)
+        val embedding = tryEmbedChunk(truncated, model, apiKey)
+        if (embedding == null) {
+            HistoryLogger.log(
+                "Embedding dropped for too problematic chunk at depth=$depth, length=${chunkText.length}"
+            )
+            return emptyList()
+        }
+        return listOf(embedding)
+    }
+
+    val truncated = chunkText.take(BUGREPORT_EMBEDDING_CHUNK_LIMIT_CHARS)
+    val embedding = tryEmbedChunk(truncated, model, apiKey)
+    if (embedding != null) {
+        return listOf(embedding)
+    }
+
+    val mid = chunkText.length / 2
+    val left = chunkText.substring(0, mid)
+    val right = chunkText.substring(mid)
+
+    val leftEmbeddings = embedChunkRobust(left, model, apiKey, depth + 1)
+    val rightEmbeddings = embedChunkRobust(right, model, apiKey, depth + 1)
+    return leftEmbeddings + rightEmbeddings
 }
