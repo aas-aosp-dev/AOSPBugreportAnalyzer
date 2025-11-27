@@ -57,6 +57,8 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Window
 import androidx.compose.ui.window.application
+import com.bigdotdev.aospbugreportanalyzer.bugreport.BugreportFileReader
+import com.bigdotdev.aospbugreportanalyzer.bugreport.BugreportReadException
 import com.bigdotdev.aospbugreportanalyzer.mcp.GithubPullRequest
 import com.bigdotdev.aospbugreportanalyzer.mcp.McpGithubClientException
 import com.bigdotdev.aospbugreportanalyzer.mcp.McpPullRequest
@@ -941,29 +943,34 @@ private fun DesktopChatApp() {
 
         val ext = bugreportFile.extension.lowercase(Locale.getDefault())
         var effectiveSource = bugreportFilePath
-        val bugreportText = if (ext == "zip") {
-            println("[BugreportExtractor] Treating bugreport as ZIP archive: $bugreportFilePath")
-            extractLargestTxtFromBugreportZip(bugreportFilePath)
-        } else {
-            println("[BugreportExtractor] Treating bugreport as plain text file: $bugreportFilePath")
-            val text = withContext(Dispatchers.IO) { bugreportFile.readText() }
-            val pointerRegex = Regex("Bug report copied to\\s+(\\S+\\.zip)")
-            val pointerZip = pointerRegex.find(text)?.groupValues?.getOrNull(1)
-            val inlineZip = "/\\S+\\.zip".toRegex().find(text)?.value
-            val zipPath = pointerZip ?: inlineZip
-            if (zipPath != null) {
-                val zipFile = File(zipPath)
-                if (zipFile.exists()) {
-                    println("[BugreportExtractor] Detected pointer TXT, redirecting to ZIP: $zipPath")
-                    effectiveSource = zipPath
-                    extractLargestTxtFromBugreportZip(zipPath)
+        val bugreportText = try {
+            if (ext == "zip") {
+                println("[BugreportExtractor] Treating bugreport as ZIP archive: $bugreportFilePath")
+                withContext(Dispatchers.IO) { BugreportFileReader.readTextRobust(bugreportFile.toPath()) }
+            } else {
+                println("[BugreportExtractor] Treating bugreport as plain text file: $bugreportFilePath")
+                val text = withContext(Dispatchers.IO) { BugreportFileReader.readTextRobust(bugreportFile.toPath()) }
+                val pointerRegex = Regex("Bug report copied to\\s+(\\S+\\.zip)")
+                val pointerZip = pointerRegex.find(text)?.groupValues?.getOrNull(1)
+                val inlineZip = "/\\S+\\.zip".toRegex().find(text)?.value
+                val zipPath = pointerZip ?: inlineZip
+                if (zipPath != null) {
+                    val zipFile = File(zipPath)
+                    if (zipFile.exists()) {
+                        println("[BugreportExtractor] Detected pointer TXT, redirecting to ZIP: $zipPath")
+                        effectiveSource = zipPath
+                        withContext(Dispatchers.IO) { BugreportFileReader.readTextRobust(zipFile.toPath()) }
+                    } else {
+                        println("[BugreportExtractor] Pointer TXT found, but ZIP not found at $zipPath, falling back to plain text.")
+                        text
+                    }
                 } else {
-                    println("[BugreportExtractor] Pointer TXT found, but ZIP not found at $zipPath, falling back to plain text.")
                     text
                 }
-            } else {
-                text
             }
+        } catch (e: BugreportReadException) {
+            HistoryLogger.log("[BugreportExtractor] Failed to read bugreport $bugreportFilePath: ${e.message}")
+            throw BugreportExtractionException("Не удалось прочитать bugreport: ${e.message}", e)
         }
 
         val normalizedBugreportText = trimBugreportForSummary(bugreportText, BUGREPORT_SUMMARY_PRIMARY_LIMIT)
@@ -1236,9 +1243,13 @@ private fun DesktopChatApp() {
         }
 
         val logcatText = try {
-            withContext(Dispatchers.IO) { outputFile.readText() }
+            withContext(Dispatchers.IO) { BugreportFileReader.readTextRobust(outputFile.toPath()) }
         } catch (t: Throwable) {
-            addSystemMessage("Не удалось прочитать logcat из файла `${outputFile.absolutePath}`: ${t.message}")
+            val message = when (t) {
+                is BugreportReadException -> "Не удалось прочитать logcat из файла `${outputFile.absolutePath}`: ${t.message}"
+                else -> "Не удалось прочитать logcat из файла `${outputFile.absolutePath}`: ${t.message}"
+            }
+            addSystemMessage(message)
             HistoryLogger.log("Logcat read failed: ${t.message}")
             withContext(Dispatchers.Main) {
                 indexingState = IndexingState(
